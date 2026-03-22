@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Config, ServerMode, RelayConfig, DirectConfig};
+use super::{Config, ServerMode};
 
 /// CLI arguments for config override
 pub struct CliArgs {

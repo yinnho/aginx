@@ -10,8 +10,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::agent::AgentManager;
 use crate::config::{Config, DEFAULT_RELAY_SERVER};
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcErrorObject};
+use crate::protocol::{JsonRpcErrorObject, JsonRpcRequest, JsonRpcResponse};
 
 /// Relay 消息类型
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,19 +98,26 @@ pub struct RelayClient {
     heartbeat_interval: u64,
     /// 重连间隔 (秒)
     reconnect_interval: u64,
+    /// Agent Manager
+    agent_manager: AgentManager,
 }
 
 impl RelayClient {
     /// 创建新的 relay 客户端
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, agent_manager: AgentManager) -> Self {
         let relay_url = config.relay.get_connect_url();
-        let aginx_id = config.relay.id.clone().unwrap_or_else(|| "unknown".to_string());
+        let aginx_id = config
+            .relay
+            .id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         Self {
             relay_url,
             aginx_id,
             heartbeat_interval: config.relay.heartbeat_interval,
             reconnect_interval: config.relay.reconnect_interval,
+            agent_manager,
         }
     }
 
@@ -218,7 +226,15 @@ impl RelayClient {
                             }
                             RelayMessage::Data { client_id, data } => {
                                 tracing::debug!("收到客户端 [{}] 数据: {:?}", client_id, data);
-                                if let Err(e) = handle_data_message(&writer, &client_id, data, &config).await {
+                                if let Err(e) = handle_data_message(
+                                    &writer,
+                                    &client_id,
+                                    data,
+                                    &config,
+                                    &self.agent_manager,
+                                )
+                                .await
+                                {
                                     tracing::error!("处理消息错误: {}", e);
                                 }
                             }
@@ -259,18 +275,20 @@ async fn handle_data_message(
     client_id: &str,
     data: serde_json::Value,
     config: &Arc<Config>,
+    agent_manager: &AgentManager,
 ) -> anyhow::Result<()> {
     // 解析 JSON-RPC 请求
-    let request: JsonRpcRequest = serde_json::from_value(data.clone())
-        .unwrap_or_else(|_| JsonRpcRequest {
+    let request: JsonRpcRequest = serde_json::from_value(data.clone()).unwrap_or_else(|_| {
+        JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id: None,
             method: String::new(),
             params: None,
-        });
+        }
+    });
 
     // 处理请求
-    let response = process_request(request, config).await;
+    let response = process_request(request, config, agent_manager).await;
 
     // 发送响应 (带 clientId)
     if let Some(resp) = response {
@@ -295,42 +313,80 @@ async fn handle_data_message(
 }
 
 /// 处理 JSON-RPC 请求
-async fn process_request(request: JsonRpcRequest, config: &Arc<Config>) -> Option<JsonRpcResponse> {
+async fn process_request(
+    request: JsonRpcRequest,
+    config: &Arc<Config>,
+    agent_manager: &AgentManager,
+) -> Option<JsonRpcResponse> {
     let id = request.id.clone();
 
     match request.method.as_str() {
-        "hello" => {
-            Some(JsonRpcResponse::success(id, serde_json::json!({
+        "hello" => Some(JsonRpcResponse::success(
+            id,
+            serde_json::json!({
                 "serverName": config.server.name,
                 "serverVersion": config.server.version
-            })))
-        }
+            }),
+        )),
         "getServerInfo" => {
-            let relay_url = config.relay.id.as_ref().map(|id| {
-                format!("agent://{}.relay.yinnho.cn", id)
-            });
-            Some(JsonRpcResponse::success(id, serde_json::json!({
-                "version": config.server.version,
-                "agentCount": 2,
-                "relayUrl": relay_url
-            })))
+            let relay_url = config
+                .relay
+                .id
+                .as_ref()
+                .map(|id| format!("agent://{}.relay.yinnho.cn", id));
+            let agent_count = agent_manager.agent_count().await;
+            Some(JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "version": config.server.version,
+                    "agentCount": agent_count,
+                    "relayUrl": relay_url
+                }),
+            ))
         }
         "listAgents" => {
-            Some(JsonRpcResponse::success(id, serde_json::json!({
-                "agents": [
-                    {"id": "echo", "name": "Echo Agent", "capabilities": ["echo"]},
-                    {"id": "info", "name": "Info Agent", "capabilities": ["info"]}
-                ]
-            })))
+            let agents = agent_manager.list_agents().await;
+            Some(JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "agents": agents
+                }),
+            ))
         }
         "sendMessage" => {
-            Some(JsonRpcResponse::success(id, serde_json::json!({
-                "response": "Message received via relay"
-            })))
+            // 获取 agent_id 和 message
+            let agent_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("agentId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude");
+
+            let message = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // 调用对应的 agent
+            match agent_manager.send_message(agent_id, message).await {
+                Ok(response) => Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "response": response
+                    }),
+                )),
+                Err(e) => Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::new(404, &e, None),
+                )),
+            }
         }
         "" => None, // 空方法，忽略
-        _ => {
-            Some(JsonRpcResponse::error(id, JsonRpcErrorObject::method_not_found(&request.method)))
-        }
+        _ => Some(JsonRpcResponse::error(
+            id,
+            JsonRpcErrorObject::method_not_found(&request.method),
+        )),
     }
 }

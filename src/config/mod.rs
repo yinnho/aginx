@@ -226,34 +226,103 @@ pub struct UserConfig {
 }
 
 /// Agent 配置
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentsConfig {
-    /// 内置 agents
+    /// Agent 列表
     #[serde(default)]
-    pub builtin: Vec<BuiltinAgentConfig>,
-
-    /// 进程 agents
-    #[serde(default)]
-    pub process: Vec<ProcessAgentConfig>,
+    pub list: Vec<AgentConfig>,
 }
 
-/// 内置 Agent 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuiltinAgentConfig {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
+/// Agent 类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentType {
+    /// 内置 agent (echo, info 等)
+    Builtin,
+    /// Claude CLI
+    Claude,
+    /// 外部进程
+    Process,
 }
 
-/// 进程 Agent 配置
+impl Default for AgentType {
+    fn default() -> Self {
+        Self::Builtin
+    }
+}
+
+/// Agent 配置 (统一格式)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessAgentConfig {
+pub struct AgentConfig {
+    /// Agent ID (唯一标识)
     pub id: String,
+    /// Agent 名称
     pub name: String,
-    pub description: Option<String>,
+    /// Agent 类型
+    #[serde(default)]
+    pub agent_type: AgentType,
+    /// 能力标签
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    /// 描述
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+
+    // Process 类型专用字段
+    /// 进程命令 (type=process 时必填)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command: String,
-    #[serde(default)]
+    /// 进程参数
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// 工作目录
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
-    pub env: Option<std::collections::HashMap<String, String>>,
+    /// 环境变量
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+}
+
+impl AgentConfig {
+    /// 创建内置 agent 配置
+    pub fn builtin(id: &str, name: &str, capabilities: Vec<&str>) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            agent_type: AgentType::Builtin,
+            capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
+            description: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 创建 Claude agent 配置
+    pub fn claude() -> Self {
+        Self {
+            id: "claude".to_string(),
+            name: "Claude Agent".to_string(),
+            agent_type: AgentType::Claude,
+            capabilities: vec!["chat".to_string(), "code".to_string(), "ask".to_string()],
+            description: "AI programming assistant".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            list: vec![
+                AgentConfig::builtin("echo", "Echo Agent", vec!["echo"]),
+                AgentConfig::builtin("info", "Info Agent", vec!["info"]),
+                AgentConfig::claude(),
+            ],
+        }
+    }
 }

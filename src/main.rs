@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use crate::config::{Config, ServerMode, save_config, get_default_config_path};
+use crate::agent::AgentManager;
 
 /// aginx - Agent Protocol 实现
 #[derive(Parser, Debug)]
@@ -111,8 +112,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("运行模式: 直连 (Direct)");
             let config = Arc::new(config);
             print_startup_info(&config);
+
+            // 创建 AgentManager
+            let agent_manager = AgentManager::from_config(&config);
+
             // 创建服务器
-            let server = server::Server::new(config.clone())?;
+            let server = server::Server::new(config.clone(), agent_manager)?;
             // 启动服务
             server.run().await?;
         }
@@ -155,8 +160,11 @@ async fn main() -> anyhow::Result<()> {
             let config = Arc::new(config);
             print_startup_info(&config);
 
+            // 创建 Agent Manager
+            let agent_manager = AgentManager::from_config(&config);
+
             // 连接 relay
-            let mut relay_client = relay::RelayClient::new(&config);
+            let mut relay_client = relay::RelayClient::new(&config, agent_manager);
             relay_client.connect(config).await?;
         }
     }

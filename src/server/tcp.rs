@@ -19,8 +19,7 @@ pub struct Server {
 
 impl Server {
     /// Create a new server
-    pub fn new(config: Arc<Config>) -> anyhow::Result<Self> {
-        let agent_manager = AgentManager::new();
+    pub fn new(config: Arc<Config>, agent_manager: AgentManager) -> anyhow::Result<Self> {
         let conn_semaphore = Arc::new(Semaphore::new(config.server.max_connections));
 
         Ok(Self {
