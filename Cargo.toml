@@ -1,0 +1,54 @@
+[package]
+name = "aginx"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Yinnho Team"]
+license = "MIT"
+description = "Agent Protocol - 访问 Agent 就像访问网站一样简单"
+
+[[bin]]
+name = "aginx"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "process", "net", "io-util", "sync", "time", "rt-multi-thread"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env", "color", "suggestions"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Crypto and certificates
+ring = "0.17"
+base64 = "0.22"
+jsonwebtoken = "9"
+
+# Networking
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+
+# URL parsing
+url = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+dirs = "5"
+rand = "0.8"
+shellexpand = "3"
+uuid = { version = "1", features = ["v4"] }
