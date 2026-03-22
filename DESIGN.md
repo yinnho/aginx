@@ -152,25 +152,46 @@ cd aginx
 cargo install --path .
 ```
 
-### 2. 配置
-
-```bash
-# 初始化配置
-aginx init
-
-# 编辑配置文件
-vim ~/.aginx/config.toml
-```
-
-### 3. 启动
+### 2. 启动（自动配置）
 
 ```bash
 aginx
 ```
 
-根据配置文件决定访问方式：
-- `relay.enabled = true` → 连接中继，获得 `agent://xxx.relay.yinnho.cn`
-- `relay.enabled = false` → 使用直连地址
+**首次启动流程**（无配置文件或无 ID 时）：
+1. 默认使用 relay 模式
+2. 自动连接 `relay.yinnho.cn:8600`
+3. 向 relay 申请一个 ID（不指定 ID，由 relay 分配）
+4. Relay 返回分配的 ID（如 `abc123`）
+5. **自动更新配置文件**，保存 ID 和 URL
+6. 输出访问地址：`agent://abc123.relay.yinnho.cn`
+
+```
+$ aginx
+首次启动，正在向 relay.yinnho.cn 申请 ID...
+申请成功！
+ID: abc123
+URL: agent://abc123.relay.yinnho.cn
+配置已保存到 ~/.aginx/config.toml
+```
+
+**后续启动**：
+- 读取配置文件中的 ID
+- 直接使用该 ID 连接 relay
+
+### 3. 手动指定 ID（可选）
+
+如果用户想使用自定义 ID：
+
+```bash
+aginx --id mycustomid
+```
+
+或配置文件：
+```toml
+[relay]
+id = "mycustomid"
+```
 
 ## 配置文件
 
@@ -179,15 +200,15 @@ aginx
 | 模式 | 说明 | 配置 |
 |------|------|------|
 | **direct** | 直连模式，监听本地 TCP 86 端口 | `mode = "direct"` |
-| **relay** | 中继模式，连接 relay 服务器 | `mode = "relay"` |
+| **relay** | 中继模式，连接 relay 服务器（默认） | `mode = "relay"` |
 
 ### 配置示例
 
 ```toml
-# ~/.aginx/config.toml
+# ~/.aginx/config.toml (首次启动后自动生成)
 
 [server]
-# 运行模式: direct(直连) | relay(中继)
+# 运行模式: direct(直连) | relay(中继)，默认 relay
 mode = "relay"
 
 # 本地服务配置 (两种模式都需要，本地调用)
@@ -196,11 +217,10 @@ host = "0.0.0.0"
 # 访问模式: public (公开) | private (私有)
 access = "public"
 
-# 中继模式配置 (mode = "relay" 时使用)
+# 中继模式配置 (首次启动后自动生成)
 [relay]
-# 完整地址，包含 aginx ID
-# 格式: {aginx_id}.relay.yinnho.cn:8600
-url = "abc123.relay.yinnho.cn:8600"
+id = "abc123"  # 自动申请的 ID
+url = "abc123.relay.yinnho.cn:8600"  # 完整地址
 
 # 直连模式配置 (mode = "direct" 时使用)
 # [direct]
@@ -235,12 +255,21 @@ mode = "relay"
 access = "public"
 
 [relay]
-# 完整地址，aginx ID 在 URL 中
+# 首次启动时自动申请，保存到配置文件
+id = "abc123"
 url = "abc123.relay.yinnho.cn:8600"
 
 # 启动后:
 # - aginx 连接 abc123.relay.yinnho.cn:8600
 # - 外部访问: agent://abc123.relay.yinnho.cn
+```
+
+**首次启动（无配置）**：
+```
+$ aginx
+首次启动，正在向 relay.yinnho.cn 申请 ID...
+申请成功！ID: abc123
+配置已保存到 ~/.aginx/config.toml
 ```
 
 #### 场景 2: 有公网域名，直连
