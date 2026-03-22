@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::agent::AgentManager;
+use crate::agent::{AgentManager, SessionConfig, SessionManager};
 use crate::config::{Config, DEFAULT_RELAY_SERVER};
 use crate::protocol::{JsonRpcErrorObject, JsonRpcRequest, JsonRpcResponse};
 
@@ -100,6 +100,8 @@ pub struct RelayClient {
     reconnect_interval: u64,
     /// Agent Manager
     agent_manager: AgentManager,
+    /// Session Manager
+    session_manager: Arc<SessionManager>,
 }
 
 impl RelayClient {
@@ -112,12 +114,20 @@ impl RelayClient {
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
+        // 创建会话管理器
+        let session_config = SessionConfig {
+            max_concurrent: config.server.max_concurrent_sessions,
+            timeout_seconds: config.server.session_timeout_seconds,
+        };
+        let session_manager = Arc::new(SessionManager::new(session_config));
+
         Self {
             relay_url,
             aginx_id,
             heartbeat_interval: config.relay.heartbeat_interval,
             reconnect_interval: config.relay.reconnect_interval,
             agent_manager,
+            session_manager,
         }
     }
 
@@ -232,6 +242,7 @@ impl RelayClient {
                                     data,
                                     &config,
                                     &self.agent_manager,
+                                    &self.session_manager,
                                 )
                                 .await
                                 {
@@ -276,6 +287,7 @@ async fn handle_data_message(
     data: serde_json::Value,
     config: &Arc<Config>,
     agent_manager: &AgentManager,
+    session_manager: &Arc<SessionManager>,
 ) -> anyhow::Result<()> {
     // 解析 JSON-RPC 请求
     let request: JsonRpcRequest = serde_json::from_value(data.clone()).unwrap_or_else(|_| {
@@ -288,7 +300,7 @@ async fn handle_data_message(
     });
 
     // 处理请求
-    let response = process_request(request, config, agent_manager).await;
+    let response = process_request(request, config, agent_manager, session_manager).await;
 
     // 发送响应 (带 clientId)
     if let Some(resp) = response {
@@ -317,6 +329,7 @@ async fn process_request(
     request: JsonRpcRequest,
     config: &Arc<Config>,
     agent_manager: &AgentManager,
+    session_manager: &Arc<SessionManager>,
 ) -> Option<JsonRpcResponse> {
     let id = request.id.clone();
 
@@ -335,11 +348,13 @@ async fn process_request(
                 .as_ref()
                 .map(|id| format!("agent://{}.relay.yinnho.cn", id));
             let agent_count = agent_manager.agent_count().await;
+            let session_count = session_manager.session_count().await;
             Some(JsonRpcResponse::success(
                 id,
                 serde_json::json!({
                     "version": config.server.version,
                     "agentCount": agent_count,
+                    "sessionCount": session_count,
                     "relayUrl": relay_url
                 }),
             ))
@@ -382,28 +397,128 @@ async fn process_request(
                 )),
             }
         }
-        "sendMessage" => {
-            // 获取 agent_id 和 message
+        "createSession" => {
             let agent_id = request
                 .params
                 .as_ref()
                 .and_then(|p| p.get("agentId"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("claude");
+                .unwrap_or("");
 
-            let message = request
+            if agent_id.is_empty() {
+                return Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::invalid_params("agentId is required"),
+                ));
+            }
+
+            // 获取 agent 信息
+            let agent_info = agent_manager.get_agent_info(agent_id).await;
+
+            match agent_info {
+                Some(info) => {
+                    match session_manager.create_session(&info).await {
+                        Ok(session_id) => Some(JsonRpcResponse::success(
+                            id,
+                            serde_json::json!({
+                                "sessionId": session_id,
+                                "agentId": agent_id
+                            }),
+                        )),
+                        Err(e) => Some(JsonRpcResponse::error(
+                            id,
+                            JsonRpcErrorObject::new(503, &e, None), // Service Unavailable
+                        )),
+                    }
+                }
+                None => Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::new(404, &format!("Agent not found: {}", agent_id), None),
+                )),
+            }
+        }
+        "sendMessage" => {
+            // 检查是否使用会话模式
+            let session_id = request
                 .params
                 .as_ref()
-                .and_then(|p| p.get("message"))
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str());
+
+            if let Some(sid) = session_id {
+                // 会话模式
+                let message = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                match session_manager.send_message(sid, message).await {
+                    Ok(response) => Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "sessionId": sid,
+                            "response": response
+                        }),
+                    )),
+                    Err(e) => Some(JsonRpcResponse::error(
+                        id,
+                        JsonRpcErrorObject::new(404, &e, None),
+                    )),
+                }
+            } else {
+                // 无状态模式（兼容旧接口）
+                let agent_id = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("agentId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude");
+
+                let message = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("message"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                // 调用对应的 agent
+                match agent_manager.send_message(agent_id, message).await {
+                    Ok(response) => Some(JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "response": response
+                        }),
+                    )),
+                    Err(e) => Some(JsonRpcResponse::error(
+                        id,
+                        JsonRpcErrorObject::new(404, &e, None),
+                    )),
+                }
+            }
+        }
+        "closeSession" => {
+            let session_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            // 调用对应的 agent
-            match agent_manager.send_message(agent_id, message).await {
-                Ok(response) => Some(JsonRpcResponse::success(
+            if session_id.is_empty() {
+                return Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::invalid_params("sessionId is required"),
+                ));
+            }
+
+            match session_manager.close_session(session_id).await {
+                Ok(_) => Some(JsonRpcResponse::success(
                     id,
                     serde_json::json!({
-                        "response": response
+                        "success": true,
+                        "sessionId": session_id
                     }),
                 )),
                 Err(e) => Some(JsonRpcResponse::error(

@@ -98,6 +98,14 @@ pub struct ServerConfig {
     /// 最大连接数
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// 最大并发会话数
+    #[serde(default = "default_max_concurrent_sessions")]
+    pub max_concurrent_sessions: usize,
+
+    /// 会话超时（秒）
+    #[serde(default = "default_session_timeout_seconds")]
+    pub session_timeout_seconds: u64,
 }
 
 fn default_server_name() -> String { "aginx".to_string() }
@@ -105,6 +113,8 @@ fn default_server_version() -> String { "0.1.0".to_string() }
 fn default_port() -> u16 { 86 }
 fn default_host() -> String { "0.0.0.0".to_string() }
 fn default_max_connections() -> usize { 100 }
+fn default_max_concurrent_sessions() -> usize { 10 }
+fn default_session_timeout_seconds() -> u64 { 1800 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -116,6 +126,8 @@ impl Default for ServerConfig {
             host: default_host(),
             access: AccessMode::default(),
             max_connections: default_max_connections(),
+            max_concurrent_sessions: default_max_concurrent_sessions(),
+            session_timeout_seconds: default_session_timeout_seconds(),
         }
     }
 }

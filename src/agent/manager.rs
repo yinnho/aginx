@@ -100,6 +100,12 @@ impl AgentManager {
         agents.contains_key(agent_id)
     }
 
+    /// Get agent info
+    pub async fn get_agent_info(&self, agent_id: &str) -> Option<AgentInfo> {
+        let agents = self.agents.read().await;
+        agents.get(agent_id).cloned()
+    }
+
     /// Get agent help (执行 help_command 获取帮助信息)
     pub async fn get_agent_help(&self, agent_id: &str) -> Result<String, String> {
         use tokio::process::Command;
