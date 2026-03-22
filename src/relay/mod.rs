@@ -353,6 +353,35 @@ async fn process_request(
                 }),
             ))
         }
+        "getAgentHelp" => {
+            let agent_id = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("agentId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if agent_id.is_empty() {
+                return Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::invalid_params("agentId is required"),
+                ));
+            }
+
+            match agent_manager.get_agent_help(agent_id).await {
+                Ok(help) => Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "agentId": agent_id,
+                        "help": help
+                    }),
+                )),
+                Err(e) => Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::new(404, &e, None),
+                )),
+            }
+        }
         "sendMessage" => {
             // 获取 agent_id 和 message
             let agent_id = request

@@ -24,6 +24,7 @@ pub struct AgentInfo {
     pub agent_type: AgentType,
     pub command: String,
     pub args: Vec<String>,
+    pub help_command: String,
     pub working_dir: Option<String>,
     pub env: HashMap<String, String>,
 }
@@ -37,6 +38,7 @@ impl From<AgentConfig> for AgentInfo {
             agent_type: config.agent_type,
             command: config.command,
             args: config.args,
+            help_command: config.help_command,
             working_dir: config.working_dir.map(|p| p.to_string_lossy().to_string()),
             env: config.env,
         }
@@ -96,6 +98,75 @@ impl AgentManager {
     pub async fn has_agent(&self, agent_id: &str) -> bool {
         let agents = self.agents.read().await;
         agents.contains_key(agent_id)
+    }
+
+    /// Get agent help (执行 help_command 获取帮助信息)
+    pub async fn get_agent_help(&self, agent_id: &str) -> Result<String, String> {
+        use tokio::process::Command;
+        use tokio::time::{timeout, Duration};
+
+        let agents = self.agents.read().await;
+        let agent = agents
+            .get(agent_id)
+            .ok_or_else(|| format!("Agent not found: {}", agent_id))?;
+
+        // 确定要执行的 help 命令
+        let help_cmd = if !agent.help_command.is_empty() {
+            agent.help_command.clone()
+        } else if !agent.command.is_empty() {
+            // fallback: command --help
+            format!("{} --help", agent.command)
+        } else {
+            return Ok(format!(
+                "Agent: {}\nType: {:?}\nCapabilities: {}",
+                agent.name,
+                agent.agent_type,
+                agent.capabilities.join(", ")
+            ));
+        };
+
+        tracing::info!("获取 Agent [{}] 帮助: {}", agent_id, help_cmd);
+
+        // 解析命令
+        let parts: Vec<&str> = help_cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err("Invalid help_command".to_string());
+        }
+
+        let mut cmd = Command::new(parts[0]);
+        for part in &parts[1..] {
+            cmd.arg(*part);
+        }
+
+        // 设置工作目录和环境变量
+        if let Some(ref dir) = agent.working_dir {
+            cmd.current_dir(dir);
+        }
+        for (key, value) in &agent.env {
+            cmd.env(key, value);
+        }
+
+        // 执行命令，带超时保护
+        let result = timeout(Duration::from_secs(10), cmd.output()).await;
+
+        match result {
+            Ok(Ok(output)) => {
+                if output.status.success() {
+                    let help = String::from_utf8_lossy(&output.stdout).to_string();
+                    Ok(help)
+                } else {
+                    let error = String::from_utf8_lossy(&output.stderr).to_string();
+                    // 有些命令把 help 输出到 stderr
+                    if !error.is_empty() {
+                        Ok(error)
+                    } else {
+                        Err("No help output".to_string())
+                    }
+                }
+            }
+            Ok(Err(e)) => Err(format!("Failed to execute help command: {}", e)),
+            Err(_) => Err("Help command timeout (>10s)".to_string()),
+        }
     }
 
     /// Send message to agent

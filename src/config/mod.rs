@@ -275,6 +275,9 @@ pub struct AgentConfig {
     /// 进程参数
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// 获取帮助的命令 (如 "claude --help")
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub help_command: String,
     /// 工作目录
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
@@ -294,6 +297,7 @@ impl AgentConfig {
             description: String::new(),
             command: String::new(),
             args: Vec::new(),
+            help_command: String::new(),
             working_dir: None,
             env: std::collections::HashMap::new(),
         }
@@ -309,6 +313,7 @@ impl AgentConfig {
             description: "AI programming assistant".to_string(),
             command: String::new(),
             args: Vec::new(),
+            help_command: "claude --help".to_string(),
             working_dir: None,
             env: std::collections::HashMap::new(),
         }

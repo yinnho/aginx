@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let requests = vec![
         ("getServerInfo", serde_json::json!({})),
         ("listAgents", serde_json::json!({})),
+        ("getAgentHelp", serde_json::json!({"agentId": "claude"})),
     ];
 
     for (method, params) in requests {

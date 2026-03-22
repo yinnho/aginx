@@ -52,3 +52,8 @@ dirs = "5"
 rand = "0.8"
 shellexpand = "3"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde_json = "1"

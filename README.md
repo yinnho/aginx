@@ -176,12 +176,27 @@ cargo run --example test_claude_agent agent://rcs0aj94.relay.yinnho.cn "你好"
 {"jsonrpc": "2.0", "id": "2", "method": "listAgents", "params": {}}
 ```
 
+**getAgentHelp**
+```json
+{"jsonrpc": "2.0", "id": "3", "method": "getAgentHelp", "params": {
+  "agentId": "claude"
+}}
+```
+
+**Response:**
+```json
+{
+  "agentId": "claude",
+  "help": "claude [options] [prompt]\n  --print    非交互模式，  ..."
+}
+```
+
 **sendMessage**
 ```json
-{"jsonrpc": "2.0", "id": "3", "method": "sendMessage", "params": {
+{"jsonrpc": "2.0", "id": "4", "method": "sendMessage", "params": {
   "agentId": "claude",
   "message": "你好"
-}}
+}
 ```
 
 ---
