@@ -3,7 +3,7 @@
 //! 让用户可以像访问网站一样访问 Agent
 //!
 //! Usage:
-//!   aginx                              # 默认 relay 模式，自动申请 ID
+//!   aginx                              # 根据 config.toml 启动（默认 relay 模式，自动申请 ID）
 //!   aginx --mode direct                # 直连模式，监听 TCP 86
 
 mod config;
@@ -31,7 +31,7 @@ struct Args {
     #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
-    /// 运行模式: direct(直连) | relay(中继)
+    /// 运行模式: direct(直连) | relay(中继，默认)
     #[arg(short = 'm', long, value_enum)]
     mode: Option<ModeArg>,
 
@@ -42,10 +42,6 @@ struct Args {
     /// 绑定地址
     #[arg(short = 'H', long, default_value = "0.0.0.0")]
     host: String,
-
-    /// Relay ID (可选，不指定则自动申请)
-    #[arg(long, value_name = "ID")]
-    relay_id: Option<String>,
 
     /// 公网访问地址 (mode=direct 时使用)
     #[arg(long, value_name = "URL")]
@@ -106,28 +102,23 @@ async fn main() -> anyhow::Result<()> {
     let config_path = result.config_path.unwrap_or_else(get_default_config_path);
     let mut config = result.config;
 
+    // 创建 AgentManager
+    let agent_manager = AgentManager::from_config(&config);
+
     // 根据模式启动
     match config.server.mode {
         ServerMode::Direct => {
             tracing::info!("运行模式: 直连 (Direct)");
             let config = Arc::new(config);
             print_startup_info(&config);
-
-            // 创建 AgentManager
-            let agent_manager = AgentManager::from_config(&config);
-
-            // 创建服务器
             let server = server::Server::new(config.clone(), agent_manager)?;
-            // 启动服务
             server.run().await?;
         }
         ServerMode::Relay => {
             tracing::info!("运行模式: 中继 (Relay)");
 
-            // 检查是否需要申请 ID
-            let needs_register = !config.relay.has_id() && args.relay_id.is_none();
-
-            if needs_register {
+            // 检查是否需要申请 ID（首次启动）
+            if !config.relay.has_id() {
                 tracing::info!("========================================");
                 tracing::info!("首次启动，正在向 relay.yinnho.cn 申请 ID...");
                 tracing::info!("========================================");
@@ -150,18 +141,10 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("ID: {}", registration.id);
                 tracing::info!("URL: {}", registration.url);
                 tracing::info!("========================================");
-            } else {
-                // 如果命令行指定了 relay_id
-                if let Some(ref id) = args.relay_id {
-                    config.relay.set_id(id.clone());
-                }
             }
 
             let config = Arc::new(config);
             print_startup_info(&config);
-
-            // 创建 Agent Manager
-            let agent_manager = AgentManager::from_config(&config);
 
             // 连接 relay
             let mut relay_client = relay::RelayClient::new(&config, agent_manager);
@@ -194,10 +177,7 @@ fn load_config(args: &Args) -> anyhow::Result<config::LoadResult> {
         port: Some(args.port),
         host: Some(args.host.clone()),
         mode: args.mode.as_ref().map(|m| ServerMode::from(m.clone())),
-        relay_id: args.relay_id.clone(),
         public_url: args.public_url.clone(),
-        verbose: args.verbose,
-        debug: args.debug,
     };
     config::load_config(&cli_args)
 }

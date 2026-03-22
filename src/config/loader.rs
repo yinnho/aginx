@@ -10,10 +10,7 @@ pub struct CliArgs {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub mode: Option<ServerMode>,
-    pub relay_id: Option<String>,
     pub public_url: Option<String>,
-    pub verbose: bool,
-    pub debug: bool,
 }
 
 /// Load result with config path
@@ -49,10 +46,6 @@ pub fn load_config(args: &CliArgs) -> anyhow::Result<LoadResult> {
     }
     if let Some(mode) = &args.mode {
         config.server.mode = mode.clone();
-    }
-    if let Some(relay_id) = &args.relay_id {
-        config.server.mode = ServerMode::Relay;
-        config.relay.set_id(relay_id.clone());
     }
     if let Some(public_url) = &args.public_url {
         config.server.mode = ServerMode::Direct;
