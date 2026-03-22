@@ -1,21 +1,38 @@
-//! 测试 Claude Agent - 通过 relay 调用本地 Claude CLI
+//! 测试 Claude Agent - 通过 agent:// URL 调用
+//!
+//! Usage:
+//!   cargo run --example test_claude_agent agent://rcs0aj94.relay.yinnho.cn "你好"
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+fn parse_agent_url(url: &str) -> Option<(String, String)> {
+    let url = url.strip_prefix("agent://")?;
+    let parts: Vec<&str> = url.split('.').collect();
+    if parts.len() >= 4 && parts[1] == "relay" {
+        let id = parts[0].to_string();
+        let addr = format!("{}.relay.yinnho.cn:8600", id);
+        Some((id, addr))
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 从命令行获取 target aginx ID
-    let target = std::env::args().nth(1).expect("Usage: test_claude_agent <aginx_id>");
+    let agent_url = std::env::args().nth(1).expect("Usage: test_claude_agent <agent_url> [message]");
     let message = std::env::args().nth(2).unwrap_or_else(|| "你是谁？".to_string());
-    let relay_addr = format!("{}.relay.yinnho.cn:8600", target);
+
+    let (target, relay_addr) = parse_agent_url(&agent_url)
+        .ok_or_else(|| anyhow::anyhow!("Invalid agent URL: {}", agent_url))?;
 
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .init();
 
-    tracing::info!("连接 Relay: {}", relay_addr);
+    tracing::info!("连接 Agent: {}", agent_url);
+    tracing::info!("Relay 地址: {}", relay_addr);
 
     // 连接 relay
     let stream = TcpStream::connect(&relay_addr).await?;
