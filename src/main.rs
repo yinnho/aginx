@@ -3,8 +3,8 @@
 //! 让用户可以像访问网站一样访问 Agent
 //!
 //! Usage:
-//!   aginx                              # 直连模式，监听 TCP 86
-//!   aginx --mode relay --relay-url abc123.relay.yinnho.cn:8600  # 中继模式
+//!   aginx                              # 默认 relay 模式，自动申请 ID
+//!   aginx --mode direct                # 直连模式，监听 TCP 86
 
 mod config;
 mod protocol;
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use crate::config::{Config, ServerMode};
+use crate::config::{Config, ServerMode, save_config, get_default_config_path};
 
 /// aginx - Agent Protocol 实现
 #[derive(Parser, Debug)]
@@ -42,10 +42,9 @@ struct Args {
     #[arg(short = 'H', long, default_value = "0.0.0.0")]
     host: String,
 
-    /// Relay 完整地址 (mode=relay 时使用)
-    /// 格式: {aginx_id}.relay.yinnho.cn:8600
-    #[arg(long, value_name = "URL")]
-    relay_url: Option<String>,
+    /// Relay ID (可选，不指定则自动申请)
+    #[arg(long, value_name = "ID")]
+    relay_id: Option<String>,
 
     /// 公网访问地址 (mode=direct 时使用)
     #[arg(long, value_name = "URL")]
@@ -102,16 +101,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 加载配置
-    let config = load_config(&args)?;
-    let config = Arc::new(config);
-
-    // 打印启动信息
-    print_startup_info(&config);
+    let result = load_config(&args)?;
+    let config_path = result.config_path.unwrap_or_else(get_default_config_path);
+    let mut config = result.config;
 
     // 根据模式启动
     match config.server.mode {
         ServerMode::Direct => {
             tracing::info!("运行模式: 直连 (Direct)");
+            let config = Arc::new(config);
+            print_startup_info(&config);
             // 创建服务器
             let server = server::Server::new(config.clone())?;
             // 启动服务
@@ -119,6 +118,43 @@ async fn main() -> anyhow::Result<()> {
         }
         ServerMode::Relay => {
             tracing::info!("运行模式: 中继 (Relay)");
+
+            // 检查是否需要申请 ID
+            let needs_register = !config.relay.has_id() && args.relay_id.is_none();
+
+            if needs_register {
+                tracing::info!("========================================");
+                tracing::info!("首次启动，正在向 relay.yinnho.cn 申请 ID...");
+                tracing::info!("========================================");
+
+                // 向 relay 申请 ID
+                let registration = relay::register_id().await?;
+
+                // 更新配置
+                config.relay.set_id(registration.id.clone());
+
+                // 保存配置
+                if let Err(e) = save_config(&config, &config_path) {
+                    tracing::error!("保存配置失败: {}", e);
+                } else {
+                    tracing::info!("配置已保存到: {:?}", config_path);
+                }
+
+                tracing::info!("========================================");
+                tracing::info!("申请成功!");
+                tracing::info!("ID: {}", registration.id);
+                tracing::info!("URL: {}", registration.url);
+                tracing::info!("========================================");
+            } else {
+                // 如果命令行指定了 relay_id
+                if let Some(ref id) = args.relay_id {
+                    config.relay.set_id(id.clone());
+                }
+            }
+
+            let config = Arc::new(config);
+            print_startup_info(&config);
+
             // 连接 relay
             let mut relay_client = relay::RelayClient::new(&config);
             relay_client.connect(config).await?;
@@ -144,13 +180,13 @@ fn init_logging(verbose: bool, debug: bool) {
         .init();
 }
 
-fn load_config(args: &Args) -> anyhow::Result<Config> {
+fn load_config(args: &Args) -> anyhow::Result<config::LoadResult> {
     let cli_args = config::CliArgs {
         config: args.config.clone(),
         port: Some(args.port),
         host: Some(args.host.clone()),
         mode: args.mode.as_ref().map(|m| ServerMode::from(m.clone())),
-        relay_url: args.relay_url.clone(),
+        relay_id: args.relay_id.clone(),
         public_url: args.public_url.clone(),
         verbose: args.verbose,
         debug: args.debug,
@@ -168,15 +204,8 @@ fn print_startup_info(config: &Config) {
             }
         }
         ServerMode::Relay => {
-            if let Some(ref url) = config.relay.url {
-                // 从 url 提取 aginx_id
-                // 格式: abc123.relay.yinnho.cn:8600
-                let parts: Vec<&str> = url.split('.').collect();
-                if let Some(id) = parts.first() {
-                    format!("agent://{}.relay.yinnho.cn", id)
-                } else {
-                    "agent://xxx.relay.yinnho.cn".to_string()
-                }
+            if let Some(ref id) = config.relay.id {
+                format!("agent://{}.relay.yinnho.cn", id)
             } else {
                 "agent://xxx.relay.yinnho.cn (未配置)".to_string()
             }

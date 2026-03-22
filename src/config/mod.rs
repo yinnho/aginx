@@ -12,11 +12,14 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum ServerMode {
     /// 直连模式 - 监听本地 TCP 86
-    #[default]
     Direct,
-    /// 中继模式 - 连接 relay 服务器
+    /// 中继模式 - 连接 relay 服务器（默认）
+    #[default]
     Relay,
 }
+
+/// 默认 Relay 服务器地址
+pub const DEFAULT_RELAY_SERVER: &str = "relay.yinnho.cn:8600";
 
 /// 访问模式
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,6 +123,10 @@ impl Default for ServerConfig {
 /// 中继配置 (mode = "relay" 时使用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
+    /// Aginx ID (首次启动自动申请)
+    #[serde(default)]
+    pub id: Option<String>,
+
     /// Relay 完整地址
     /// 格式: {aginx_id}.relay.yinnho.cn:8600
     /// 例如: abc123.relay.yinnho.cn:8600
@@ -141,10 +148,36 @@ fn default_reconnect_interval() -> u64 { 5 }
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
+            id: None,
             url: None,
             heartbeat_interval: default_heartbeat_interval(),
             reconnect_interval: default_reconnect_interval(),
         }
+    }
+}
+
+impl RelayConfig {
+    /// 获取连接地址
+    /// 如果有 url 则使用 url，否则用默认服务器地址
+    pub fn get_connect_url(&self) -> String {
+        if let Some(ref url) = self.url {
+            url.clone()
+        } else if let Some(ref id) = self.id {
+            format!("{}.relay.yinnho.cn:8600", id)
+        } else {
+            DEFAULT_RELAY_SERVER.to_string()
+        }
+    }
+
+    /// 是否已配置 ID
+    pub fn has_id(&self) -> bool {
+        self.id.is_some()
+    }
+
+    /// 设置 ID（申请成功后调用）
+    pub fn set_id(&mut self, id: String) {
+        self.id = Some(id.clone());
+        self.url = Some(format!("{}.relay.yinnho.cn:8600", id));
     }
 }
 

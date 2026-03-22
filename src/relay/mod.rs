@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_RELAY_SERVER};
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcErrorObject};
 
 /// Relay 消息类型
@@ -46,11 +46,52 @@ pub enum RelayMessage {
     Data { client_id: String, data: serde_json::Value },
 }
 
+/// 注册结果
+#[derive(Debug, Clone)]
+pub struct Registration {
+    pub id: String,
+    pub url: String,
+}
+
+/// 向 relay 申请 ID（首次启动时调用）
+pub async fn register_id() -> anyhow::Result<Registration> {
+    tracing::info!("首次启动，正在向 {} 申请 ID...", DEFAULT_RELAY_SERVER);
+
+    // 连接到 relay
+    let stream = TcpStream::connect(DEFAULT_RELAY_SERVER).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    // 发送注册请求（不指定 ID，让 relay 分配）
+    let register = RelayMessage::Register { id: None };
+    let register_json = serde_json::to_string(&register)?;
+    writer.write_all(format!("{}\n", register_json).as_bytes()).await?;
+    writer.flush().await?;
+
+    // 等待响应
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).await?;
+    let response: RelayMessage = serde_json::from_str(response_line.trim())?;
+
+    match response {
+        RelayMessage::Registered { id, url } => {
+            tracing::info!("申请成功！ID: {}, URL: {}", id, url);
+            Ok(Registration { id, url })
+        }
+        RelayMessage::Error { message } => {
+            Err(anyhow::anyhow!("申请 ID 失败: {}", message))
+        }
+        _ => {
+            Err(anyhow::anyhow!("意外的响应: {:?}", response))
+        }
+    }
+}
+
 /// Relay 客户端
 pub struct RelayClient {
-    /// Relay 完整地址 (格式: {id}.relay.yinnho.cn:8600)
+    /// Relay 地址
     relay_url: String,
-    /// Aginx ID (从 relay_url 提取)
+    /// Aginx ID
     aginx_id: String,
     /// 心跳间隔 (秒)
     heartbeat_interval: u64,
@@ -61,15 +102,8 @@ pub struct RelayClient {
 impl RelayClient {
     /// 创建新的 relay 客户端
     pub fn new(config: &Config) -> Self {
-        let relay_url = config.relay.url.clone()
-            .unwrap_or_else(|| "xxx.relay.yinnho.cn:8600".to_string());
-
-        // 从 URL 提取 aginx_id (格式: {id}.relay.yinnho.cn:8600)
-        let aginx_id = relay_url
-            .split('.')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
+        let relay_url = config.relay.get_connect_url();
+        let aginx_id = config.relay.id.clone().unwrap_or_else(|| "unknown".to_string());
 
         Self {
             relay_url,
@@ -109,7 +143,7 @@ impl RelayClient {
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
 
-        // 发送注册请求 (携带用户指定的 ID)
+        // 发送注册请求 (携带已配置的 ID)
         let register = RelayMessage::Register { id: Some(self.aginx_id.clone()) };
         let register_json = serde_json::to_string(&register)?;
         {
@@ -272,10 +306,13 @@ async fn process_request(request: JsonRpcRequest, config: &Arc<Config>) -> Optio
             })))
         }
         "getServerInfo" => {
+            let relay_url = config.relay.id.as_ref().map(|id| {
+                format!("agent://{}.relay.yinnho.cn", id)
+            });
             Some(JsonRpcResponse::success(id, serde_json::json!({
                 "version": config.server.version,
                 "agentCount": 2,
-                "relayUrl": None::<String>
+                "relayUrl": relay_url
             })))
         }
         "listAgents" => {

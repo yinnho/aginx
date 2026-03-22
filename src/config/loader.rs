@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Config, ServerMode};
+use super::{Config, ServerMode, RelayConfig, DirectConfig};
 
 /// CLI arguments for config override
 pub struct CliArgs {
@@ -10,23 +10,29 @@ pub struct CliArgs {
     pub port: Option<u16>,
     pub host: Option<String>,
     pub mode: Option<ServerMode>,
-    pub relay_url: Option<String>,
+    pub relay_id: Option<String>,
     pub public_url: Option<String>,
     pub verbose: bool,
     pub debug: bool,
 }
 
+/// Load result with config path
+pub struct LoadResult {
+    pub config: Config,
+    pub config_path: Option<PathBuf>,
+}
+
 /// Load configuration
-pub fn load_config(args: &CliArgs) -> anyhow::Result<Config> {
+pub fn load_config(args: &CliArgs) -> anyhow::Result<LoadResult> {
     // Find config file path
     let config_path = args.config.clone().or_else(find_default_config);
 
-    let mut config = if let Some(path) = config_path {
+    let mut config = if let Some(ref path) = config_path {
         if path.exists() {
             tracing::info!("Loading config from: {:?}", path);
-            load_from_file(&path)?
+            load_from_file(path)?
         } else {
-            tracing::warn!("Config file not found, using defaults: {:?}", path);
+            tracing::info!("Config file not found, using defaults: {:?}", path);
             Config::default()
         }
     } else {
@@ -44,16 +50,16 @@ pub fn load_config(args: &CliArgs) -> anyhow::Result<Config> {
     if let Some(mode) = &args.mode {
         config.server.mode = mode.clone();
     }
-    if let Some(relay_url) = &args.relay_url {
+    if let Some(relay_id) = &args.relay_id {
         config.server.mode = ServerMode::Relay;
-        config.relay.url = Some(relay_url.clone());
+        config.relay.set_id(relay_id.clone());
     }
     if let Some(public_url) = &args.public_url {
         config.server.mode = ServerMode::Direct;
         config.direct.public_url = Some(public_url.clone());
     }
 
-    Ok(config)
+    Ok(LoadResult { config, config_path })
 }
 
 /// Load config from file
@@ -83,6 +89,11 @@ fn find_default_config() -> Option<PathBuf> {
     None
 }
 
+/// Get default config file path (for saving)
+pub fn get_default_config_path() -> PathBuf {
+    PathBuf::from(shellexpand::tilde("~/.aginx/config.toml").to_string())
+}
+
 /// Save config to file
 pub fn save_config(config: &Config, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
@@ -105,6 +116,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.port, 86);
         assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.mode, ServerMode::Relay); // 默认是 relay 模式
     }
 
     #[test]
@@ -113,5 +125,13 @@ mod tests {
         let toml = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml).unwrap();
         assert_eq!(config.server.port, parsed.server.port);
+    }
+
+    #[test]
+    fn test_relay_config_set_id() {
+        let mut config = Config::default();
+        config.relay.set_id("abc123".to_string());
+        assert_eq!(config.relay.id, Some("abc123".to_string()));
+        assert_eq!(config.relay.url, Some("abc123.relay.yinnho.cn:8600".to_string()));
     }
 }
