@@ -170,7 +170,9 @@ async fn handle_connection(
 
     match msg_type {
         "register" => {
-            handle_aginx(reader, writer, state, domain, peer_addr).await
+            // 提取用户指定的 ID (可选)
+            let requested_id = json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            handle_aginx(reader, writer, state, domain, peer_addr, requested_id).await
         }
         "connect" => {
             let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -197,28 +199,51 @@ async fn handle_aginx(
     state: Arc<RwLock<RelayState>>,
     domain: Arc<String>,
     peer_addr: SocketAddr,
+    requested_id: Option<String>,
 ) -> anyhow::Result<()> {
-    // 生成 ID
-    let aginx_id = generate_id();
+    // 确定使用哪个 ID
+    let aginx_id = if let Some(id) = requested_id {
+        // 验证 ID 格式 (只允许字母数字)
+        if !id.chars().all(|c| c.is_alphanumeric()) {
+            send_error(&writer, "ID must be alphanumeric").await;
+            return Ok(());
+        }
+        // 检查 ID 是否已被占用
+        let state_read = state.read().await;
+        if state_read.aginx_senders.contains_key(&id) {
+            drop(state_read);
+            send_error(&writer, &format!("ID '{}' is already in use", id)).await;
+            return Ok(());
+        }
+        id
+    } else {
+        // 自动生成 ID
+        generate_id()
+    };
+
     let url = format!("agent://{}.{}", aginx_id, domain);
 
     tracing::info!("Aginx [{}] registered from {}", aginx_id, peer_addr);
+
+    // 创建接收通道
+    let (tx, mut rx) = mpsc::channel::<ToAginx>(100);
+
+    // 注册到状态 (需要再次检查，因为之前释放了锁)
+    {
+        let mut state = state.write().await;
+        if state.aginx_senders.contains_key(&aginx_id) {
+            send_error(&writer, &format!("ID '{}' is already in use", aginx_id)).await;
+            return Ok(());
+        }
+        state.aginx_senders.insert(aginx_id.clone(), tx);
+        state.aginx_clients.insert(aginx_id.clone(), Vec::new());
+    }
 
     // 发送注册成功
     send_msg(&writer, RelayMessage::Registered {
         id: aginx_id.clone(),
         url: url.clone(),
     }).await?;
-
-    // 创建接收通道
-    let (tx, mut rx) = mpsc::channel::<ToAginx>(100);
-
-    // 注册到状态
-    {
-        let mut state = state.write().await;
-        state.aginx_senders.insert(aginx_id.clone(), tx);
-        state.aginx_clients.insert(aginx_id.clone(), Vec::new());
-    }
 
     let aginx_id_for_recv = aginx_id.clone();
     let state_for_recv = state.clone();

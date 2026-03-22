@@ -48,8 +48,10 @@ pub enum RelayMessage {
 
 /// Relay 客户端
 pub struct RelayClient {
-    /// Relay 完整地址
+    /// Relay 完整地址 (格式: {id}.relay.yinnho.cn:8600)
     relay_url: String,
+    /// Aginx ID (从 relay_url 提取)
+    aginx_id: String,
     /// 心跳间隔 (秒)
     heartbeat_interval: u64,
     /// 重连间隔 (秒)
@@ -62,8 +64,16 @@ impl RelayClient {
         let relay_url = config.relay.url.clone()
             .unwrap_or_else(|| "xxx.relay.yinnho.cn:8600".to_string());
 
+        // 从 URL 提取 aginx_id (格式: {id}.relay.yinnho.cn:8600)
+        let aginx_id = relay_url
+            .split('.')
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+
         Self {
             relay_url,
+            aginx_id,
             heartbeat_interval: config.relay.heartbeat_interval,
             reconnect_interval: config.relay.reconnect_interval,
         }
@@ -99,8 +109,8 @@ impl RelayClient {
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
 
-        // 发送注册请求
-        let register = RelayMessage::Register { id: None };
+        // 发送注册请求 (携带用户指定的 ID)
+        let register = RelayMessage::Register { id: Some(self.aginx_id.clone()) };
         let register_json = serde_json::to_string(&register)?;
         {
             let mut w = writer.lock().await;
