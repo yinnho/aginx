@@ -147,8 +147,30 @@ API_KEY = "your-api-key"
 | 类型 | 说明 | 必填字段 |
 |------|------|----------|
 | `builtin` | 内置 agent | id, name, capabilities |
-| `claude` | Claude CLI | id, name, capabilities |
-| `process` | 外部进程 | id, name, capabilities, command |
+| `claude` | Claude CLI | id, name, capabilities, help_command (可选) |
+| `process` | 外部进程 | id, name, capabilities, command, help_command (可选) |
+
+### help_command 字段
+
+用于指定获取 agent 帮助信息的命令：
+
+```toml
+[[agents.list]]
+id = "claude"
+name = "Claude Agent"
+agent_type = "claude"
+capabilities = ["chat", "code", "ask"]
+help_command = "claude --help"
+
+[[agents.list]]
+id = "weather"
+name = "Weather Agent"
+agent_type = "process"
+command = "/usr/local/bin/weather-agent"
+help_command = "/usr/local/bin/weather-agent --help"
+```
+
+如果未配置 `help_command`，会自动尝试 `{command} --help`
 
 ---
 
