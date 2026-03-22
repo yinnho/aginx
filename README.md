@@ -2,6 +2,36 @@
 
 > 让访问 Agent 像访问网站一样简单
 
+## 基本原则
+
+### 1. Aginx 是纯粹的消息路由器
+
+Aginx **不关心** Agent 内部如何实现：
+- 用云端 API 还是本地服务
+- 用什么语言、什么框架
+- 如何处理请求
+
+Aginx **只负责**：
+```
+接收请求 --> 路由到 Agent --> 返回响应
+```
+
+### 2. Agent 内部实现与 Aginx 无关
+
+```
+Aginx --> Claude Agent --> 调用云端 API（Agent 内部）
+Aginx --> OpenCarrier Agent --> 调用本地服务（Agent 内部）
+Aginx --> Weather Agent --> 调用第三方 API（Agent 内部）
+```
+
+Agent 用什么、怎么实现，是 Agent 自己的事情。
+
+### 3. 任何 CLI 都可以是 Agent
+
+只要能通过命令行调用并返回结果，就能包装成 Agent。
+
+---
+
 ## 核心理念
 
 一个 URL 搞定所有连接：
