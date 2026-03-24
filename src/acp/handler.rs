@@ -315,22 +315,21 @@ impl AcpHandler {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel::<String>();
         let message_inner = message.clone();
 
-        // Spawn blocking task for streaming
-        // sync_tx is moved into the closure and will be dropped when streaming finishes,
-        // which will close the channel and end the relay
+        // Spawn blocking task for streaming with interactive mode (supports permissions)
         let streaming_handle = tokio::task::spawn_blocking(move || {
             let on_update = |notification: &str| -> Result<(), String> {
                 sync_tx.send(notification.to_string())
                     .map_err(|e| format!("Failed to send: {}", e))
             };
 
-            streaming_session.send_prompt_streaming(&message_inner, on_update)
+            streaming_session.send_prompt_interactive(&message_inner, on_update)
         });
 
         // Relay notifications from sync channel to async channel
+        let tx_relay = tx.clone();
         let relay_handle = tokio::spawn(async move {
             while let Ok(notification) = sync_rx.recv() {
-                if tx.send(notification).await.is_err() {
+                if tx_relay.send(notification).await.is_err() {
                     break;
                 }
             }
@@ -338,17 +337,51 @@ impl AcpHandler {
 
         // Wait for streaming to complete
         match streaming_handle.await {
-            Ok(Ok(_stop_reason)) => {
+            Ok(result) => {
                 // sync_tx is dropped when streaming_handle finishes, closing the channel
                 let _ = relay_handle.await;
 
-                AcpResponse::success(request.id, serde_json::json!({
-                    "stopReason": "end_turn"
-                }))
-            }
-            Ok(Err(e)) => {
-                let _ = relay_handle.await;
-                AcpResponse::error(request.id, -32603, &format!("Streaming error: {}", e))
+                match result {
+                    super::streaming::StreamingResult::Completed(_stop_reason) => {
+                        AcpResponse::success(request.id, serde_json::json!({
+                            "stopReason": "end_turn"
+                        }))
+                    }
+                    super::streaming::StreamingResult::PermissionNeeded { request: perm, .. } => {
+                        // Send permission notification before returning
+                        let notification = AcpResponse::notification("requestPermission", serde_json::json!({
+                            "requestId": perm.request_id,
+                            "description": perm.description,
+                            "options": perm.options.iter().enumerate().map(|(i, opt)| {
+                                serde_json::json!({
+                                    "optionId": format!("opt_{}", i),
+                                    "label": opt.label
+                                })
+                            }).collect::<Vec<_>>()
+                        }));
+
+                        if let Ok(json) = notification.to_ndjson() {
+                            let _ = tx.send(json).await;
+                        }
+
+                        AcpResponse::success(request.id, serde_json::json!({
+                            "stopReason": "permission_required",
+                            "permissionRequest": {
+                                "requestId": perm.request_id,
+                                "description": perm.description,
+                                "options": perm.options.iter().enumerate().map(|(i, opt)| {
+                                    serde_json::json!({
+                                        "optionId": format!("opt_{}", i),
+                                        "label": opt.label
+                                    })
+                                }).collect::<Vec<_>>()
+                            }
+                        }))
+                    }
+                    super::streaming::StreamingResult::Error(e) => {
+                        AcpResponse::error(request.id, -32603, &format!("Streaming error: {}", e))
+                    }
+                }
             }
             Err(e) => {
                 let _ = relay_handle.await;
@@ -484,6 +517,180 @@ impl AcpHandler {
             }
         }
     }
+
+    /// Handle permission response with streaming support
+    /// This is used when the initial prompt was streaming and needs to continue
+    pub async fn handle_permission_response_streaming(
+        &self,
+        request: AcpRequest,
+        tx: mpsc::Sender<String>,
+    ) -> AcpResponse {
+        // Parse params
+        let params = match &request.params {
+            Some(p) => p.clone(),
+            None => {
+                return AcpResponse::error(request.id, -32602, "Missing params");
+            }
+        };
+
+        let session_id = params.get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let session_id = match session_id {
+            Some(id) => id,
+            None => {
+                return AcpResponse::error(request.id, -32602, "Missing sessionId");
+            }
+        };
+
+        let outcome = params.get("outcome");
+        let outcome = match outcome {
+            Some(o) => o.clone(),
+            None => {
+                return AcpResponse::error(request.id, -32602, "Missing outcome");
+            }
+        };
+
+        let outcome_type = outcome.get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        match outcome_type {
+            "selected" => {
+                let option_id = outcome.get("optionId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+
+                let option_id = match option_id {
+                    Some(id) => id,
+                    None => {
+                        return AcpResponse::error(request.id, -32602, "Missing optionId for selected outcome");
+                    }
+                };
+
+                // Parse option_id as choice index (e.g., "opt_0" -> 0)
+                let choice: usize = if option_id.starts_with("opt_") {
+                    option_id[4..].parse().unwrap_or(0)
+                } else {
+                    option_id.parse().unwrap_or(0)
+                };
+
+                tracing::info!("ACP permissionResponse (streaming): session={}, choice={}", session_id, choice);
+
+                // Get session info
+                let session_info = match self.session_manager.get_session_info(&session_id).await {
+                    Some(info) => info,
+                    None => {
+                        return AcpResponse::error(request.id, -32603, &format!("Session not found: {}", session_id));
+                    }
+                };
+
+                // Get agent info
+                let agent_info = match self.agent_manager.get_agent_info(&session_info.agent_id).await {
+                    Some(agent) => agent,
+                    None => {
+                        return AcpResponse::error(request.id, -32603, &format!("Agent not found: {}", session_info.agent_id));
+                    }
+                };
+
+                // Create streaming session
+                let claude_uuid = session_info.claude_session_uuid
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                let mut streaming_session = StreamingSession::from_session(
+                    session_id.clone(),
+                    claude_uuid,
+                    agent_info,
+                    session_info.workdir.as_deref(),
+                );
+
+                // Continue streaming with permission choice
+                let (sync_tx, sync_rx) = std::sync::mpsc::channel::<String>();
+
+                let streaming_handle = tokio::task::spawn_blocking(move || {
+                    let on_update = |notification: &str| -> Result<(), String> {
+                        sync_tx.send(notification.to_string())
+                            .map_err(|e| format!("Failed to send: {}", e))
+                    };
+
+                    streaming_session.continue_after_permission(choice, on_update)
+                });
+
+                // Relay notifications
+                let tx_relay = tx.clone();
+                let relay_handle = tokio::spawn(async move {
+                    while let Ok(notification) = sync_rx.recv() {
+                        if tx_relay.send(notification).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Wait for streaming to complete
+                match streaming_handle.await {
+                    Ok(result) => {
+                        let _ = relay_handle.await;
+
+                        match result {
+                            super::streaming::StreamingResult::Completed(_stop_reason) => {
+                                AcpResponse::success(request.id, serde_json::json!({
+                                    "stopReason": "end_turn"
+                                }))
+                            }
+                            super::streaming::StreamingResult::PermissionNeeded { request: perm, .. } => {
+                                // Send permission notification
+                                let notification = AcpResponse::notification("requestPermission", serde_json::json!({
+                                    "requestId": perm.request_id,
+                                    "description": perm.description,
+                                    "options": perm.options.iter().enumerate().map(|(i, opt)| {
+                                        serde_json::json!({
+                                            "optionId": format!("opt_{}", i),
+                                            "label": opt.label
+                                        })
+                                    }).collect::<Vec<_>>()
+                                }));
+
+                                if let Ok(json) = notification.to_ndjson() {
+                                    let _ = tx.send(json).await;
+                                }
+
+                                AcpResponse::success(request.id, serde_json::json!({
+                                    "stopReason": "permission_required",
+                                    "permissionRequest": {
+                                        "requestId": perm.request_id,
+                                        "description": perm.description,
+                                        "options": perm.options.iter().enumerate().map(|(i, opt)| {
+                                            serde_json::json!({
+                                                "optionId": format!("opt_{}", i),
+                                                "label": opt.label
+                                            })
+                                        }).collect::<Vec<_>>()
+                                    }
+                                }))
+                            }
+                            super::streaming::StreamingResult::Error(e) => {
+                                AcpResponse::error(request.id, -32603, &format!("Streaming error: {}", e))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = relay_handle.await;
+                        AcpResponse::error(request.id, -32603, &format!("Task error: {}", e))
+                    }
+                }
+            }
+            "cancelled" => {
+                tracing::info!("ACP permissionResponse (streaming): session={} cancelled", session_id);
+                AcpResponse::success(request.id, serde_json::json!({
+                    "stopReason": "cancelled"
+                }))
+            }
+            _ => {
+                AcpResponse::error(request.id, -32602, &format!("Invalid outcome type: {}", outcome_type))
+            }
+        }
+    }
 }
 
 /// Run ACP protocol over stdin/stdout with streaming support
@@ -534,8 +741,8 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
                     }
                 };
 
-                // Handle request with streaming support for prompt
-                if request.method == "prompt" {
+                // Handle request with streaming support for prompt and permissionResponse
+                if request.method == "prompt" || request.method == "permissionResponse" {
                     // Create channel for notifications
                     let (tx, rx) = mpsc::channel::<String>(32);
 
@@ -561,7 +768,11 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
                     });
 
                     // Handle with streaming
-                    let response = handler.handle_prompt_streaming(request, tx).await;
+                    let response = if request.method == "prompt" {
+                        handler.handle_prompt_streaming(request, tx).await
+                    } else {
+                        handler.handle_permission_response_streaming(request, tx).await
+                    };
 
                     // Wait for notification task to complete (tx is dropped, so rx will end)
                     let _ = notify_task.await;

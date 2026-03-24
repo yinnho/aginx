@@ -1,9 +1,13 @@
 //! Streaming session support for ACP
 //!
-//! Converts Claude CLI stream-json output to ACP sessionUpdate notifications
+//! Converts Claude CLI output to ACP sessionUpdate notifications
+//! Supports both JSON streaming mode (--output-format stream-json) and interactive mode
 
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -12,7 +16,35 @@ use super::types::{
     ToolCallStatus, ToolCallContent, ToolKind, StopReason,
 };
 use super::stream::{StreamEvent, ContentBlock as StreamContentBlock};
-use crate::agent::AgentInfo;
+use crate::agent::{AgentInfo, PermissionPrompt, PermissionOption};
+
+/// Permission request from streaming session
+#[derive(Debug, Clone)]
+pub struct StreamingPermissionRequest {
+    /// Request ID
+    pub request_id: String,
+    /// Description
+    pub description: String,
+    /// Options
+    pub options: Vec<PermissionOption>,
+}
+
+/// Streaming result - either continue with notifications or pause for permission
+#[derive(Debug)]
+pub enum StreamingResult {
+    /// Completed successfully
+    Completed(StopReason),
+    /// Need permission before continuing
+    PermissionNeeded {
+        request: StreamingPermissionRequest,
+        /// Channel to receive permission response (choice index)
+        response_tx: Sender<usize>,
+        /// Channel to wait for permission response
+        response_rx: Receiver<usize>,
+    },
+    /// Error occurred
+    Error(String),
+}
 
 /// Streaming session state
 pub struct StreamingSession {
@@ -335,6 +367,322 @@ impl StreamingSession {
             .unwrap_or_else(|_| "{}".to_string())
     }
 
+    /// Send a prompt with streaming and permission support
+    ///
+    /// This method runs Claude without stream-json to get permission prompts.
+    /// Returns StreamingResult::PermissionNeeded when a permission is needed.
+    pub fn send_prompt_interactive<F>(
+        &mut self,
+        message: &str,
+        mut on_update: F,
+    ) -> StreamingResult
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        use crate::config::AgentType;
+
+        match self.agent_info.agent_type {
+            AgentType::Claude => self.send_prompt_claude_interactive(message, on_update),
+            AgentType::Process => {
+                // Process type doesn't support streaming permissions
+                match self.send_prompt_process_streaming(message, on_update) {
+                    Ok(reason) => StreamingResult::Completed(reason),
+                    Err(e) => StreamingResult::Error(e),
+                }
+            }
+            AgentType::Builtin => StreamingResult::Error("Builtin agents do not support streaming".to_string()),
+        }
+    }
+
+    /// Continue after permission response
+    ///
+    /// Sends the permission choice and continues streaming
+    pub fn continue_after_permission<F>(
+        &mut self,
+        choice: usize,
+        mut on_update: F,
+    ) -> StreamingResult
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        // For now, we need to re-run the command with the choice as input
+        // This is a simplified approach - in production, we'd keep the process alive
+        self.send_permission_choice_streaming(choice, on_update)
+    }
+
+    /// Send prompt to Claude CLI with interactive mode (supports permissions)
+    fn send_prompt_claude_interactive<F>(
+        &mut self,
+        message: &str,
+        mut on_update: F,
+    ) -> StreamingResult
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        // Find claude command path
+        let claude_path = if let Ok(path) = std::env::var("HOME") {
+            let npm_path = format!("{}/.npm-global/bin/claude", path);
+            if std::path::Path::new(&npm_path).exists() {
+                npm_path
+            } else {
+                "claude".to_string()
+            }
+        } else {
+            "claude".to_string()
+        };
+
+        let mut cmd = Command::new(&claude_path);
+        // Use --print without stream-json to get permission prompts
+        cmd.arg("--print")
+            .arg("--session-id")
+            .arg(&self.claude_session_uuid)
+            .env_remove("CLAUDECODE");
+
+        if let Some(ref dir) = self.workdir {
+            cmd.current_dir(dir);
+        }
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return StreamingResult::Error(format!("Failed to spawn claude: {}", e)),
+        };
+
+        // Write message to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = writeln!(stdin, "{}", message) {
+                return StreamingResult::Error(format!("Write error: {}", e));
+            }
+            if let Err(e) = stdin.flush() {
+                return StreamingResult::Error(format!("Flush error: {}", e));
+            }
+        }
+
+        // Read output
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => return StreamingResult::Error("Failed to get stdout".to_string()),
+        };
+        let reader = std::io::BufReader::new(stdout);
+
+        let mut output_buffer = String::new();
+        let mut text_buffer = String::new();  // For extracting clean text from ANSI output
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Error reading line: {}", e);
+                    continue;
+                }
+            };
+
+            // Accumulate output for permission detection
+            output_buffer.push_str(&line);
+            output_buffer.push('\n');
+
+            // Strip ANSI codes and extract clean text
+            let clean_line = strip_ansi_codes(&line);
+
+            // Skip empty lines
+            if clean_line.trim().is_empty() {
+                continue;
+            }
+
+            // Check for permission prompt
+            if let Some(perm) = parse_permission_prompt_from_output(&output_buffer) {
+                tracing::info!("Detected permission prompt: {}", perm.description);
+
+                // Send what we have so far as message chunk
+                if !text_buffer.is_empty() {
+                    let notification = self.make_message_chunk(&text_buffer);
+                    if let Err(e) = on_update(&notification) {
+                        return StreamingResult::Error(e);
+                    }
+                    text_buffer.clear();
+                }
+
+                // Create channels for permission response
+                let (response_tx, response_rx) = mpsc::channel();
+
+                // Return permission needed
+                return StreamingResult::PermissionNeeded {
+                    request: StreamingPermissionRequest {
+                        request_id: perm.request_id,
+                        description: perm.description,
+                        options: perm.options,
+                    },
+                    response_tx,
+                    response_rx,
+                };
+            }
+
+            // Send text as message chunk (skip tool-related output)
+            if !is_tool_output(&clean_line) {
+                text_buffer.push_str(&clean_line);
+                text_buffer.push('\n');
+
+                // Send chunk
+                let notification = self.make_message_chunk(&clean_line);
+                if let Err(e) = on_update(&notification) {
+                    return StreamingResult::Error(e);
+                }
+            }
+        }
+
+        // Wait for process to complete
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => return StreamingResult::Error(format!("Wait error: {}", e)),
+        };
+
+        if !status.success() {
+            // Read stderr for error message
+            if let Some(stderr) = child.stderr.take() {
+                let stderr_reader = std::io::BufReader::new(stderr);
+                let error_msg: String = stderr_reader.lines()
+                    .filter_map(|l| l.ok())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !error_msg.is_empty() {
+                    return StreamingResult::Error(format!("Claude error: {}", error_msg));
+                }
+            }
+            return StreamingResult::Error("Claude process failed".to_string());
+        }
+
+        StreamingResult::Completed(StopReason::EndTurn)
+    }
+
+    /// Send permission choice and continue streaming
+    fn send_permission_choice_streaming<F>(
+        &mut self,
+        choice: usize,
+        mut on_update: F,
+    ) -> StreamingResult
+    where
+        F: FnMut(&str) -> Result<(), String>,
+    {
+        // Find claude command path
+        let claude_path = if let Ok(path) = std::env::var("HOME") {
+            let npm_path = format!("{}/.npm-global/bin/claude", path);
+            if std::path::Path::new(&npm_path).exists() {
+                npm_path
+            } else {
+                "claude".to_string()
+            }
+        } else {
+            "claude".to_string()
+        };
+
+        let mut cmd = Command::new(&claude_path);
+        cmd.arg("--print")
+            .arg("--session-id")
+            .arg(&self.claude_session_uuid)
+            .env_remove("CLAUDECODE");
+
+        if let Some(ref dir) = self.workdir {
+            cmd.current_dir(dir);
+        }
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return StreamingResult::Error(format!("Failed to spawn claude: {}", e)),
+        };
+
+        // Write choice to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = writeln!(stdin, "{}", choice) {
+                return StreamingResult::Error(format!("Write error: {}", e));
+            }
+            if let Err(e) = stdin.flush() {
+                return StreamingResult::Error(format!("Flush error: {}", e));
+            }
+        }
+
+        // Read output
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => return StreamingResult::Error("Failed to get stdout".to_string()),
+        };
+        let reader = std::io::BufReader::new(stdout);
+
+        let mut output_buffer = String::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Error reading line: {}", e);
+                    continue;
+                }
+            };
+
+            output_buffer.push_str(&line);
+            output_buffer.push('\n');
+
+            let clean_line = strip_ansi_codes(&line);
+
+            if clean_line.trim().is_empty() {
+                continue;
+            }
+
+            // Check for another permission prompt
+            if let Some(perm) = parse_permission_prompt_from_output(&output_buffer) {
+                tracing::info!("Detected another permission prompt: {}", perm.description);
+
+                let (response_tx, response_rx) = mpsc::channel();
+
+                return StreamingResult::PermissionNeeded {
+                    request: StreamingPermissionRequest {
+                        request_id: perm.request_id,
+                        description: perm.description,
+                        options: perm.options,
+                    },
+                    response_tx,
+                    response_rx,
+                };
+            }
+
+            // Send text as message chunk
+            if !is_tool_output(&clean_line) {
+                let notification = self.make_message_chunk(&clean_line);
+                if let Err(e) = on_update(&notification) {
+                    return StreamingResult::Error(e);
+                }
+            }
+        }
+
+        // Wait for process to complete
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => return StreamingResult::Error(format!("Wait error: {}", e)),
+        };
+
+        if !status.success() {
+            if let Some(stderr) = child.stderr.take() {
+                let stderr_reader = std::io::BufReader::new(stderr);
+                let error_msg: String = stderr_reader.lines()
+                    .filter_map(|l| l.ok())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !error_msg.is_empty() {
+                    return StreamingResult::Error(format!("Claude error: {}", error_msg));
+                }
+            }
+            return StreamingResult::Error("Claude process failed".to_string());
+        }
+
+        StreamingResult::Completed(StopReason::EndTurn)
+    }
+
     /// Parse tool info from name and input
     fn parse_tool_info(&self, name: &str, input: &serde_json::Value) -> (Option<ToolKind>, String) {
         let kind = match name {
@@ -396,5 +744,166 @@ impl StreamingSession {
         };
 
         (kind, title)
+    }
+}
+
+/// Strip ANSI escape codes from a string
+fn strip_ansi_codes(s: &str) -> String {
+    // Simple ANSI stripping - remove escape sequences
+    let mut result = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if chars[i] == '\x1b' {
+            // Start of escape sequence
+            i += 1;
+            if i < chars.len() && chars[i] == '[' {
+                i += 1;
+                // Skip until we hit a letter (end of sequence)
+                while i < chars.len() && !chars[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                i += 1; // Skip the final letter
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
+/// Check if a line is tool output (should be filtered from message chunks)
+fn is_tool_output(line: &str) -> bool {
+    // Tool output typically contains these patterns
+    let tool_patterns = [
+        "●", "○", "◉",  // Tool indicators
+        "Tool use:", "Tool result:",
+        "Reading:", "Writing:", "Editing:",
+        "Executing:", "Running:",
+        "✓", "✗",  // Success/failure indicators
+    ];
+
+    for pattern in &tool_patterns {
+        if line.contains(pattern) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Parse permission prompt from Claude CLI output
+fn parse_permission_prompt_from_output(output: &str) -> Option<StreamingPermissionRequest> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut description_lines = Vec::new();
+    let mut options = Vec::new();
+    let mut found_prompt = false;
+    let mut in_options = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+
+        // Detect permission prompt keywords
+        if !found_prompt {
+            if trimmed.contains("Do you want") ||
+               trimmed.contains("Allow") ||
+               trimmed.contains("Proceed?") ||
+               trimmed.contains("Continue?") ||
+               (trimmed.starts_with("❯") && trimmed.contains("1.")) {
+                found_prompt = true;
+                // If line starts with ❯, it's an option line
+                if trimmed.starts_with("❯") {
+                    if let Some(opt) = parse_permission_option(trimmed) {
+                        options.push(opt);
+                        in_options = true;
+                    }
+                } else {
+                    description_lines.push(trimmed.to_string());
+                }
+                continue;
+            }
+        }
+
+        if found_prompt {
+            // Detect option lines
+            if let Some(opt) = parse_permission_option(trimmed) {
+                in_options = true;
+                options.push(opt);
+            } else if in_options && trimmed.is_empty() {
+                // Options ended
+                break;
+            } else if !in_options && !trimmed.is_empty() && !trimmed.starts_with("❯") {
+                // Description continues
+                description_lines.push(trimmed.to_string());
+            } else if trimmed.starts_with("❯") || trimmed.starts_with("  ") {
+                // Might be an option line
+                if let Some(opt) = parse_permission_option(trimmed) {
+                    options.push(opt);
+                    in_options = true;
+                }
+            }
+        }
+    }
+
+    if found_prompt && !options.is_empty() {
+        Some(StreamingPermissionRequest {
+            request_id: format!("perm_{}", Uuid::new_v4().simple()),
+            description: if description_lines.is_empty() {
+                "Permission required".to_string()
+            } else {
+                description_lines.join("\n")
+            },
+            options,
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse a single permission option
+fn parse_permission_option(line: &str) -> Option<PermissionOption> {
+    use regex::Regex;
+
+    // Remove leading symbols (❯, ●, ○, spaces)
+    let line = line.trim_start_matches(['❯', '●', '○', ' ']).trim();
+
+    // Match "1. xxx" or "1) xxx" format
+    let re = regex::Regex::new(r"^(\d+)[.\)]\s*(.+)$").ok()?;
+
+    if let Some(caps) = re.captures(line) {
+        let index: usize = caps.get(1)?.as_str().parse().ok()?;
+        let label = caps.get(2)?.as_str().trim().to_string();
+        let is_default = line.starts_with('❯') || line.starts_with('●');
+
+        Some(PermissionOption {
+            index,
+            label,
+            is_default,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi_codes() {
+        let input = "\x1b[32mHello\x1b[0m World";
+        let result = strip_ansi_codes(input);
+        assert_eq!(result, "Hello World");
+    }
+
+    #[test]
+    fn test_parse_permission_option() {
+        let line = "1. Yes, proceed";
+        let opt = parse_permission_option(line).unwrap();
+        assert_eq!(opt.index, 1);
+        assert_eq!(opt.label, "Yes, proceed");
     }
 }
