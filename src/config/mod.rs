@@ -290,9 +290,12 @@ pub struct AgentConfig {
     /// 获取帮助的命令 (如 "claude --help")
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub help_command: String,
-    /// 工作目录
+    /// 工作目录 (固定目录)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
+    /// 是否需要用户选择工作目录 (App 端弹出选择)
+    #[serde(default)]
+    pub require_workdir: bool,
     /// 环境变量
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
@@ -311,6 +314,7 @@ impl AgentConfig {
             args: Vec::new(),
             help_command: String::new(),
             working_dir: None,
+            require_workdir: false,
             env: std::collections::HashMap::new(),
         }
     }
@@ -327,6 +331,7 @@ impl AgentConfig {
             args: Vec::new(),
             help_command: "claude --help".to_string(),
             working_dir: None,
+            require_workdir: false,
             env: std::collections::HashMap::new(),
         }
     }

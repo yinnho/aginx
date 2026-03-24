@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 dirs = "5"
 rand = "0.8"
+regex = "1"
 shellexpand = "3"
 uuid = { version = "1", features = ["v4"] }
 

@@ -405,6 +405,13 @@ async fn process_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            // 获取可选的 workdir 参数
+            let workdir = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("workdir"))
+                .and_then(|v| v.as_str());
+
             if agent_id.is_empty() {
                 return Some(JsonRpcResponse::error(
                     id,
@@ -417,7 +424,7 @@ async fn process_request(
 
             match agent_info {
                 Some(info) => {
-                    match session_manager.create_session(&info).await {
+                    match session_manager.create_session(&info, workdir).await {
                         Ok(session_id) => Some(JsonRpcResponse::success(
                             id,
                             serde_json::json!({
@@ -484,7 +491,7 @@ async fn process_request(
                     .unwrap_or("");
 
                 // 调用对应的 agent
-                match agent_manager.send_message(agent_id, message).await {
+                match agent_manager.send_message(agent_id, message, None).await {
                     Ok(response) => Some(JsonRpcResponse::success(
                         id,
                         serde_json::json!({

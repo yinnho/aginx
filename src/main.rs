@@ -11,6 +11,8 @@ mod protocol;
 mod server;
 mod agent;
 mod relay;
+mod binding;
+mod acp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +20,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use crate::config::{Config, ServerMode, save_config, get_default_config_path};
 use crate::agent::AgentManager;
+use crate::binding::BindingManager;
 
 /// aginx - Agent Protocol 实现
 #[derive(Parser, Debug)]
@@ -83,6 +86,30 @@ enum Commands {
 
     /// 查看状态
     Status,
+
+    /// 生成配对码（用于 App 绑定）
+    Pair,
+
+    /// 查看已绑定的设备
+    Devices,
+
+    /// 解绑设备
+    Unbind {
+        /// 设备 ID
+        device_id: String,
+    },
+
+    /// ACP 协议模式 (Agent Client Protocol)
+    /// 用于 IDE 集成 (Zed, Cursor, VS Code 等)
+    Acp {
+        /// 使用 stdio 模式 (被 IDE 启动)
+        #[arg(long)]
+        stdio: bool,
+
+        /// 指定默认 Agent ID
+        #[arg(short = 'a', long, default_value = "claude")]
+        agent: String,
+    },
 }
 
 #[tokio::main]
@@ -94,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 处理子命令
     if let Some(cmd) = args.command {
-        return handle_command(cmd);
+        return handle_command(cmd).await;
     }
 
     // 加载配置
@@ -209,7 +236,7 @@ fn print_startup_info(config: &Config) {
 }
 
 /// 处理子命令
-fn handle_command(cmd: Commands) -> anyhow::Result<()> {
+async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
     match cmd {
         Commands::Init { output } => {
             let path = shellexpand::tilde(&output.to_string_lossy()).to_string();
@@ -235,7 +262,89 @@ fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         Commands::Status => {
             println!("状态查看功能尚未实现");
         }
+        Commands::Pair => {
+            let mut manager = BindingManager::new();
+            let result = manager.generate_pair_code();
+
+            println!("========================================");
+            println!("配对码: {}", result.code);
+            println!("有效期: {} 秒 (5分钟)", result.expires_in);
+            println!("========================================");
+            println!("");
+            println!("在 App 中输入此配对码完成绑定");
+        }
+        Commands::Devices => {
+            let manager = BindingManager::new();
+            let devices = manager.list_devices();
+
+            if devices.is_empty() {
+                println!("没有已绑定的设备");
+            } else {
+                println!("已绑定的设备:");
+                println!("");
+                for device in devices {
+                    let bound_time = chrono::DateTime::from_timestamp(device.bound_at, 0)
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "未知".to_string());
+                    println!("  ID: {}", device.id);
+                    println!("  名称: {}", device.name);
+                    println!("  绑定时间: {}", bound_time);
+                    println!("  ---");
+                }
+            }
+        }
+        Commands::Unbind { device_id } => {
+            let mut manager = BindingManager::new();
+
+            if manager.unbind_device(&device_id) {
+                println!("设备 {} 已解绑", device_id);
+            } else {
+                println!("设备 {} 不存在", device_id);
+            }
+        }
+        Commands::Acp { stdio, agent } => {
+            run_acp_mode(stdio, agent).await?;
+        }
     }
+
+    Ok(())
+}
+
+/// 运行 ACP 模式
+async fn run_acp_mode(stdio: bool, default_agent: String) -> anyhow::Result<()> {
+    use crate::agent::{SessionManager, SessionConfig};
+    use crate::acp::run_acp_stdio;
+
+    // 加载配置
+    let config = config::load_config(&config::CliArgs::default())?.config;
+
+    // 创建 AgentManager
+    let agent_manager = Arc::new(AgentManager::from_config(&config));
+
+    // 创建 SessionManager
+    let session_config = SessionConfig {
+        max_concurrent: 10,
+        timeout_seconds: 1800,
+    };
+    let session_manager = Arc::new(SessionManager::new(session_config));
+
+    // 启动超时清理任务
+    let cleanup_handle = session_manager.clone().start_cleanup_task();
+
+    tracing::info!("ACP 模式启动, 默认 Agent: {}", default_agent);
+
+    if stdio {
+        // stdio 模式 - 被 IDE 启动
+        run_acp_stdio(agent_manager, session_manager).await;
+    } else {
+        // 交互模式 - 用于测试
+        tracing::error!("ACP 交互模式尚未实现，请使用 --stdio");
+        println!("ACP 交互模式尚未实现");
+        println!("请使用: aginx acp --stdio");
+    }
+
+    // 清理
+    cleanup_handle.abort();
 
     Ok(())
 }

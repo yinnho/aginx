@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use super::{Config, ServerMode};
 
 /// CLI arguments for config override
+#[derive(Default)]
 pub struct CliArgs {
     pub config: Option<PathBuf>,
     pub port: Option<u16>,

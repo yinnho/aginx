@@ -4,16 +4,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::Config;
-use crate::agent::AgentManager;
+use crate::agent::{AgentManager, SessionManager, SessionConfig};
+use crate::binding::BindingManager;
 use super::handler::Handler;
 
 /// aginx Server
 pub struct Server {
     config: Arc<Config>,
     agent_manager: AgentManager,
+    binding_manager: Arc<Mutex<BindingManager>>,
+    session_manager: Arc<SessionManager>,
     conn_semaphore: Arc<Semaphore>,
 }
 
@@ -21,10 +24,20 @@ impl Server {
     /// Create a new server
     pub fn new(config: Arc<Config>, agent_manager: AgentManager) -> anyhow::Result<Self> {
         let conn_semaphore = Arc::new(Semaphore::new(config.server.max_connections));
+        let binding_manager = Arc::new(Mutex::new(BindingManager::new()));
+
+        // 创建会话管理器
+        let session_config = SessionConfig {
+            max_concurrent: config.server.max_concurrent_sessions,
+            timeout_seconds: config.server.session_timeout_seconds,
+        };
+        let session_manager = Arc::new(SessionManager::new(session_config));
 
         Ok(Self {
             config,
             agent_manager,
+            binding_manager,
+            session_manager,
             conn_semaphore,
         })
     }
@@ -57,6 +70,8 @@ impl Server {
             let handler = Handler::new(
                 self.config.clone(),
                 self.agent_manager.clone(),
+                self.binding_manager.clone(),
+                self.session_manager.clone(),
             );
 
             // Spawn handler

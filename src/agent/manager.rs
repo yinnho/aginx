@@ -26,6 +26,7 @@ pub struct AgentInfo {
     pub args: Vec<String>,
     pub help_command: String,
     pub working_dir: Option<String>,
+    pub require_workdir: bool,
     pub env: HashMap<String, String>,
 }
 
@@ -40,6 +41,7 @@ impl From<AgentConfig> for AgentInfo {
             args: config.args,
             help_command: config.help_command,
             working_dir: config.working_dir.map(|p| p.to_string_lossy().to_string()),
+            require_workdir: config.require_workdir,
             env: config.env,
         }
     }
@@ -74,7 +76,9 @@ impl AgentManager {
                 serde_json::json!({
                     "id": a.id,
                     "name": a.name,
-                    "capabilities": a.capabilities
+                    "capabilities": a.capabilities,
+                    "require_workdir": a.require_workdir,
+                    "working_dir": a.working_dir
                 })
             })
             .collect()
@@ -176,16 +180,21 @@ impl AgentManager {
     }
 
     /// Send message to agent
-    pub async fn send_message(&self, agent_id: &str, message: &str) -> Result<String, String> {
+    pub async fn send_message(&self, agent_id: &str, message: &str, workdir: Option<&str>) -> Result<String, String> {
         let agents = self.agents.read().await;
         let agent = agents
             .get(agent_id)
             .ok_or_else(|| format!("Agent not found: {}", agent_id))?;
 
+        // 确定工作目录：优先使用传入的，其次使用配置的
+        let effective_workdir = workdir
+            .map(|s| s.to_string())
+            .or_else(|| agent.working_dir.clone());
+
         match &agent.agent_type {
             AgentType::Builtin => self.handle_builtin(agent_id, message).await,
-            AgentType::Claude => self.call_claude(message).await,
-            AgentType::Process => self.call_process(agent, message).await,
+            AgentType::Claude => self.call_claude(message, effective_workdir.as_deref()).await,
+            AgentType::Process => self.call_process_with_dir(agent, message, effective_workdir.as_deref()).await,
         }
     }
 
@@ -199,15 +208,20 @@ impl AgentManager {
     }
 
     /// 调用 Claude CLI
-    async fn call_claude(&self, message: &str) -> Result<String, String> {
+    async fn call_claude(&self, message: &str, workdir: Option<&str>) -> Result<String, String> {
         use tokio::process::Command;
 
-        tracing::info!("调用 Claude CLI: {}", message);
+        tracing::info!("调用 Claude CLI: {} (workdir: {:?})", message, workdir);
 
-        let output = Command::new("claude")
-            .arg("--print")
-            .arg(message)
-            .env_remove("CLAUDECODE")
+        let mut cmd = Command::new("claude");
+        cmd.arg("--print").arg(message).env_remove("CLAUDECODE");
+
+        // 设置工作目录
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
+
+        let output = cmd
             .output()
             .await
             .map_err(|e| format!("Failed to execute claude: {}", e))?;
@@ -222,8 +236,8 @@ impl AgentManager {
         }
     }
 
-    /// 调用外部进程
-    async fn call_process(&self, agent: &AgentInfo, message: &str) -> Result<String, String> {
+    /// 调用外部进程（带工作目录参数）
+    async fn call_process_with_dir(&self, agent: &AgentInfo, message: &str, workdir: Option<&str>) -> Result<String, String> {
         use tokio::process::Command;
 
         if agent.command.is_empty() {
@@ -242,8 +256,10 @@ impl AgentManager {
         // 添加消息作为最后一个参数或通过 stdin
         cmd.arg(message);
 
-        // 设置工作目录
-        if let Some(ref dir) = agent.working_dir {
+        // 设置工作目录（优先使用传入的，其次使用配置的）
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        } else if let Some(ref dir) = agent.working_dir {
             cmd.current_dir(dir);
         }
 
