@@ -54,10 +54,14 @@ pub enum SendMessageResult {
 /// 会话简要信息
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
+    /// 会话 ID
+    pub session_id: String,
     /// Agent ID
     pub agent_id: String,
     /// 工作目录
     pub workdir: Option<String>,
+    /// Claude session UUID (用于 --session-id 参数)
+    pub claude_session_uuid: Option<String>,
 }
 
 /// 解析权限提示
@@ -578,8 +582,10 @@ impl SessionManager {
     pub async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.lock().await;
         sessions.get(session_id).map(|s| SessionInfo {
+            session_id: s.id.clone(),
             agent_id: s.agent_id.clone(),
             workdir: s.workdir.clone(),
+            claude_session_uuid: s.claude_session_uuid.clone(),
         })
     }
 

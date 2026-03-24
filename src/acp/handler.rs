@@ -283,7 +283,7 @@ impl AcpHandler {
 
         tracing::debug!("ACP prompt (streaming) to session {}: {} chars", params.sessionId, message.len());
 
-        // Get session info to create streaming session
+        // Get session info from session manager
         let session_info = match self.session_manager.get_session_info(&params.sessionId).await {
             Some(info) => info,
             None => {
@@ -299,8 +299,16 @@ impl AcpHandler {
             }
         };
 
-        // Create streaming session
-        let mut streaming_session = StreamingSession::new(agent_info, session_info.workdir.as_deref());
+        // Create streaming session from existing session
+        let claude_uuid = session_info.claude_session_uuid
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let mut streaming_session = StreamingSession::from_session(
+            params.sessionId.clone(),
+            claude_uuid,
+            agent_info,
+            session_info.workdir.as_deref(),
+        );
 
         // For true streaming, we use spawn_blocking because StreamingSession uses blocking I/O
         // We use a sync channel within the blocking task and relay to async channel

@@ -29,11 +29,27 @@ pub struct StreamingSession {
 }
 
 impl StreamingSession {
-    /// Create a new streaming session
+    /// Create a new streaming session (for standalone use)
     pub fn new(agent_info: AgentInfo, workdir: Option<&str>) -> Self {
         let session_id = format!("sess_{}", Uuid::new_v4().simple());
         let claude_session_uuid = Uuid::new_v4().to_string();
 
+        Self {
+            session_id,
+            agent_info,
+            workdir: workdir.map(|s| s.to_string()),
+            claude_session_uuid,
+            tool_call_counter: 0,
+        }
+    }
+
+    /// Create from existing session (for ACP with session manager)
+    pub fn from_session(
+        session_id: String,
+        claude_session_uuid: String,
+        agent_info: AgentInfo,
+        workdir: Option<&str>,
+    ) -> Self {
         Self {
             session_id,
             agent_info,
