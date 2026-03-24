@@ -1,0 +1,488 @@
+   Compiling aginx v0.1.0 (/Users/sophiehe/Documents/yinnhoos/aginx)
+   Compiling aginx v0.1.0 (/Users/sophiehe/Documents/yinnhoos/aginx)
+warning: unused import: `JsonRpcErrorObject`
+ --> src/protocol/message.rs:6:46
+  |
+6 | use super::{JsonRpcRequest, JsonRpcResponse, JsonRpcErrorObject, RequestId};
+  |                                              ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `JsonRpcErrorObject`
+ --> src/protocol/message.rs:6:46
+  |
+6 | use super::{JsonRpcRequest, JsonRpcResponse, JsonRpcErrorObject, RequestId};
+  |                                              ^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `message::*`
+ --> warning: unused import: `message::*`
+ --> src/protocol/mod.rs:9:9
+  |
+9 | pub use message::*;
+  |         ^^^^^^^^^^
+
+src/protocol/mod.rs:9:9
+  |
+9 | pub use message::*;
+  |         ^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/agent/permission.rs:5:5
+  warning: unused import: `std::sync::Arc`
+ --> src/agent/permission.rs:5:5
+  |
+5 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+|
+5 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `PermissionManager`, `PermissionRequestPreview`, `PermissionRequest`, and `PermissionResponse`
+ --> src/agent/mod.rs:8:22
+  |
+8 | pub use permission::{PermissionManager, PermissionOption, PermissionRequest, PermissionRequestPreview, PermissionResponse};
+  |                      ^^^^^^^^^^^^^^^^^                    ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^warning: unused imports: `PermissionManager`, `PermissionRequestPreview`, `PermissionRequest`, and `PermissionResponse`
+ --> src/agent/mod.rs:8:22
+  |
+8 | pub use permission::{PermissionManager, PermissionOption, PermissionRequest, PermissionRequestPreview, PermissionResponse};
+  |                      ^^^^^^^^^^^^^^^^^                    ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PermissionOption as SessionPermissionOption`
+ --> src/agent/mod.rs:9:100
+  |
+9 | ...Info, SendMessageResult, PermissionPrompt, PermissionOption as SessionPermissionOption};
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+
+warning: unused import: `PermissionOption as SessionPermissionOption`
+ --> src/agent/mod.rs:9:100
+  |
+9 | ...Info, SendMessageResult, PermissionPrompt, PermissionOption as SessionPermissionOption};
+  |                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::BindingManager as BindingManagerAlias`
+   --> src/binding/mod.rs:221:9
+    |
+221 | pub use self::BindingManager as BindingManagerAlias;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `self::BindingManager as BindingManagerAlias`
+   --> src/binding/mod.rs:221:9
+    |
+221 | pub use self::BindingManager as BindingManagerAlias;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PermissionOutcome`
+ --> src/acp/handler.rs:9:146
+  |
+9 | ...nParams, LoadSessionParams, PromptParams, ContentBlock, PermissionOutcome};
+  |                                                            ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PermissionOutcome`
+ --> src/acp/handler.rs:9:146
+  |
+9 | ...nParams, LoadSessionParams, PromptParams, ContentBlock, PermissionOutcome};
+  |                                                            ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `SessionInfo`
+  --> src/acp/handler.rs:11:50
+   |
+11 | use crate::agent::{AgentManager, SessionManager, SessionInfo, SendMessageResult};
+   |                                                  ^^^^^^^^^^^
+
+warning: unused import: `SessionInfo`
+  --> src/acp/handler.rs:11:50
+   |
+11 | use crate::agent::{AgentManager, SessionManager, SessionInfo, SendMessageResult};
+   |                                                  ^^^^^^^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> src/acp/streaming.rs:9:17
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused imports: `Arc` and `Mutex`
+ --> src/acp/streaming.rs:9:17
+  |
+9 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `std::time::Duration`
+  --> warning: unused import: `std::time::Duration`
+  --> src/acp/streaming.rs:10:5
+   |
+10 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+src/acp/streaming.rs:10:5
+   |
+10 | use std::time::Duration;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `regex::Regex`
+   --> src/acp/streaming.rs:800:9
+    |
+800 |     use regex::Regex;
+    |         ^^^^^^^^^^^^
+
+warning: unused import: `regex::Regex`
+   --> src/acp/streaming.rs:800:9
+    |
+800 |     use regex::Regex;
+    |         ^^^^^^^^^^^^
+
+warning: unused import: `regex::Regex`
+   --> src/acp/streaming.rs:870:9
+    |
+870 |     use regex::Regex;
+    |         ^^^^^^^^^^^^
+
+warning: unused import: `regex::Regex`
+   --> src/acp/streaming.rs:870:9
+    |
+870 |     use regex::Regex;
+    |         ^^^^^^^^^^^^
+
+warning: unused import: `types::*`
+  --> src/acp/mod.rs:11:9
+   |
+11 warning: unused import: `types::*`
+  --> src/acp/mod.rs:11:9
+   |
+11 | pub use types::*;
+   |         ^^^^^^^^
+
+| pub use types::*;
+   |         ^^^^^^^^
+
+warning: unused import: `stream::*`
+  --> src/acp/mod.rs:13:9
+   |
+13 | pub use stream::*;
+   |         ^^^^^^^^^
+
+warning: unused import: `stream::*`
+  --> src/acp/mod.rs:13:9
+   |
+13 | pub use stream::*;
+   |         ^^^^^^^^^
+
+warning: unused import: `streaming::*`
+  --> src/acp/mod.rs:14:9
+   |
+14 | pub use streaming::*;
+   |         ^^^^^^^^^^^^
+
+warning: unused import: `streaming::*`
+  --> src/acp/mod.rs:14:9
+   |
+14 | pub use streaming::*;
+   |         ^^^^^^^^^^^^
+
+error[E0382]: borrow of moved value: `tx`
+   --> src/acp/handler.rs:363:37
+    error[E0382]: borrow of moved value: `tx`
+   --> src/acp/handler.rs:363:37
+    |
+254 |         tx: mpsc::Sender<String>,
+    |         -- move occurs because `tx` has type `tokio::sync::mpsc::Sender<std::string::String>`, which does not implement the `Copy` trait
+...
+329 |         let relay_handle = tokio::spawn(async move {
+    |                                         |
+254 |         tx: mpsc::Sender<String>,
+    |         -- move occurs because `tx` has type `tokio::sync::mpsc::Sender<std::string::String>`, which does not implement the `Copy` trait
+...
+329 |         let relay_handle = tokio::spawn(async move {
+    |                                         ---------- value moved here
+330 |             while let Ok(notification) = sync_rx.recv() {
+    |             ------------------------------------------- ---------- value moved here
+330 |             while let Ok(notification) = sync_rx.recv() {
+    |             ------------------------------------------- inside of this loop
+331 |                 if tx.send(notification).await.is_err() {
+    |                    -- variable moved due to use in coroutineinside of this loop
+331 |                 if tx.send(notification).await.is_err() {
+    |                    -- variable moved due to use in coroutine
+...
+363 |                             let _ = tx.send(json).await;
+    |                                     ^^ 
+...
+363 |                             let _ = tx.send(json).await;
+    |                                     ^^ value borrowed here after move
+    |
+help: consider cloning the value before moving it into the closure
+    |
+329 ~ value borrowed here after move
+    |
+help: consider cloning the value before moving it into the closure
+    |
+329 ~         let value = tx.clone();
+330 ~         let relay_handle = tokio::spawn(async move {
+331 |        let value = tx.clone();
+330 ~         let relay_handle = tokio::spawn(async move {
+331 |             while let Ok(notification) = sync_rx.recv() {
+332 ~                 if value.send(notification).await.is_err() {
+    |
+
+             while let Ok(notification) = sync_rx.recv() {
+332 ~                 if value.send(notification).await.is_err() {
+    |
+
+error[E0382]: borrow of moved value: `tx`
+   --> src/acp/handler.rs:653:45
+    |
+525 |         tx: mpsc::Sender<String>,
+    |         -- error[E0382]: borrow of moved value: `tx`
+   --> src/acp/handler.rs:653:45
+    |
+525 |         tx: mpsc::Sender<String>,
+    |         -- move occurs because `tx` has type `tokio::sync::mpsc::Sender<std::string::String>`, which does not implement the `Copy` trait
+...
+620 |                 let relay_handle = tokio::spawn(async move {
+    |                                                 ---------- value moved here
+621 |                     while let Ok(notification) = sync_rx.recv() {
+    |                     ------------------------------------------- inside of this loop
+622 |                         if tx.send(notification).await.is_err() {
+    |                            -- variable moved due to use in coroutine
+move occurs because `tx` has type `tokio::sync::mpsc::Sender<std::string::String>`, which does not implement the `Copy` trait
+...
+620 |                 let relay_handle = tokio::spawn(async move {
+    |                                                 ---------- value moved here
+621 |                     while let Ok(notification) = sync_rx.recv() {
+    |                     ------------------------------------------- inside of this loop
+622 |                         if tx.send(notification).await.is_err() {
+    |                            -- variable moved due to use in coroutine
+...
+653 |                                     let _ = tx.send(json).await;
+    |                                             ^^ value borrowed here after move
+    |...
+653 |                                     let _ = tx.send(json).await;
+    |                                             ^^ value borrowed here after move
+    |
+help: consider cloning the value before moving it into the closure
+    |
+620 ~                 let value = tx.clone();
+
+help: consider cloning the value before moving it into the closure
+    |
+620 ~                 let value = tx.clone();
+621 ~                 let relay_handle = tokio::spawn(async move {
+622 |                     while let Ok(notification) = sync_rx.recv() {
+623 ~ 621 ~                 let relay_handle = tokio::spawn(async move {
+622 |                     while let Ok(notification) = sync_rx.recv() {
+623 ~                         if value.send(notification).await.is_err() {
+    |
+
+                        if value.send(notification).await.is_err() {
+    |
+
+error[E0308]: mismatched types
+   --> src/acp/streaming.rs:516:34
+    |
+516 |                         options: perm.options,
+    |                                  ^^^^^^^^^^^^ expected `permission::PermissionOption`, found `session::PermissionOption`
+    |
+    = note: `session::PermissionOption` and `permission::PermissionOption` have similar names, but are actually distinct types
+noteerror[E0308]: mismatched types
+   --> src/acp/streaming.rs:516:34
+    |
+516 |                         options: perm.options,
+    |                                  ^^^^^^^^^^^^ expected `permission::PermissionOption`, found `session::PermissionOption`
+    |
+    = note: `session::PermissionOption` and `permission::PermissionOption` have similar names, but are actually distinct types
+note: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   --> src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   --> src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+error[E0308]: mismatched types
+   --> src/acp/streaming.rs:647:34
+    |
+647 |                         options: perm.options,
+    |                                  ^^^^^^^^^^^^ expected `permission::PermissionOption`, found `session::PermissionOption`
+    |
+    = note: `session::PermissionOption` and `permission::PermissionOption` have similar names, but are actually distinct types
+note: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   error[E0308]: mismatched types
+   --> src/acp/streaming.rs:647:34
+    |
+647 |                         options: perm.options,
+    |                                  ^^^^^^^^^^^^ expected `permission::PermissionOption`, found `session::PermissionOption`
+    |
+    = note: `session::PermissionOption` and `permission::PermissionOption` have similar names, but are actually distinct types
+note: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   --> src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+--> src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> src/acp/streaming.rs:861:13
+    |error[E0308]: mismatched types
+   --> src/acp/streaming.rs:861:13
+    |
+822 |                         options.push(opt);
+    |                         -------      --- this argument has type `permission::PermissionOption`...
+    |                         |
+    |                         ... which causes `options` to have type `Vec<permission::PermissionOption>`
+...
+861 |             options,
+    |             ^^^^^^^ expected `session::PermissionOption`, found `permission::PermissionOption`
+822 |                         options.push(opt);
+    |                         -------      --- this argument has type `permission::PermissionOption`...
+    |                         |
+    |                         ... which causes `options` to have type `Vec<permission::PermissionOption>`
+...
+861 |             options,
+    |             ^^^^^^^ expected `session::PermissionOption`, found `permission::PermissionOption`
+    |
+    = note
+    |
+    = note: `permission::PermissionOption` and `session::PermissionOption` have similar names, but are actually distinct types
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24: `permission::PermissionOption` and `session::PermissionOption` have similar names, but are actually distinct types
+note: `permission::PermissionOption` is defined in module `crate::agent::permission` of the current crate
+   --> src/agent/permission.rs:24:1
+    |
+ 24 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   -->  | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: `session::PermissionOption` is defined in module `crate::agent::session` of the current crate
+   --> src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/agent/session.rs:31:1
+    |
+ 31 | pub struct PermissionOption {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+warning: unused variable: `code`
+   --> src/binding/mod.rs:104:30
+    |warning: unused variable: `code`
+   --> src/binding/mod.rs:104:30
+    |
+104 |     fn save_pair_code(&self, code: &str) -> anyhow::Result<()> {
+    |                              ^^^^ help: if this is intentional, prefix it with an underscore: `_code`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+
+104 |     fn save_pair_code(&self, code: &str) -> anyhow::Result<()> {
+    |                              ^^^^ help: if this is intentional, prefix it with an underscore: `_code`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `code`
+   --> src/binding/mod.rs:114:30
+    |
+114 |     fn load_pair_code(&self, code: &str) -> Option<PairCodeData> {
+    |                              ^^^^ help: if this is intentional, prefix it with an underscore: `_code`
+
+warning: unused variable: `code`
+   --> src/binding/mod.rs:114:30
+    |
+114 |     fn load_pair_code(&self, code: &str) -> Option<PairCodeData> {
+    |                              ^^^^ help: if this is intentional, prefix it with an underscore: `_code`
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:103:63
+    |
+103 |     pub fn send_prompt_streaming<F>(&mut self, message: &str, mut on_update: F) -> Result<StopReason, String>
+    |                                                               ----^^^^^^^^^
+    |                                                               |
+    |                                                               help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:103:63
+    |
+103 |     pub fn send_prompt_streaming<F>(&mut self, message: &str, mut on_update: F) -> Result<StopReason, String>
+    |                                                               ----^^^^^^^^^
+    |                                                               |
+    |                                                               help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:377:9
+    |
+377 |         mut on_update: F,
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:377:9
+    |
+377 |         mut on_update: F,
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:403:9
+    |
+403 |         mut on_update: F,
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> src/acp/streaming.rs:403:9
+    |
+403 |         mut on_update: F,
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+Some errors have detailed explanations: E0308, E0382.
+Some errors have detailed explanations: E0308, E0382.
+For more information about an error, try `rustc --explain E0308`.
+For more information about an error, try `rustc --explain E0308`.
+warning: `aginx` (bin "aginx") generated 20 warnings
+warning: `aginx` (bin "aginx") generated 20 warnings
+error: could not compile `aginx` (bin "aginx") due to 5 previous errors; 20 warnings emitted
+error: could not compile `aginx` (bin "aginx") due to 5 previous errors; 20 warnings emitted

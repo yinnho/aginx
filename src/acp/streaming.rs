@@ -135,6 +135,7 @@ impl StreamingSession {
             .arg("--output-format")
             .arg("stream-json")
             .arg("--verbose")
+            .arg("--dangerously-skip-permissions")
             .arg("--session-id")
             .arg(&self.claude_session_uuid)
             .env_remove("CLAUDECODE");

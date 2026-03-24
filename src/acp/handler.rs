@@ -315,14 +315,17 @@ impl AcpHandler {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel::<String>();
         let message_inner = message.clone();
 
-        // Spawn blocking task for streaming with interactive mode (supports permissions)
+        // Spawn blocking task for streaming (uses JSON streaming with auto-approved permissions)
         let streaming_handle = tokio::task::spawn_blocking(move || {
             let on_update = |notification: &str| -> Result<(), String> {
                 sync_tx.send(notification.to_string())
                     .map_err(|e| format!("Failed to send: {}", e))
             };
 
-            streaming_session.send_prompt_interactive(&message_inner, on_update)
+            match streaming_session.send_prompt_streaming(&message_inner, on_update) {
+                Ok(stop_reason) => super::streaming::StreamingResult::Completed(stop_reason),
+                Err(e) => super::streaming::StreamingResult::Error(e),
+            }
         });
 
         // Relay notifications from sync channel to async channel
