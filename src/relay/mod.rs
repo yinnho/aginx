@@ -612,18 +612,14 @@ async fn process_request(
                     .and_then(|p| p.get("agentId"))
                     .and_then(|v| v.as_str());
 
-                // 如果没有指定 agentId，使用配置中的第一个 agent
+                // 必须指定 agentId
                 let agent_id = match agent_id {
                     Some(id) => id.to_string(),
                     None => {
-                        let agents = agent_manager.list_agents().await;
-                        if agents.is_empty() {
-                            return Some(JsonRpcResponse::error(
-                                id,
-                                JsonRpcErrorObject::invalid_params("No agent configured"),
-                            ));
-                        }
-                        agents[0].get("id").and_then(|v| v.as_str()).unwrap_or("echo").to_string()
+                        return Some(JsonRpcResponse::error(
+                            id,
+                            JsonRpcErrorObject::invalid_params("agentId is required"),
+                        ));
                     }
                 };
 
