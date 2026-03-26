@@ -219,7 +219,14 @@ impl AgentManager {
 
         tracing::info!("调用 Claude CLI: {} (workdir: {:?})", message, workdir);
 
-        let mut cmd = Command::new("claude");
+        // 使用配置的 command 或默认 "claude"
+        let claude_cmd = if agent.command.is_empty() {
+            "claude"
+        } else {
+            &agent.command
+        };
+
+        let mut cmd = Command::new(claude_cmd);
         cmd.arg("--print").arg(message);
 
         // 使用配置的 env_remove
@@ -235,7 +242,7 @@ impl AgentManager {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("Failed to execute claude: {}", e))?;
+            .map_err(|e| format!("Failed to spawn {}: {}", claude_cmd, e))?;
 
         if output.status.success() {
             let result = String::from_utf8_lossy(&output.stdout).to_string();
