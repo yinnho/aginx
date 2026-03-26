@@ -328,7 +328,7 @@ impl AgentConfig {
         }
     }
 
-    /// 创建 Claude agent 配置
+    /// 创建 Claude agent 配置（需要用户配置 command）
     pub fn claude() -> Self {
         Self {
             id: "claude".to_string(),
@@ -336,9 +336,9 @@ impl AgentConfig {
             agent_type: AgentType::Claude,
             capabilities: vec!["chat".to_string(), "code".to_string(), "ask".to_string()],
             description: "AI programming assistant".to_string(),
-            command: "claude".to_string(),  // 默认命令，用户可覆盖
+            command: String::new(),  // 必须由用户配置
             args: Vec::new(),
-            help_command: "claude --help".to_string(),
+            help_command: String::new(),
             working_dir: None,
             require_workdir: true,
             env: std::collections::HashMap::new(),
@@ -354,7 +354,7 @@ impl Default for AgentsConfig {
             list: vec![
                 AgentConfig::builtin("echo", "Echo Agent", vec!["echo"]),
                 AgentConfig::builtin("info", "Info Agent", vec!["info"]),
-                AgentConfig::claude(),
+                // Claude agent 需要用户显式配置 command
             ],
         }
     }

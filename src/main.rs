@@ -110,9 +110,9 @@ enum Commands {
         #[arg(long)]
         stdio: bool,
 
-        /// 指定默认 Agent ID
-        #[arg(short = 'a', long, default_value = "claude")]
-        agent: String,
+        /// 指定默认 Agent ID (必须配置)
+        #[arg(short = 'a', long)]
+        agent: Option<String>,
     },
 }
 
@@ -331,7 +331,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 }
 
 /// 运行 ACP 模式
-async fn run_acp_mode(stdio: bool, default_agent: String) -> anyhow::Result<()> {
+async fn run_acp_mode(stdio: bool, default_agent: Option<String>) -> anyhow::Result<()> {
     use crate::agent::{SessionManager, SessionConfig};
     use crate::acp::run_acp_stdio;
 
@@ -351,7 +351,11 @@ async fn run_acp_mode(stdio: bool, default_agent: String) -> anyhow::Result<()> 
     // 启动超时清理任务
     let cleanup_handle = session_manager.clone().start_cleanup_task();
 
-    tracing::info!("ACP 模式启动, 默认 Agent: {}", default_agent);
+    if let Some(ref agent) = default_agent {
+        tracing::info!("ACP 模式启动, 默认 Agent: {}", agent);
+    } else {
+        tracing::info!("ACP 模式启动, Agent 需要通过请求指定");
+    }
 
     if stdio {
         // stdio 模式 - 被 IDE 启动

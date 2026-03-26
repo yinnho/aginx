@@ -610,8 +610,17 @@ async fn process_request(
                     .params
                     .as_ref()
                     .and_then(|p| p.get("agentId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude");
+                    .and_then(|v| v.as_str());
+
+                let agent_id = match agent_id {
+                    Some(id) => id,
+                    None => {
+                        return Some(JsonRpcResponse::error(
+                            id,
+                            JsonRpcErrorObject::invalid_params("agentId is required"),
+                        ));
+                    }
+                };
 
                 let message = request
                     .params

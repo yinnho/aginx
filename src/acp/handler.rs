@@ -127,8 +127,15 @@ impl AcpHandler {
                     .and_then(|p| p.get("agentId"))
                     .and_then(|v| v.as_str())
                     .map(String::from)
-            })
-            .unwrap_or_else(|| "claude".to_string());
+            });
+
+        // 必须指定 agentId
+        let agent_id = match agent_id {
+            Some(id) => id,
+            None => {
+                return AcpResponse::error(request.id, -32602, "agentId is required");
+            }
+        };
 
         // Get agent info
         let agent_info = match self.agent_manager.get_agent_info(&agent_id).await {
