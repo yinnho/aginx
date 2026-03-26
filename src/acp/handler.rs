@@ -115,7 +115,7 @@ impl AcpHandler {
             None => NewSessionParams::default()
         };
 
-        // Get agent ID from _meta or directly from params or use default
+        // Get agent ID from _meta or directly from params
         let agent_id = params._meta
             .as_ref()
             .and_then(|m| m.get("agentId"))
@@ -129,11 +129,16 @@ impl AcpHandler {
                     .map(String::from)
             });
 
-        // 必须指定 agentId
+        // 如果没有指定 agentId，使用配置中的第一个 agent
         let agent_id = match agent_id {
             Some(id) => id,
             None => {
-                return AcpResponse::error(request.id, -32602, "agentId is required");
+                // 获取配置的第一个 agent
+                let agents = self.agent_manager.list_agents().await;
+                if agents.is_empty() {
+                    return AcpResponse::error(request.id, -32602, "No agent configured");
+                }
+                agents[0].get("id").and_then(|v| v.as_str()).unwrap_or("echo").to_string()
             }
         };
 
