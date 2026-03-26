@@ -336,7 +336,7 @@ impl AgentConfig {
             agent_type: AgentType::Claude,
             capabilities: vec!["chat".to_string(), "code".to_string(), "ask".to_string()],
             description: "AI programming assistant".to_string(),
-            command: String::new(),
+            command: "claude".to_string(),  // 默认命令，用户可覆盖
             args: Vec::new(),
             help_command: "claude --help".to_string(),
             working_dir: None,
