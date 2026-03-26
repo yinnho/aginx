@@ -54,7 +54,11 @@ enum RelayMessage {
 
     /// 注册请求 (aginx -> relay)
     #[serde(rename = "register")]
-    Register { id: Option<String> },
+    Register {
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+    },
 
     /// 注册成功 (relay -> aginx)
     #[serde(rename = "registered")]
@@ -96,6 +100,8 @@ struct RelayState {
     client_senders: HashMap<String, (String, mpsc::Sender<String>)>,
     /// aginx 的客户端列表: aginx_id -> Vec<client_id>
     aginx_clients: HashMap<String, Vec<String>>,
+    /// 硬件指纹 -> aginx_id 映射 (用于恢复 ID)
+    fingerprint_to_id: HashMap<String, String>,
 }
 
 impl RelayState {
@@ -104,6 +110,7 @@ impl RelayState {
             aginx_senders: HashMap::new(),
             client_senders: HashMap::new(),
             aginx_clients: HashMap::new(),
+            fingerprint_to_id: HashMap::new(),
         }
     }
 }
@@ -172,7 +179,9 @@ async fn handle_connection(
         "register" => {
             // 提取用户指定的 ID (可选)
             let requested_id = json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-            handle_aginx(reader, writer, state, domain, peer_addr, requested_id).await
+            // 提取硬件指纹 (可选)
+            let fingerprint = json.get("fingerprint").and_then(|v| v.as_str()).map(|s| s.to_string());
+            handle_aginx(reader, writer, state, domain, peer_addr, requested_id, fingerprint).await
         }
         "connect" => {
             let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -200,6 +209,7 @@ async fn handle_aginx(
     domain: Arc<String>,
     peer_addr: SocketAddr,
     requested_id: Option<String>,
+    fingerprint: Option<String>,
 ) -> anyhow::Result<()> {
     // 确定使用哪个 ID
     let aginx_id = if let Some(id) = requested_id {
@@ -216,6 +226,23 @@ async fn handle_aginx(
             return Ok(());
         }
         id
+    } else if let Some(ref fp) = fingerprint {
+        // 没有指定 ID，但有指纹，尝试根据指纹恢复 ID
+        let state_read = state.read().await;
+        if let Some(existing_id) = state_read.fingerprint_to_id.get(fp) {
+            let existing_id = existing_id.clone();
+            tracing::info!("根据指纹恢复 ID: {} -> {}", fp, existing_id);
+            // 检查该 ID 是否当前在线
+            if state_read.aginx_senders.contains_key(&existing_id) {
+                drop(state_read);
+                send_error(&writer, &format!("Device with this fingerprint is already online (ID: {})", existing_id)).await;
+                return Ok(());
+            }
+            existing_id
+        } else {
+            // 没有找到映射，生成新 ID
+            generate_id()
+        }
     } else {
         // 自动生成 ID
         generate_id()
@@ -223,7 +250,7 @@ async fn handle_aginx(
 
     let url = format!("agent://{}.{}", aginx_id, domain);
 
-    tracing::info!("Aginx [{}] registered from {}", aginx_id, peer_addr);
+    tracing::info!("Aginx [{}] registered from {} (fingerprint: {:?})", aginx_id, peer_addr, fingerprint.as_ref().map(|_| "***"));
 
     // 创建接收通道
     let (tx, mut rx) = mpsc::channel::<ToAginx>(100);
@@ -237,6 +264,11 @@ async fn handle_aginx(
         }
         state.aginx_senders.insert(aginx_id.clone(), tx);
         state.aginx_clients.insert(aginx_id.clone(), Vec::new());
+
+        // 存储指纹映射
+        if let Some(fp) = fingerprint {
+            state.fingerprint_to_id.insert(fp, aginx_id.clone());
+        }
     }
 
     // 发送注册成功

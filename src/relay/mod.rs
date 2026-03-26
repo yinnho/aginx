@@ -29,8 +29,13 @@ pub enum RelayMessage {
     Pong,
 
     /// 注册请求 (aginx -> relay)
+    /// fingerprint: 硬件指纹，用于重置后恢复原 aginx_id
     #[serde(rename = "register")]
-    Register { id: Option<String> },
+    Register {
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+    },
 
     /// 注册成功 (relay -> aginx)
     #[serde(rename = "registered")]
@@ -60,13 +65,20 @@ pub struct Registration {
 pub async fn register_id() -> anyhow::Result<Registration> {
     tracing::info!("首次启动，正在向 {} 申请 ID...", DEFAULT_RELAY_SERVER);
 
+    // 生成硬件指纹
+    let fingerprint = crate::fingerprint::HardwareFingerprint::generate();
+    tracing::info!("硬件指纹: {}", fingerprint.as_str());
+
     // 连接到 relay
     let stream = TcpStream::connect(DEFAULT_RELAY_SERVER).await?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    // 发送注册请求（不指定 ID，让 relay 分配）
-    let register = RelayMessage::Register { id: None };
+    // 发送注册请求（携带硬件指纹，让 relay 分配/恢复 ID）
+    let register = RelayMessage::Register {
+        id: None,
+        fingerprint: Some(fingerprint.as_str().to_string()),
+    };
     let register_json = serde_json::to_string(&register)?;
     writer.write_all(format!("{}\n", register_json).as_bytes()).await?;
     writer.flush().await?;
@@ -164,8 +176,15 @@ impl RelayClient {
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(Mutex::new(writer));
 
-        // 发送注册请求 (携带已配置的 ID)
-        let register = RelayMessage::Register { id: Some(self.aginx_id.clone()) };
+        // 生成硬件指纹
+        let fingerprint = crate::fingerprint::HardwareFingerprint::generate();
+        tracing::debug!("硬件指纹: {}", fingerprint.as_str());
+
+        // 发送注册请求 (携带已配置的 ID 和硬件指纹)
+        let register = RelayMessage::Register {
+            id: Some(self.aginx_id.clone()),
+            fingerprint: Some(fingerprint.as_str().to_string()),
+        };
         let register_json = serde_json::to_string(&register)?;
         {
             let mut w = writer.lock().await;
