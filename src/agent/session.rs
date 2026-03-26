@@ -60,8 +60,8 @@ pub struct SessionInfo {
     pub agent_id: String,
     /// 工作目录
     pub workdir: Option<String>,
-    /// Claude session UUID (用于 --session-id 参数)
-    pub claude_session_uuid: Option<String>,
+    /// Session UUID (用于保持上下文)
+    pub session_uuid: Option<String>,
 }
 
 /// 解析权限提示
@@ -192,6 +192,16 @@ pub struct Session {
     pub agent_id: String,
     /// Agent 类型
     agent_type: AgentType,
+    /// Agent 命令路径 (从配置读取)
+    command: String,
+    /// Agent 命令参数 (从配置读取)
+    args: Vec<String>,
+    /// Agent 环境变量 (从配置读取)
+    env: HashMap<String, String>,
+    /// 需要移除的环境变量 (从配置读取)
+    env_remove: Vec<String>,
+    /// Session ID 参数模板 (从配置读取，支持 ${SESSION_ID} 变量)
+    session_args: Vec<String>,
     /// 工作目录
     workdir: Option<String>,
     /// 进程 stdin 写入端 (仅用于 Process 类型)
@@ -202,12 +212,12 @@ pub struct Session {
     pub last_activity: Mutex<Instant>,
     /// 进程句柄（用于关闭时 kill, 仅用于 Process 类型）
     process: Mutex<Option<std::process::Child>>,
-    /// Claude 会话 UUID (仅用于 Claude 类型，用于 --session-id 参数)
-    claude_session_uuid: Option<String>,
+    /// Session UUID (用于保持上下文)
+    session_uuid: Option<String>,
     /// 信号量许可（持有它来限制并发）
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
-    /// 待处理的权限请求 (仅用于 Claude 类型)
+    /// 待处理的权限请求
     pending_permission: Mutex<Option<PendingPermission>>,
 }
 
@@ -227,19 +237,25 @@ impl Session {
 
         match agent_info.agent_type {
             AgentType::Claude => {
-                // Claude 类型：生成专用的 Claude session UUID，用于 --session-id 参数
-                let claude_uuid = Uuid::new_v4().to_string();
-                tracing::info!("会话 [{}] 创建成功 (Claude 模式)，Agent: {}, Claude UUID: {}", session_id, agent_info.id, claude_uuid);
+                // Claude 类型：生成 session UUID 用于保持上下文
+                let session_uuid = Uuid::new_v4().to_string();
+                tracing::info!("会话 [{}] 创建成功 (Claude 模式)，Agent: {}, Command: {}, Session UUID: {}",
+                    session_id, agent_info.id, agent_info.command, session_uuid);
                 Ok(Self {
                     id: session_id,
                     agent_id: agent_info.id.clone(),
                     agent_type: AgentType::Claude,
+                    command: agent_info.command.clone(),
+                    args: agent_info.args.clone(),
+                    env: agent_info.env.clone(),
+                    env_remove: agent_info.env_remove.clone(),
+                    session_args: agent_info.session_args.clone(),
                     workdir: workdir.map(|s| s.to_string()),
                     stdin: Mutex::new(None),
                     stdout: Mutex::new(None),
                     last_activity: Mutex::new(Instant::now()),
                     process: Mutex::new(None),
-                    claude_session_uuid: Some(claude_uuid),
+                    session_uuid: Some(session_uuid),
                     permit,
                     pending_permission: Mutex::new(None),
                 })
@@ -247,17 +263,23 @@ impl Session {
             AgentType::Process => {
                 // Process 类型：启动持久进程
                 let (stdin, stdout, process) = Self::spawn_process(agent_info, workdir)?;
-                tracing::info!("会话 [{}] 创建成功 (Process 模式)，Agent: {}", session_id, agent_info.id);
+                tracing::info!("会话 [{}] 创建成功 (Process 模式)，Agent: {}, Command: {}",
+                    session_id, agent_info.id, agent_info.command);
                 Ok(Self {
                     id: session_id,
                     agent_id: agent_info.id.clone(),
                     agent_type: AgentType::Process,
+                    command: agent_info.command.clone(),
+                    args: agent_info.args.clone(),
+                    env: agent_info.env.clone(),
+                    env_remove: agent_info.env_remove.clone(),
+                    session_args: agent_info.session_args.clone(),
                     workdir: workdir.map(|s| s.to_string()),
                     stdin: Mutex::new(Some(stdin)),
                     stdout: Mutex::new(Some(stdout)),
                     last_activity: Mutex::new(Instant::now()),
                     process: Mutex::new(Some(process)),
-                    claude_session_uuid: None,
+                    session_uuid: None,
                     permit,
                     pending_permission: Mutex::new(None),
                 })
@@ -337,33 +359,38 @@ impl Session {
         }
     }
 
-    /// Claude 类型：发送消息（每次启动新进程，使用 --session-id 保持上下文）
+    /// Claude 类型：发送消息（每次启动新进程，使用 session_args 保持上下文）
     async fn send_message_claude(&self, message: &str) -> Result<SendMessageResult, String> {
         use tokio::process::Command as AsyncCommand;
 
-        // 获取 Claude session UUID
-        let claude_uuid = self.claude_session_uuid.as_ref()
-            .ok_or("Claude session UUID not set")?;
+        // 获取 Session UUID
+        let session_uuid = self.session_uuid.as_ref()
+            .ok_or("Session UUID not set")?;
 
-        // 尝试找到 claude 命令的完整路径
-        let claude_path = if let Ok(path) = std::env::var("HOME") {
-            let npm_path = format!("{}/.npm-global/bin/claude", path);
-            if std::path::Path::new(&npm_path).exists() {
-                npm_path
-            } else {
-                "claude".to_string()
-            }
-        } else {
-            "claude".to_string()
-        };
+        tracing::debug!("会话 [{}] 发送消息, Command: {}, Session UUID: {}", self.id, self.command, session_uuid);
 
-        tracing::debug!("Claude 会话 [{}] 发送消息到 {}, UUID: {}", self.id, claude_path, claude_uuid);
+        let mut cmd = AsyncCommand::new(&self.command);
 
-        let mut cmd = AsyncCommand::new(&claude_path);
-        cmd.arg("--print")
-            .arg("--session-id")
-            .arg(claude_uuid)
-            .env_remove("CLAUDECODE");
+        // 添加配置中的参数
+        for arg in &self.args {
+            cmd.arg(arg);
+        }
+
+        // 添加 session 参数（支持 ${SESSION_ID} 变量替换）
+        for arg in &self.session_args {
+            let processed_arg = arg.replace("${SESSION_ID}", session_uuid);
+            cmd.arg(processed_arg);
+        }
+
+        // 移除配置中指定的环境变量
+        for env_key in &self.env_remove {
+            cmd.env_remove(env_key);
+        }
+
+        // 添加配置中的环境变量
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
 
         if let Some(ref dir) = self.workdir {
             cmd.current_dir(dir);
@@ -585,7 +612,7 @@ impl SessionManager {
             session_id: s.id.clone(),
             agent_id: s.agent_id.clone(),
             workdir: s.workdir.clone(),
-            claude_session_uuid: s.claude_session_uuid.clone(),
+            session_uuid: s.session_uuid.clone(),
         })
     }
 
@@ -652,28 +679,33 @@ impl SessionManager {
         let pending = pending.ok_or("No pending permission request")?;
         tracing::info!("响应权限请求 [{}]: choice={}", pending.request_id, choice);
 
-        // 获取 Claude session UUID
-        let claude_uuid = session.claude_session_uuid.as_ref()
-            .ok_or("Claude session UUID not set")?;
+        // 获取 Session UUID
+        let session_uuid = session.session_uuid.as_ref()
+            .ok_or("Session UUID not set")?;
 
-        // 尝试找到 claude 命令的完整路径
-        let claude_path = if let Ok(path) = std::env::var("HOME") {
-            let npm_path = format!("{}/.npm-global/bin/claude", path);
-            if std::path::Path::new(&npm_path).exists() {
-                npm_path
-            } else {
-                "claude".to_string()
-            }
-        } else {
-            "claude".to_string()
-        };
+        // 构建命令，使用配置的 command 和 session_args 保持上下文
+        let mut cmd = AsyncCommand::new(&session.command);
 
-        // 构建命令，使用 --print 和 --session-id 保持上下文
-        let mut cmd = AsyncCommand::new(&claude_path);
-        cmd.arg("--print")
-            .arg("--session-id")
-            .arg(claude_uuid)
-            .env_remove("CLAUDECODE");
+        // 添加配置中的参数
+        for arg in &session.args {
+            cmd.arg(arg);
+        }
+
+        // 添加 session 参数（支持 ${SESSION_ID} 变量替换）
+        for arg in &session.session_args {
+            let processed_arg = arg.replace("${SESSION_ID}", session_uuid);
+            cmd.arg(processed_arg);
+        }
+
+        // 移除配置中指定的环境变量
+        for env_key in &session.env_remove {
+            cmd.env_remove(env_key);
+        }
+
+        // 添加配置中的环境变量
+        for (key, value) in &session.env {
+            cmd.env(key, value);
+        }
 
         if let Some(ref dir) = session.workdir {
             cmd.current_dir(dir);

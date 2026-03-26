@@ -299,6 +299,13 @@ pub struct AgentConfig {
     /// 环境变量
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
+    /// 需要移除的环境变量
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_remove: Vec<String>,
+    /// Session ID 参数模板 (支持 ${SESSION_ID} 变量)
+    /// 例如: ["--session-id", "${SESSION_ID}"]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_args: Vec<String>,
 }
 
 impl AgentConfig {
@@ -316,6 +323,8 @@ impl AgentConfig {
             working_dir: None,
             require_workdir: false,
             env: std::collections::HashMap::new(),
+            env_remove: Vec::new(),
+            session_args: Vec::new(),
         }
     }
 
@@ -331,8 +340,10 @@ impl AgentConfig {
             args: Vec::new(),
             help_command: "claude --help".to_string(),
             working_dir: None,
-            require_workdir: false,
+            require_workdir: true,
             env: std::collections::HashMap::new(),
+            env_remove: vec!["CLAUDECODE".to_string()],
+            session_args: vec!["--session-id".to_string(), "${SESSION_ID}".to_string()],
         }
     }
 }

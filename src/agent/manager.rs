@@ -28,6 +28,10 @@ pub struct AgentInfo {
     pub working_dir: Option<String>,
     pub require_workdir: bool,
     pub env: HashMap<String, String>,
+    /// 需要移除的环境变量
+    pub env_remove: Vec<String>,
+    /// Session ID 参数模板 (支持 ${SESSION_ID} 变量)
+    pub session_args: Vec<String>,
 }
 
 impl From<AgentConfig> for AgentInfo {
@@ -43,6 +47,8 @@ impl From<AgentConfig> for AgentInfo {
             working_dir: config.working_dir.map(|p| p.to_string_lossy().to_string()),
             require_workdir: config.require_workdir,
             env: config.env,
+            env_remove: config.env_remove,
+            session_args: config.session_args,
         }
     }
 }
@@ -193,7 +199,7 @@ impl AgentManager {
 
         match &agent.agent_type {
             AgentType::Builtin => self.handle_builtin(agent_id, message).await,
-            AgentType::Claude => self.call_claude(message, effective_workdir.as_deref()).await,
+            AgentType::Claude => self.call_claude(agent, message, effective_workdir.as_deref()).await,
             AgentType::Process => self.call_process_with_dir(agent, message, effective_workdir.as_deref()).await,
         }
     }
@@ -208,13 +214,18 @@ impl AgentManager {
     }
 
     /// 调用 Claude CLI
-    async fn call_claude(&self, message: &str, workdir: Option<&str>) -> Result<String, String> {
+    async fn call_claude(&self, agent: &AgentInfo, message: &str, workdir: Option<&str>) -> Result<String, String> {
         use tokio::process::Command;
 
         tracing::info!("调用 Claude CLI: {} (workdir: {:?})", message, workdir);
 
         let mut cmd = Command::new("claude");
-        cmd.arg("--print").arg(message).env_remove("CLAUDECODE");
+        cmd.arg("--print").arg(message);
+
+        // 使用配置的 env_remove
+        for env in &agent.env_remove {
+            cmd.env_remove(env);
+        }
 
         // 设置工作目录
         if let Some(dir) = workdir {

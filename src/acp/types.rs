@@ -146,6 +146,32 @@ pub struct ListSessionsParams {
     pub _meta: Option<serde_json::Value>,
 }
 
+/// Bind device request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindDeviceParams {
+    /// Pairing code
+    pub pairCode: String,
+    /// Device name
+    #[serde(default)]
+    pub deviceName: Option<String>,
+}
+
+/// Bind device response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindDeviceResult {
+    /// Whether binding was successful
+    pub success: bool,
+    /// Device ID (if successful)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deviceId: Option<String>,
+    /// Token (if successful)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Error message (if failed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 // ============================================================================
 // Response Types
 // ============================================================================

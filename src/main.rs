@@ -13,6 +13,7 @@ mod agent;
 mod relay;
 mod binding;
 mod acp;
+mod fingerprint;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,6 +99,9 @@ enum Commands {
         /// 设备 ID
         device_id: String,
     },
+
+    /// 显示设备硬件指纹
+    Fingerprint,
 
     /// ACP 协议模式 (Agent Client Protocol)
     /// 用于 IDE 集成 (Zed, Cursor, VS Code 等)
@@ -301,6 +305,22 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             } else {
                 println!("设备 {} 不存在", device_id);
             }
+        }
+        Commands::Fingerprint => {
+            use crate::fingerprint::HardwareFingerprint;
+
+            let fp = HardwareFingerprint::generate();
+
+            println!("========================================");
+            println!("设备硬件指纹");
+            println!("========================================");
+            println!("");
+            println!("MAC 地址: {}", fp.mac_address.as_deref().unwrap_or("无法获取"));
+            println!("硬盘序列号: {}", fp.disk_serial.as_deref().unwrap_or("无法获取"));
+            println!("主板 UUID: {}", fp.motherboard_uuid.as_deref().unwrap_or("无法获取"));
+            println!("");
+            println!("设备指纹: {}", fp.fingerprint);
+            println!("========================================");
         }
         Commands::Acp { stdio, agent } => {
             run_acp_mode(stdio, agent).await?;

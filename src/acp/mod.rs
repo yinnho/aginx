@@ -8,6 +8,9 @@ mod handler;
 mod stream;
 mod streaming;
 
+#[cfg(test)]
+mod tests;
+
 pub use types::*;
 pub use handler::*;
 pub use stream::*;

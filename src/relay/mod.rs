@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::agent::{AgentManager, SessionConfig, SessionManager};
+use crate::binding;
 use crate::config::{Config, DEFAULT_RELAY_SERVER};
 use crate::protocol::{JsonRpcErrorObject, JsonRpcRequest, JsonRpcResponse};
+use crate::acp::{AcpHandler, AcpRequest, Id as AcpId};
 
 /// Relay 消息类型
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -99,7 +101,7 @@ pub struct RelayClient {
     /// 重连间隔 (秒)
     reconnect_interval: u64,
     /// Agent Manager
-    agent_manager: AgentManager,
+    agent_manager: Arc<AgentManager>,
     /// Session Manager
     session_manager: Arc<SessionManager>,
 }
@@ -120,6 +122,7 @@ impl RelayClient {
             timeout_seconds: config.server.session_timeout_seconds,
         };
         let session_manager = Arc::new(SessionManager::new(session_config));
+        let agent_manager = Arc::new(agent_manager);
 
         Self {
             relay_url,
@@ -286,7 +289,7 @@ async fn handle_data_message(
     client_id: &str,
     data: serde_json::Value,
     config: &Arc<Config>,
-    agent_manager: &AgentManager,
+    agent_manager: &Arc<AgentManager>,
     session_manager: &Arc<SessionManager>,
 ) -> anyhow::Result<()> {
     // 解析 JSON-RPC 请求
@@ -299,27 +302,128 @@ async fn handle_data_message(
         }
     });
 
-    // 处理请求
-    let response = process_request(request, config, agent_manager, session_manager).await;
+    // 检查是否是 ACP 流式方法
+    if request.method == "prompt" || request.method == "permissionResponse" {
+        // 使用流式处理
+        handle_acp_streaming_request(writer, client_id, request, agent_manager, session_manager).await
+    } else {
+        // 普通请求
+        let response = process_request(request, config, agent_manager, session_manager).await;
 
-    // 发送响应 (带 clientId)
-    if let Some(resp) = response {
-        let resp_json = serde_json::to_value(&resp)?;
-        let resp_with_client = serde_json::json!({
-            "clientId": client_id,
-            "jsonrpc": resp_json.get("jsonrpc").unwrap_or(&serde_json::json!("2.0")),
-            "id": resp_json.get("id"),
-            "result": resp_json.get("result"),
-            "error": resp_json.get("error"),
-        });
-        let resp_text = serde_json::to_string(&resp_with_client)?;
+        // 发送响应 (带 clientId)
+        if let Some(resp) = response {
+            send_response(writer, client_id, &resp).await?;
+        }
 
-        let mut w = writer.lock().await;
-        w.write_all(format!("{}\n", resp_text).as_bytes()).await?;
-        w.flush().await?;
-
-        tracing::debug!("发送响应给客户端 [{}]", client_id);
+        Ok(())
     }
+}
+
+/// 发送响应给客户端
+async fn send_response(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    client_id: &str,
+    resp: &JsonRpcResponse,
+) -> anyhow::Result<()> {
+    let resp_json = serde_json::to_value(resp)?;
+    let resp_with_client = serde_json::json!({
+        "clientId": client_id,
+        "jsonrpc": resp_json.get("jsonrpc").unwrap_or(&serde_json::json!("2.0")),
+        "id": resp_json.get("id"),
+        "result": resp_json.get("result"),
+        "error": resp_json.get("error"),
+    });
+    let resp_text = serde_json::to_string(&resp_with_client)?;
+
+    let mut w = writer.lock().await;
+    w.write_all(format!("{}\n", resp_text).as_bytes()).await?;
+    w.flush().await?;
+
+    tracing::debug!("发送响应给客户端 [{}]", client_id);
+    Ok(())
+}
+
+/// 处理 ACP 流式请求
+async fn handle_acp_streaming_request(
+    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    client_id: &str,
+    request: JsonRpcRequest,
+    agent_manager: &Arc<AgentManager>,
+    session_manager: &Arc<SessionManager>,
+) -> anyhow::Result<()> {
+    // 转换 ID 类型
+    let acp_id = request.id.as_ref().map(|id| match id {
+        crate::protocol::RequestId::String(s) => AcpId::String(s.clone()),
+        crate::protocol::RequestId::Number(n) => AcpId::Number(*n),
+        crate::protocol::RequestId::Null => AcpId::String("null".to_string()),
+    });
+
+    // 转换为 ACP 请求
+    let acp_request = AcpRequest {
+        jsonrpc: request.jsonrpc.clone(),
+        id: acp_id,
+        method: request.method.clone(),
+        params: request.params,
+    };
+
+    // 创建 ACP handler
+    let handler = Arc::new(AcpHandler::new(agent_manager.clone(), session_manager.clone()));
+
+    // 创建通知 channel
+    let (tx, mut rx) = mpsc::channel::<String>(32);
+
+    // 克隆 writer 用于发送通知
+    let writer_clone = writer.clone();
+    let client_id_clone = client_id.to_string();
+
+    // 启动通知转发任务
+    let notify_handle = tokio::spawn(async move {
+        while let Some(notification) = rx.recv().await {
+            // 通知已经是 NDJSON 格式，直接发送
+            // 合并通知和 clientId
+            let mut notification_value: serde_json::Value = serde_json::from_str(&notification).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = notification_value.as_object_mut() {
+                obj.insert("clientId".to_string(), serde_json::json!(client_id_clone.clone()));
+            }
+            let resp_text = serde_json::to_string(&notification_value).unwrap_or(notification);
+
+            let mut w = writer_clone.lock().await;
+            if let Err(e) = w.write_all(format!("{}\n", resp_text).as_bytes()).await {
+                tracing::error!("发送通知失败: {}", e);
+                break;
+            }
+            if let Err(e) = w.flush().await {
+                tracing::error!("刷新失败: {}", e);
+                break;
+            }
+        }
+    });
+
+    // 处理请求
+    let response = if request.method == "prompt" {
+        handler.handle_prompt_streaming(acp_request, tx).await
+    } else {
+        handler.handle_permission_response_streaming(acp_request, tx).await
+    };
+
+    // tx 已在 handler 中被消费，channel 会在 handler 完成后关闭
+    // 等待通知任务完成
+    let _ = notify_handle.await;
+
+    // 转换 ACP 响应为 JSON-RPC 响应
+    let id = response.id.map(|id| match id {
+        crate::acp::Id::String(s) => crate::protocol::RequestId::String(s),
+        crate::acp::Id::Number(n) => crate::protocol::RequestId::Number(n),
+    });
+
+    let json_rpc_response = if let Some(error) = response.error {
+        JsonRpcResponse::error(id, JsonRpcErrorObject::new(error.code, &error.message, error.data))
+    } else {
+        JsonRpcResponse::success(id, response.result.unwrap_or(serde_json::json!({})))
+    };
+
+    // 发送最终响应
+    send_response(writer, client_id, &json_rpc_response).await?;
 
     Ok(())
 }
@@ -328,7 +432,7 @@ async fn handle_data_message(
 async fn process_request(
     request: JsonRpcRequest,
     config: &Arc<Config>,
-    agent_manager: &AgentManager,
+    agent_manager: &Arc<AgentManager>,
     session_manager: &Arc<SessionManager>,
 ) -> Option<JsonRpcResponse> {
     let id = request.id.clone();
@@ -397,19 +501,27 @@ async fn process_request(
                 )),
             }
         }
-        "createSession" => {
+        // ACP 风格的 newSession (与 createSession 相同)
+        "newSession" | "createSession" => {
+            // 支持从 _meta.agentId 或直接从 agentId 获取
             let agent_id = request
                 .params
                 .as_ref()
-                .and_then(|p| p.get("agentId"))
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("agentId"))
                 .and_then(|v| v.as_str())
+                .or_else(|| {
+                    request.params.as_ref()
+                        .and_then(|p| p.get("agentId"))
+                        .and_then(|v| v.as_str())
+                })
                 .unwrap_or("");
 
-            // 获取可选的 workdir 参数
+            // 获取可选的 workdir/cwd 参数
             let workdir = request
                 .params
                 .as_ref()
-                .and_then(|p| p.get("workdir"))
+                .and_then(|p| p.get("cwd").or_else(|| p.get("workdir")))
                 .and_then(|v| v.as_str());
 
             if agent_id.is_empty() {
@@ -428,8 +540,7 @@ async fn process_request(
                         Ok(session_id) => Some(JsonRpcResponse::success(
                             id,
                             serde_json::json!({
-                                "sessionId": session_id,
-                                "agentId": agent_id
+                                "sessionId": session_id
                             }),
                         )),
                         Err(e) => Some(JsonRpcResponse::error(
@@ -531,6 +642,50 @@ async fn process_request(
                 Err(e) => Some(JsonRpcResponse::error(
                     id,
                     JsonRpcErrorObject::new(404, &e, None),
+                )),
+            }
+        }
+        "bindDevice" => {
+            let pair_code = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("pairCode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let device_name = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("deviceName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown Device");
+
+            if pair_code.is_empty() {
+                return Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::invalid_params("pairCode is required"),
+                ));
+            }
+
+            // 使用单例 BindingManager
+            let manager = binding::get_binding_manager();
+            let mut binding_manager = manager.lock().unwrap();
+            match binding_manager.bind_device(pair_code, device_name) {
+                binding::BindResult::Success(device) => Some(JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "success": true,
+                        "deviceId": device.id,
+                        "token": device.token
+                    }),
+                )),
+                binding::BindResult::AlreadyBound { device_name } => Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::new(409, &format!("Already bound to device: {}", device_name), None),
+                )),
+                binding::BindResult::InvalidCode => Some(JsonRpcResponse::error(
+                    id,
+                    JsonRpcErrorObject::new(400, "Invalid or expired pair code", None),
                 )),
             }
         }
