@@ -7,7 +7,6 @@
 //!   aginx --mode direct                # 直连模式，监听 TCP 86
 
 mod config;
-mod protocol;
 mod server;
 mod agent;
 mod relay;
@@ -179,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
 
             // 连接 relay
             let mut relay_client = relay::RelayClient::new(&config, agent_manager);
-            relay_client.connect(config).await?;
+            relay_client.connect().await?;
         }
     }
 
@@ -199,6 +198,7 @@ fn init_logging(verbose: bool, debug: bool) {
         .with_max_level(level)
         .with_target(false)
         .compact()
+        .with_writer(std::io::stderr)
         .init();
 }
 

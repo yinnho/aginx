@@ -2,6 +2,9 @@
 //!
 //! This handler implements the ACP (Agent Client Protocol) over TCP.
 //! ACP uses JSON-RPC 2.0 with ndjson (newline-delimited JSON) format.
+//!
+//! CONCURRENT MODEL: `prompt` requests are spawned as independent tasks so
+//! the main loop can continue reading `permissionResponse` without deadlock.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,15 +43,22 @@ impl Handler {
         binding_manager: Arc<tokio::sync::Mutex<BindingManager>>,
         session_manager: Arc<SessionManager>,
     ) -> Self {
+        // Get agents directory from config
+        let agents_dir = config.agents.get_agents_dir();
+        tracing::info!("Agents directory: {}", agents_dir.display());
+
+        let agent_manager = Arc::new(agent_manager);
+
         // Create ACP handler using the same managers
-        let acp_handler = Arc::new(AcpHandler::new(
-            Arc::new(agent_manager.clone()),
-            session_manager.clone()
+        let acp_handler = Arc::new(AcpHandler::with_agents_dir(
+            agent_manager.clone(),
+            session_manager.clone(),
+            agents_dir
         ));
 
         Self {
             config,
-            agent_manager: Arc::new(agent_manager),
+            agent_manager,
             binding_manager,
             session_manager,
             acp_handler
@@ -87,64 +97,68 @@ impl Handler {
                 Err(e) => {
                     tracing::error!("Failed to parse ACP request: {}", e);
                     let response = AcpResponse::error(None, -32700, &format!("Parse error: {}", e));
-                    self.send_acp_response(&writer, &response).await?;
+                    send_response(&writer, &response).await?;
                     continue;
                 }
             };
 
-            // Handle request with ACP handler
             let method = request.method.clone();
-            let request_id = request.id.clone();
 
-            // Handle streaming methods (prompt, permissionResponse)
-            if method == "prompt" || method == "permissionResponse" {
-                // Create channel for notifications
-                let (tx, mut rx) = mpsc::channel::<String>(32);
-                let writer_clone = writer.clone();
+            if method == "prompt" {
+                // SPAWN: run streaming in a separate task so the main loop
+                // can continue reading the next request (e.g. permissionResponse)
+                let acp_handler = self.acp_handler.clone();
+                let writer = writer.clone();
+                let (tx, rx) = mpsc::channel::<String>(32);
 
-                // Spawn task to write notifications
-                let notify_task = tokio::spawn(async move {
-                    while let Some(notification) = rx.recv().await {
-                        let mut w = writer_clone.lock().await;
-                        if let Err(e) = write_ndjson(&mut *w, &notification).await {
-                            tracing::error!("Failed to write notification: {}", e);
-                            break;
+                tokio::spawn(async move {
+                    // Notification forwarder: writes streaming notifications to TCP
+                    let writer_clone = writer.clone();
+                    let notify_task = tokio::spawn(async move {
+                        let mut rx = rx;
+                        while let Some(notification) = rx.recv().await {
+                            let mut w = writer_clone.lock().await;
+                            if let Err(e) = write_ndjson(&mut *w, &notification).await {
+                                tracing::error!("Failed to write notification: {}", e);
+                                break;
+                            }
                         }
+                    });
+
+                    // Run the streaming prompt
+                    let response = acp_handler.handle_prompt_streaming(request, tx).await;
+
+                    // Wait for all notifications to be written
+                    let _ = notify_task.await;
+
+                    // Send final response
+                    if let Ok(json) = response.to_ndjson() {
+                        tracing::trace!("ACP prompt response: {}", json);
+                        let mut w = writer.lock().await;
+                        let _ = write_ndjson(&mut *w, &json).await;
                     }
                 });
 
-                // Handle with streaming
-                let response = if method == "prompt" {
-                    self.acp_handler.handle_prompt_streaming(request, tx).await
-                } else {
-                    self.acp_handler.handle_permission_response_streaming(request, tx).await
-                };
-
-                // Wait for notification task to complete
-                let _ = notify_task.await;
-
-                // Send final response
-                self.send_acp_response(&writer, &response).await?;
+                // Main loop continues immediately - does NOT wait for prompt to finish
             } else {
-                // Non-streaming methods
+                // Non-streaming methods: handle synchronously
                 let response = self.acp_handler.handle_request(request).await;
-                self.send_acp_response(&writer, &response).await?;
+                send_response(&writer, &response).await?;
             }
         }
 
         Ok(())
     }
+}
 
-    /// Send ACP response
-    async fn send_acp_response(
-        &self,
-        writer: &Arc<tokio::sync::Mutex<BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
-        response: &AcpResponse
-    ) -> anyhow::Result<()> {
-        let json = response.to_ndjson()?;
-        tracing::trace!("ACP response: {}", json);
-        let mut w = writer.lock().await;
-        write_ndjson(&mut *w, &json).await?;
-        Ok(())
-    }
+/// Send ACP response (standalone function, no &self needed)
+async fn send_response(
+    writer: &Arc<tokio::sync::Mutex<BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
+    response: &AcpResponse
+) -> anyhow::Result<()> {
+    let json = response.to_ndjson()?;
+    tracing::trace!("ACP response: {}", json);
+    let mut w = writer.lock().await;
+    write_ndjson(&mut *w, &json).await?;
+    Ok(())
 }
