@@ -369,7 +369,7 @@ impl AcpHandler {
                             Some(&msg_preview),
                         );
 
-                        // Send final response
+                        // Send final response (only stopReason, content was already sent via sessionUpdate)
                         let final_response = AcpResponse::success(request_id, serde_json::json!({
                             "stopReason": match stop_reason {
                                 StopReason::EndTurn => "end_turn",
@@ -377,8 +377,7 @@ impl AcpHandler {
                                 StopReason::Cancelled => "cancelled",
                                 StopReason::Refusal => "refusal",
                                 StopReason::Error => "error",
-                            },
-                            "response": content
+                            }
                         }));
                         let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
                     }
