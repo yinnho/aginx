@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
 
-use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock};
+use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock, StopReason};
 use super::streaming::StreamingSession;
 use crate::agent::{AgentManager, SessionManager, SendMessageResult};
 use crate::binding::{self, BindResult};
@@ -302,99 +302,100 @@ impl AcpHandler {
             }
         };
 
-        // Create streaming session from existing session
-        let session_uuid = session_info.session_uuid
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        let mut streaming_session = StreamingSession::from_session(
+        // Use async streaming for real-time output
+        let mut event_rx = match StreamingSession::run_claude_async(
             params.sessionId.clone(),
-            session_uuid,
             agent_info,
-            session_info.workdir.as_deref(),
+            session_info.workdir.clone(),
             session_info.claude_session_id.clone(),
-        );
-
-        // For true streaming, we use spawn_blocking because StreamingSession uses blocking I/O
-        // We use a sync channel within the blocking task and relay to async channel
-        let (sync_tx, sync_rx) = std::sync::mpsc::channel::<String>();
-        let message_inner = message.clone();
-        let session_id_inner = params.sessionId.clone();
-        let session_manager = self.session_manager.clone();
-
-        // Spawn blocking task for streaming with interactive mode (supports permissions)
-        let streaming_handle = tokio::task::spawn_blocking(move || {
-            let on_update = |notification: &str| -> Result<(), String> {
-                sync_tx.send(notification.to_string())
-                    .map_err(|e| format!("Failed to send: {}", e))
-            };
-
-            let result = streaming_session.send_prompt_streaming(&message_inner, on_update);
-
-            // Extract claude_session_id and save it back to session manager
-            if let super::streaming::StreamingResult::Completed(_, _, Some(ref claude_sid)) = &result {
-                // We need to save this synchronously - use try_recv
-                tracing::info!("Saving claude_session_id: {}", claude_sid);
+            &message,
+        ).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                return AcpResponse::error(request.id, -32603, &format!("Failed to start streaming: {}", e));
             }
+        };
 
-            result
-        });
+        // Spawn task to process streaming events
+        let session_id = params.sessionId.clone();
+        let request_id = request.id.clone();
+        let session_manager = self.session_manager.clone();
+        let agent_id = session_info.agent_id.clone();
 
-        // Relay notifications from sync channel to async channel
-        let tx_relay = tx.clone();
-        let relay_handle = tokio::spawn(async move {
-            while let Ok(notification) = sync_rx.recv() {
-                if tx_relay.send(notification).await.is_err() {
-                    break;
+        tokio::spawn(async move {
+            let mut final_result: Option<super::streaming::AsyncStreamingResult> = None;
+
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    super::streaming::StreamingEvent::Notification(json) => {
+                        // Immediately send notification to client
+                        if tx.send(json).await.is_err() {
+                            tracing::warn!("Client disconnected");
+                            break;
+                        }
+                    }
+                    super::streaming::StreamingEvent::Completed(result) => {
+                        final_result = Some(result);
+                        break;
+                    }
                 }
             }
-        });
 
-        // Wait for streaming to complete
-        match streaming_handle.await {
-            Ok(result) => {
-                // sync_tx is dropped when streaming_handle finishes, closing the channel
-                let _ = relay_handle.await;
-
+            // Handle final result
+            if let Some(result) = final_result {
                 match result {
-                    super::streaming::StreamingResult::Completed(_stop_reason, content, claude_session_id) => {
-                        // Save claude_session_id for --resume in subsequent calls
+                    super::streaming::AsyncStreamingResult::Completed {
+                        stop_reason,
+                        content,
+                        claude_session_id,
+                    } => {
+                        // Save claude_session_id for --resume
                         if let Some(ref sid) = claude_session_id {
-                            if let Err(e) = session_manager.update_claude_session_id(&session_id_inner, sid).await {
+                            if let Err(e) = session_manager.update_claude_session_id(&session_id, sid).await {
                                 tracing::warn!("Failed to save claude_session_id: {}", e);
                             }
                         }
+
                         // Update persisted session metadata
-                        {
-                            let session_info = session_manager.get_session_info(&session_id_inner).await;
-                            if let Some(info) = session_info {
-                                let msg_preview = if content.len() > 100 {
-                                    format!("{}...", &content[..100])
-                                } else {
-                                    content.clone()
-                                };
-                                session_manager.update_persisted_metadata(
-                                    &session_id_inner,
-                                    &info.agent_id,
-                                    claude_session_id.as_deref(),
-                                    Some(&msg_preview),
-                                );
-                            }
-                        }
-                        AcpResponse::success(request.id, serde_json::json!({
-                            "stopReason": "end_turn",
+                        let msg_preview = if content.len() > 100 {
+                            format!("{}...", &content[..100])
+                        } else {
+                            content.clone()
+                        };
+                        session_manager.update_persisted_metadata(
+                            &session_id,
+                            &agent_id,
+                            claude_session_id.as_deref(),
+                            Some(&msg_preview),
+                        );
+
+                        // Send final response
+                        let final_response = AcpResponse::success(request_id, serde_json::json!({
+                            "stopReason": match stop_reason {
+                                StopReason::EndTurn => "end_turn",
+                                StopReason::Stop => "stop",
+                                StopReason::Cancelled => "cancelled",
+                                StopReason::Refusal => "refusal",
+                                StopReason::Error => "error",
+                            },
                             "response": content
-                        }))
+                        }));
+                        let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
                     }
-                    super::streaming::StreamingResult::Error(e) => {
-                        AcpResponse::error(request.id, -32603, &format!("Streaming error: {}", e))
+                    super::streaming::AsyncStreamingResult::Error(e) => {
+                        tracing::error!("Streaming error: {}", e);
+                        let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
+                        let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
                     }
                 }
             }
-            Err(e) => {
-                let _ = relay_handle.await;
-                AcpResponse::error(request.id, -32603, &format!("Task error: {}", e))
-            }
-        }
+        });
+
+        // Return immediately - streaming happens in background
+        AcpResponse::success(request.id, serde_json::json!({
+            "streaming": true,
+            "sessionId": params.sessionId
+        }))
     }
 
     /// Handle cancel request

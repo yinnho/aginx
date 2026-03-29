@@ -1,9 +1,13 @@
 //! Streaming session support for ACP with Claude CLI JSON output parsing
 //!
-//! Uses Claude CLI with --output-format stream-json via PTY for real-time streaming.
+//! Uses Claude CLI with --output-format stream-json for real-time streaming.
 //! CLI runs with --dangerously-skip-permissions, no permission handling needed.
 
 use std::io::BufRead;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use uuid::Uuid;
 
@@ -97,6 +101,28 @@ pub enum StreamingResult {
     Completed(StopReason, String, Option<String>),
     /// Error
     Error(String),
+}
+
+/// Async streaming result (sent through channel when complete)
+#[derive(Debug, Clone)]
+pub enum AsyncStreamingResult {
+    /// Completed successfully
+    Completed {
+        stop_reason: StopReason,
+        content: String,
+        claude_session_id: Option<String>,
+    },
+    /// Error occurred
+    Error(String),
+}
+
+/// Streaming event (for async channel communication)
+#[derive(Debug, Clone)]
+pub enum StreamingEvent {
+    /// ACP sessionUpdate notification JSON
+    Notification(String),
+    /// Streaming completed
+    Completed(AsyncStreamingResult),
 }
 
 /// Streaming session state
@@ -583,6 +609,374 @@ impl StreamingSession {
         } else {
             let error = String::from_utf8_lossy(&output.stderr).to_string();
             Err(format!("Process error: {}", error))
+        }
+    }
+
+    /// Run Claude CLI asynchronously with tokio::process::Command
+    ///
+    /// Returns a receiver that yields streaming events in real-time.
+    /// Each line from stdout is parsed and sent immediately as a notification.
+    pub async fn run_claude_async(
+        session_id: String,
+        agent_info: AgentInfo,
+        workdir: Option<String>,
+        claude_session_id: Option<String>,
+        message: &str,
+    ) -> Result<mpsc::Receiver<StreamingEvent>, String> {
+        use std::process::Stdio;
+
+        // Build args: base args + session resume args + message
+        let mut full_args: Vec<String> = agent_info.args.clone();
+
+        if let Some(ref sid) = claude_session_id {
+            for arg in &agent_info.session_args {
+                full_args.push(arg.replace("${SESSION_ID}", sid));
+            }
+        }
+        full_args.push(message.to_string());
+
+        tracing::info!("Spawning async: {} {:?}", agent_info.command, full_args);
+
+        // Create channel for streaming events
+        let (tx, rx) = mpsc::channel::<StreamingEvent>(64);
+
+        // Build async command
+        let mut cmd = Command::new(&agent_info.command);
+        cmd.args(&full_args);
+
+        // Set environment
+        for (key, value) in &agent_info.env {
+            cmd.env(key, value);
+        }
+        for env_key in &agent_info.env_remove {
+            cmd.env_remove(env_key);
+        }
+
+        // Set working directory
+        if let Some(ref dir) = workdir {
+            cmd.current_dir(dir);
+        }
+
+        // Configure stdio for async reading
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Spawn process
+        let mut child = cmd.spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", agent_info.command, e))?;
+
+        let stdout = child.stdout.take()
+            .ok_or("Failed to capture stdout")?;
+        let stderr = child.stderr.take()
+            .ok_or("Failed to capture stderr")?;
+
+        // Clone data for async task
+        let session_id_clone = session_id.clone();
+        let tx_clone = tx.clone();
+
+        // Spawn task to process stdout
+        let stdout_task = tokio::spawn(async move {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+            let mut accumulated_content = String::new();
+            let mut claude_session_id: Option<String> = None;
+            let mut stop_reason = StopReason::EndTurn;
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                tracing::debug!("Async line: {}", &line[..line.len().min(200)]);
+
+                // Process the line
+                match Self::process_line_static(
+                    &session_id_clone,
+                    &line,
+                    &mut accumulated_content,
+                    &mut claude_session_id,
+                    &mut stop_reason,
+                ) {
+                    Ok(Some(notification)) => {
+                        if tx_clone.send(StreamingEvent::Notification(notification)).await.is_err() {
+                            tracing::warn!("Client disconnected, stopping stdout task");
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("Error processing line: {}", e);
+                    }
+                }
+            }
+
+            // Send completion event
+            let result = AsyncStreamingResult::Completed {
+                stop_reason,
+                content: accumulated_content,
+                claude_session_id,
+            };
+
+            let _ = tx_clone.send(StreamingEvent::Completed(result)).await;
+        });
+
+        // Spawn task to handle stderr (logging only)
+        let tx_err = tx.clone();
+        let stderr_task = tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::warn!("Claude stderr: {}", line);
+            }
+        });
+
+        // Spawn task to wait for process completion
+        tokio::spawn(async move {
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            match child.wait().await {
+                Ok(status) => {
+                    tracing::info!("Process completed: {:?}", status);
+                }
+                Err(e) => {
+                    tracing::error!("Wait error: {}", e);
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Process a single line and return notification if any
+    fn process_line_static(
+        session_id: &str,
+        line: &str,
+        accumulated_content: &mut String,
+        claude_session_id: &mut Option<String>,
+        stop_reason: &mut StopReason,
+    ) -> Result<Option<String>, String> {
+        let event: ClaudeEvent = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!("Not a Claude JSON event: {}", e);
+                return Ok(None);
+            }
+        };
+
+        match event {
+            ClaudeEvent::System { session_id: sid } => {
+                if let Some(sid) = sid {
+                    tracing::info!("Got Claude session_id from init: {}", sid);
+                    *claude_session_id = Some(sid);
+                }
+                Ok(None)
+            }
+
+            ClaudeEvent::Assistant { message, session_id: sid } => {
+                if let Some(sid) = sid {
+                    if claude_session_id.is_none() {
+                        *claude_session_id = Some(sid);
+                    }
+                }
+                if let Some(msg) = message {
+                    for block in msg.content {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                accumulated_content.push_str(&text);
+                                return Ok(Some(Self::make_message_chunk_static(session_id, &text)));
+                            }
+                            ContentBlock::Thinking { thinking } => {
+                                tracing::debug!("Thinking: {} chars", thinking.len());
+                            }
+                            ContentBlock::ToolUse { id, name, input } => {
+                                let tool_call_id = format!("tc_{}", id);
+                                let title = Self::format_tool_title_static(&name, &Some(input.clone()));
+                                let kind = Self::infer_tool_kind(&name);
+                                return Ok(Some(Self::make_tool_call_static(session_id, &tool_call_id, &title, &kind)));
+                            }
+                            ContentBlock::ToolResultBlock { tool_use_id, content } => {
+                                let tool_call_id = format!("tc_{}", tool_use_id);
+                                let output_text = content.as_ref().and_then(|c| c.as_str());
+                                return Ok(Some(Self::make_tool_call_update_static(
+                                    session_id,
+                                    &tool_call_id,
+                                    ToolCallStatus::Completed,
+                                    output_text,
+                                )));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
+            ClaudeEvent::ToolUse { id, name, input, meta, raw_input } => {
+                let tool_call_id = format!("tc_{}", id);
+                let title = Self::format_tool_title_static(&name, &Some(input.clone()));
+                let kind = Self::infer_tool_kind(&name);
+                Ok(Some(Self::make_tool_call_static(session_id, &tool_call_id, &title, &kind)))
+            }
+
+            ClaudeEvent::ToolResult { tool_use_id, content, is_error } => {
+                let tool_call_id = format!("tc_{}", tool_use_id);
+                let status = if is_error.unwrap_or(false) {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                let output_text = content.as_ref().and_then(|c| c.as_str());
+                Ok(Some(Self::make_tool_call_update_static(session_id, &tool_call_id, status, output_text)))
+            }
+
+            ClaudeEvent::Result { result, stop_reason: reason, session_id: sid, is_error } => {
+                if let Some(sid) = sid {
+                    tracing::info!("Got Claude session_id from result: {}", sid);
+                    *claude_session_id = Some(sid);
+                }
+
+                if let Some(text) = result {
+                    if !text.is_empty() && accumulated_content.is_empty() {
+                        accumulated_content.push_str(&text);
+                        // Send the final content as notification
+                        let _ = Self::make_message_chunk_static(session_id, &text);
+                    }
+                    if is_error.unwrap_or(false) {
+                        return Err(format!("Claude error: {}", text));
+                    }
+                }
+
+                *stop_reason = match reason.as_deref() {
+                    Some("end_turn") => StopReason::EndTurn,
+                    Some("stop") => StopReason::Stop,
+                    Some("tool_use") => StopReason::EndTurn,
+                    _ => StopReason::EndTurn,
+                };
+
+                Ok(None)
+            }
+        }
+    }
+
+    /// Static helper: create message chunk notification
+    fn make_message_chunk_static(session_id: &str, text: &str) -> String {
+        let notification = SessionUpdateParams {
+            sessionId: session_id.to_string(),
+            update: SessionUpdate::AgentMessageChunk {
+                content: MessageContent::Text { text: text.to_string() },
+            },
+        };
+        serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Static helper: create tool_call notification
+    fn make_tool_call_static(session_id: &str, tool_call_id: &str, title: &str, kind: &Option<ToolKind>) -> String {
+        let notification = SessionUpdateParams {
+            sessionId: session_id.to_string(),
+            update: SessionUpdate::ToolCall {
+                toolCallId: tool_call_id.to_string(),
+                title: title.to_string(),
+                status: ToolCallStatus::InProgress,
+                rawInput: None,
+                kind: kind.clone(),
+            },
+        };
+        serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Static helper: create tool_call_update notification
+    fn make_tool_call_update_static(session_id: &str, tool_call_id: &str, status: ToolCallStatus, output: Option<&str>) -> String {
+        let content = output.map(|o| vec![
+            ToolCallContent::Content {
+                content: MessageContent::Text { text: o.to_string() },
+            }
+        ]);
+        let notification = SessionUpdateParams {
+            sessionId: session_id.to_string(),
+            update: SessionUpdate::ToolCallUpdate {
+                toolCallId: tool_call_id.to_string(),
+                status: Some(status),
+                rawOutput: output.map(|o| serde_json::json!(o)),
+                content,
+            },
+        };
+        serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Static helper: format tool title
+    fn format_tool_title_static(name: &str, input: &Option<serde_json::Value>) -> String {
+        match name {
+            "Read" | "NBRead" => {
+                let path = input.as_ref()
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("Read({})", path)
+            }
+            "Edit" | "NBEdit" => {
+                let path = input.as_ref()
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("Edit({})", path)
+            }
+            "Write" | "NBWrite" => {
+                let path = input.as_ref()
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("Write({})", path)
+            }
+            "Delete" => {
+                let path = input.as_ref()
+                    .and_then(|i| i.get("file_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("Delete({})", path)
+            }
+            "Bash" => {
+                let cmd = input.as_ref()
+                    .and_then(|i| i.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let truncated = if cmd.len() > 40 {
+                    format!("{}...", &cmd[..37])
+                } else {
+                    cmd.to_string()
+                };
+                format!("Bash({})", truncated)
+            }
+            "Glob" => {
+                let pattern = input.as_ref()
+                    .and_then(|i| i.get("pattern"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*");
+                format!("Glob({})", pattern)
+            }
+            "Grep" => {
+                let pattern = input.as_ref()
+                    .and_then(|i| i.get("pattern"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                format!("Grep({})", pattern)
+            }
+            _ => name.to_string(),
+        }
+    }
+
+    /// Static helper: infer tool kind from name
+    fn infer_tool_kind(name: &str) -> Option<ToolKind> {
+        match name {
+            "Read" | "NBRead" => Some(ToolKind::Read),
+            "Edit" | "NBEdit" => Some(ToolKind::Edit),
+            "Write" | "NBWrite" => Some(ToolKind::Other),
+            "Delete" => Some(ToolKind::Delete),
+            "Glob" | "Grep" => Some(ToolKind::Search),
+            "Bash" => Some(ToolKind::Execute),
+            "WebFetch" => Some(ToolKind::Fetch),
+            _ => Some(ToolKind::Other),
         }
     }
 }
