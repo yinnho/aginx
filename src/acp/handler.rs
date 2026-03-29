@@ -356,9 +356,9 @@ impl AcpHandler {
                             }
                         }
 
-                        // Update persisted session metadata
-                        let msg_preview = if content.len() > 100 {
-                            format!("{}...", &content[..100])
+                        // Update persisted session metadata (UTF-8 safe truncation)
+                        let msg_preview = if content.chars().count() > 100 {
+                            format!("{}...", content.chars().take(100).collect::<String>())
                         } else {
                             content.clone()
                         };
