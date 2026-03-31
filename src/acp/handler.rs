@@ -7,9 +7,10 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock, StopReason};
-use super::streaming::StreamingSession;
-use crate::agent::{AgentManager, SessionManager, SendMessageResult};
+use super::streaming::{AsyncStreamingResult, StreamingEvent};
+use crate::agent::{AgentManager, SessionManager};
 use crate::binding::{self, BindResult};
+use crate::config::AgentType;
 
 /// ACP Handler that processes ACP protocol messages
 pub struct AcpHandler {
@@ -47,25 +48,67 @@ impl AcpHandler {
     }
 
 
+    /// Safely resolve a path, preventing path traversal attacks.
+    /// Returns the canonicalized path if valid, or an error message.
+    fn safe_resolve_path(path_str: &str) -> Result<std::path::PathBuf, String> {
+        let path = if path_str == "~" || path_str.is_empty() {
+            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
+        } else if path_str.starts_with("~/") {
+            let rest = &path_str[2..];
+            dirs::home_dir()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| std::path::PathBuf::from(path_str))
+        } else {
+            std::path::PathBuf::from(path_str)
+        };
+
+        // Canonicalize to resolve . and .. and symlinks
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|e| format!("Cannot resolve path: {}", e))?;
+
+        // Ensure the path is within the home directory
+        let home_dir = dirs::home_dir()
+            .ok_or_else(|| "Cannot determine home directory".to_string())?;
+
+        let homecanonical = std::fs::canonicalize(&home_dir)
+            .map_err(|e| format!("Cannot resolve home directory: {}", e))?;
+
+        // Check if the canonical path starts with the home directory
+        let canonical_str = canonical.to_string_lossy();
+        let homecanonical_str = homecanonical.to_string_lossy();
+
+        if !canonical_str.starts_with(&*homecanonical_str) {
+            return Err("Access denied: path outside home directory".to_string());
+        }
+
+        Ok(canonical)
+    }
+
     /// Handle an ACP request
     pub async fn handle_request(&self, request: AcpRequest) -> AcpResponse {
-        tracing::debug!("ACP request: {} ({:?})", request.method, request.id);
+        tracing::info!("ACP request: {} ({:?})", request.method, request.id);
 
         match request.method.as_str() {
+            // 标准 ACP 核心方法
             "initialize" => self.handle_initialize(request).await,
-            "newSession" => self.handle_new_session(request).await,
-            "loadSession" => self.handle_load_session(request).await,
-            "prompt" => self.handle_prompt(request).await,
-            "cancel" => self.handle_cancel(request).await,
-            "listSessions" => self.handle_list_sessions(request).await,
+            "session/new" => self.handle_new_session(request).await,
+            "session/load" => self.handle_load_session(request).await,
+            "session/prompt" => {
+                AcpResponse::error(request.id, -32601, "Use streaming endpoint for session/prompt")
+            }
+            "session/cancel" => self.handle_cancel(request).await,
+
+            // Aginx 扩展方法
+            "listConversations" => self.handle_list_conversations(request).await,
+            "deleteConversation" => self.handle_delete_conversation(request).await,
+            "getMessages" | "getConversationMessages" => self.handle_get_conversation_messages(request).await,
             "listAgents" => self.handle_list_agents(request).await,
             "discoverAgents" => self.handle_discover_agents(request).await,
             "registerAgent" => self.handle_register_agent(request).await,
             "bindDevice" => self.handle_bind_device(request).await,
             "listDirectory" => self.handle_list_directory(request).await,
             "readFile" => self.handle_read_file(request).await,
-            "listConversations" => self.handle_list_conversations(request).await,
-            "deleteConversation" => self.handle_delete_conversation(request).await,
+            "listSessions" => self.handle_list_sessions(request).await,
             _ => {
                 tracing::warn!("Unknown ACP method: {}", request.method);
                 AcpResponse::error(
@@ -128,16 +171,30 @@ impl AcpHandler {
                     .map(String::from)
             });
 
-        // 如果没有指定 agentId，使用配置中的第一个 agent
+        // 如果没有指定 agentId，查找第一个支持 session 的 agent
         let agent_id = match agent_id {
             Some(id) => id,
             None => {
-                // 获取配置的第一个 agent
+                // 获取配置中第一个支持 session 的 agent（非 builtin 类型）
                 let agents = self.agent_manager.list_agents().await;
                 if agents.is_empty() {
                     return AcpResponse::error(request.id, -32602, "No agent configured");
                 }
-                agents[0].get("id").and_then(|v| v.as_str()).unwrap_or("echo").to_string()
+                // 查找第一个非 builtin 的 agent
+                agents.iter()
+                    .find(|a| {
+                        let agent_type = a.get("agent_type")
+                            .or_else(|| a.get("type"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("builtin");
+                        agent_type != "builtin"
+                    })
+                    .and_then(|a| a.get("id").and_then(|v| v.as_str()))
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        // 如果都是 builtin，使用第一个（可能会失败）
+                        agents[0].get("id").and_then(|v| v.as_str()).unwrap_or("echo").to_string()
+                    })
             }
         };
 
@@ -156,8 +213,7 @@ impl AcpHandler {
                 return AcpResponse::error(request.id, -32603, &format!("Failed to create session: {}", e));
             }
         };
-
-        tracing::info!("ACP newSession: {} -> {}", session_id, agent_id);
+        tracing::info!("ACP newSession: {} -> {:?}, streaming mode", session_id, agent_info.agent_type);
 
         AcpResponse::success(request.id, serde_json::json!({
             "sessionId": session_id
@@ -180,78 +236,61 @@ impl AcpHandler {
 
         tracing::info!("ACP loadSession: {}", params.sessionId);
 
-        // Check if session exists
-        match self.session_manager.get_session_info(&params.sessionId).await {
-            Some(info) => {
-                // Session exists, return success with session info
-                AcpResponse::success(request.id, serde_json::json!({
-                    "sessionId": info.session_id,
-                    "status": "resumed"
-                }))
-            }
-            None => {
-                // Session not found
-                AcpResponse::error(request.id, 404, &format!("Session not found: {}", params.sessionId))
-            }
-        }
-    }
-
-    /// Handle prompt request
-    async fn handle_prompt(&self, request: AcpRequest) -> AcpResponse {
-        let params: PromptParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
-        };
-
-        // Extract text from prompt blocks
-        let message: String = params.prompt.iter()
-            .filter_map(|block| {
-                if let ContentBlock::Text { text } = block {
-                    Some(text.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<&str>>()
-            .join("\n");
-
-        if message.is_empty() {
-            return AcpResponse::error(request.id, -32602, "Empty prompt");
+        // 1. 先检查内存中是否还有活跃会话
+        if self.session_manager.get_session_info(&params.sessionId).await.is_some() {
+            return AcpResponse::success(request.id, serde_json::json!({
+                "sessionId": params.sessionId,
+                "status": "active"
+            }));
         }
 
-        tracing::debug!("ACP prompt to session {}: {} chars", params.sessionId, message.len());
-
-        // Send message to session
-        let result = match self.session_manager.send_message(&params.sessionId, &message).await {
-            Ok(r) => r,
-            Err(e) => {
-                return AcpResponse::error(request.id, -32603, &format!("Failed to send message: {}", e));
+        // 2. 从持久化元数据加载（需要遍历所有 agent 目录查找）
+        let agents = self.agent_manager.list_agents().await;
+        let mut metadata = None;
+        let mut found_agent_id = None;
+        for agent in &agents {
+            if let Some(aid) = agent.get("id").and_then(|v| v.as_str()) {
+                if let Some(m) = self.session_manager.get_persisted_metadata(&params.sessionId, aid) {
+                    metadata = Some(m);
+                    found_agent_id = Some(aid.to_string());
+                    break;
+                }
             }
-        };
+        }
 
-        match result {
-            SendMessageResult::Response(response) => {
-                AcpResponse::success(request.id, serde_json::json!({
-                    "stopReason": "end_turn",
-                    "response": response
-                }))
-            }
+        let (meta, agent_id) = match (metadata, found_agent_id) {
+            (Some(m), Some(a)) => (m, a),
             _ => {
-                AcpResponse::error(request.id, -32603, "Unexpected result type")
+                return AcpResponse::error(request.id, 404, &format!("Session not found: {}", params.sessionId));
             }
-        }
+        };
+
+        // 3. 获取 agent 信息
+        let agent_info = match self.agent_manager.get_agent_info(&agent_id).await {
+            Some(info) => info,
+            None => {
+                return AcpResponse::error(request.id, -32602, &format!("Agent not found: {}", agent_id));
+            }
+        };
+
+        // 4. 重建内存中的 session（后续 prompt 会用 claude_session_id 自动带上 --resume）
+        let _ = self.session_manager.create_session_with_id(
+            &params.sessionId,
+            &agent_info,
+            meta.workdir.as_deref(),
+        ).await;
+        let claude_sid = meta.claude_session_id.as_deref().unwrap_or("");
+        tracing::info!("ACP loadSession: {} (claude session: {})", params.sessionId, claude_sid);
+
+        AcpResponse::success(request.id, serde_json::json!({
+            "sessionId": params.sessionId,
+            "status": "resumed"
+        }))
     }
 
     /// Handle prompt request with streaming support
-    /// Sends streaming events via channel, returns final response
-    pub async fn handle_prompt_streaming(
+    /// Sends streaming events via channel, returns initial response immediately
+    pub async fn handle_prompt(
         &self,
         request: AcpRequest,
         tx: mpsc::Sender<String>,
@@ -294,101 +333,200 @@ impl AcpHandler {
             }
         };
 
-        // Get agent info
-        let agent_info = match self.agent_manager.get_agent_info(&session_info.agent_id).await {
-            Some(agent) => agent,
-            None => {
-                return AcpResponse::error(request.id, -32603, &format!("Agent not found: {}", session_info.agent_id));
-            }
-        };
+        // Try to get ACP agent process (for Claude-type agents)
+        let agent_process = self.session_manager.get_agent_process(&params.sessionId).await;
 
-        // Use async streaming for real-time output
-        let mut event_rx = match StreamingSession::run_claude_async(
-            params.sessionId.clone(),
-            agent_info,
-            session_info.workdir.clone(),
-            session_info.claude_session_id.clone(),
-            &message,
-        ).await {
-            Ok(rx) => rx,
-            Err(e) => {
-                return AcpResponse::error(request.id, -32603, &format!("Failed to start streaming: {}", e));
-            }
-        };
+        if let Some(process) = agent_process {
+            // === ACP Stdio mode: use persistent agent process ===
+            let request_id = request.id.clone();
+            let session_id = params.sessionId.clone();
+            let agent_id = session_info.agent_id.clone();
+            let session_manager = self.session_manager.clone();
 
-        // Spawn task to process streaming events
-        let session_id = params.sessionId.clone();
-        let request_id = request.id.clone();
-        let session_manager = self.session_manager.clone();
-        let agent_id = session_info.agent_id.clone();
+            // Create streaming event channel
+            let (event_tx, event_rx) = mpsc::channel::<StreamingEvent>(64);
 
-        tokio::spawn(async move {
-            let mut final_result: Option<super::streaming::AsyncStreamingResult> = None;
+            // Spawn task to run prompt via ACP process (takes ownership of event_tx)
+            let process_clone = process.clone();
+            tokio::spawn(async move {
+                let mut p = process_clone.lock().await;
+                if let Err(e) = p.prompt(&message, event_tx).await {
+                    tracing::error!("ACP prompt error: {}", e);
+                    // event_tx was consumed by prompt(), error is logged
+                    // The client will see no completion event and timeout
+                }
+            });
 
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    super::streaming::StreamingEvent::Notification(json) => {
-                        // Immediately send notification to client
-                        if tx.send(json).await.is_err() {
-                            tracing::warn!("Client disconnected");
+            // Spawn task to forward streaming events to client
+            let mut event_rx = event_rx;
+            tokio::spawn(async move {
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        StreamingEvent::Notification(json) => {
+                            if tx.send(json).await.is_err() {
+                                tracing::warn!("Client disconnected");
+                                break;
+                            }
+                        }
+                        StreamingEvent::Completed(result) => {
+                            match result {
+                                AsyncStreamingResult::Completed {
+                                    stop_reason,
+                                    content,
+                                    claude_session_id,
+                                } => {
+                                    // Update persisted metadata
+                                    let msg_preview = if content.chars().count() > 100 {
+                                        format!("{}...", content.chars().take(100).collect::<String>())
+                                    } else {
+                                        content.clone()
+                                    };
+                                    session_manager.update_persisted_metadata(
+                                        &session_id,
+                                        &agent_id,
+                                        claude_session_id.as_deref(),
+                                        Some(&msg_preview),
+                                    );
+
+                                    // Send final response
+                                    let final_response = AcpResponse::success(request_id, serde_json::json!({
+                                        "stopReason": match stop_reason {
+                                            StopReason::EndTurn => "end_turn",
+                                            StopReason::Stop => "stop",
+                                            StopReason::Cancelled => "cancelled",
+                                            StopReason::Refusal => "refusal",
+                                            StopReason::Error => "error",
+                                        },
+                                        "response": content
+                                    }));
+                                    let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
+                                }
+                                AsyncStreamingResult::Error(e) => {
+                                    tracing::error!("Streaming error: {}", e);
+                                    let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
+                                    let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                                }
+                            }
                             break;
                         }
                     }
-                    super::streaming::StreamingEvent::Completed(result) => {
-                        final_result = Some(result);
-                        break;
-                    }
                 }
-            }
+            });
 
-            // Handle final result
-            if let Some(result) = final_result {
-                match result {
-                    super::streaming::AsyncStreamingResult::Completed {
-                        stop_reason,
-                        content,
-                        claude_session_id,
-                    } => {
-                        // Save claude_session_id for --resume
-                        if let Some(ref sid) = claude_session_id {
-                            if let Err(e) = session_manager.update_claude_session_id(&session_id, sid).await {
-                                tracing::warn!("Failed to save claude_session_id: {}", e);
+            // Return immediately - streaming happens in background via spawned tasks
+            return AcpResponse::success(request.id, serde_json::json!({
+                "streaming": true,
+                "sessionId": params.sessionId
+            }));
+        } else {
+            // === No active agent process: try to resume with --resume ===
+            let agent_info = match self.agent_manager.get_agent_info(&session_info.agent_id).await {
+                Some(agent) => agent,
+                None => {
+                    return AcpResponse::error(request.id, -32603, &format!("Agent not found: {}", session_info.agent_id));
+                }
+            };
+
+            // 对于 Claude 类型和所有其他 agent，统一使用 legacy streaming 模式
+            // 检查是否使用 legacy 模式 (args 包含 --print 表示使用 stream-json 输出)
+            let use_legacy = agent_info.args.iter().any(|arg| arg == "--print");
+
+            if use_legacy || agent_info.agent_type == AgentType::Claude {
+                // Legacy 模式：每次启动新进程，使用 stream-json 输出格式
+                    tracing::info!("[PROMPT] Starting legacy streaming for session {}", params.sessionId);
+                    let mut event_rx = match super::streaming::StreamingSession::run_claude_async(
+                        params.sessionId.clone(),
+                        agent_info,
+                        session_info.workdir.clone(),
+                        session_info.claude_session_id.clone(),
+                        &message,
+                    ).await {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            return AcpResponse::error(request.id, -32603, &format!("Failed to start streaming: {}", e));
+                        }
+                    };
+
+                    let session_id = params.sessionId.clone();
+                    let request_id = request.id.clone();
+                    let session_manager = self.session_manager.clone();
+                    let agent_id = session_info.agent_id.clone();
+                    let user_message = message.clone(); // 保存用户消息用于存储
+
+                    // 先存储用户消息
+                    tracing::info!("[PROMPT] Appending user message to session {}", session_id);
+                    session_manager.append_message(&session_id, &agent_id, "user", &user_message);
+                    tracing::info!("[PROMPT] User message saved, spawning notification task");
+
+                    tokio::spawn(async move {
+                        let mut final_result: Option<AsyncStreamingResult> = None;
+
+                        while let Some(event) = event_rx.recv().await {
+                            match event {
+                                StreamingEvent::Notification(json) => {
+                                    tracing::info!("[PROMPT] Forwarding notification, json_len={}", json.len());
+                                    if tx.send(json).await.is_err() {
+                                        tracing::warn!("Client disconnected");
+                                        break;
+                                    }
+                                }
+                                StreamingEvent::Completed(result) => {
+                                    final_result = Some(result);
+                                    break;
+                                }
                             }
                         }
 
-                        // Update persisted session metadata (UTF-8 safe truncation)
-                        let msg_preview = if content.chars().count() > 100 {
-                            format!("{}...", content.chars().take(100).collect::<String>())
-                        } else {
-                            content.clone()
-                        };
-                        session_manager.update_persisted_metadata(
-                            &session_id,
-                            &agent_id,
-                            claude_session_id.as_deref(),
-                            Some(&msg_preview),
-                        );
+                        if let Some(result) = final_result {
+                            match result {
+                                AsyncStreamingResult::Completed {
+                                    stop_reason,
+                                    content,
+                                    claude_session_id,
+                            } => {
+                                if let Some(ref sid) = claude_session_id {
+                                    if let Err(e) = session_manager.update_claude_session_id(&session_id, sid).await {
+                                        tracing::warn!("Failed to save claude_session_id: {}", e);
+                                    }
+                                }
 
-                        // Send final response (only stopReason, content was already sent via sessionUpdate)
-                        let final_response = AcpResponse::success(request_id, serde_json::json!({
-                            "stopReason": match stop_reason {
-                                StopReason::EndTurn => "end_turn",
-                                StopReason::Stop => "stop",
-                                StopReason::Cancelled => "cancelled",
-                                StopReason::Refusal => "refusal",
-                                StopReason::Error => "error",
+                                let msg_preview = if content.chars().count() > 100 {
+                                    format!("{}...", content.chars().take(100).collect::<String>())
+                                } else {
+                                    content.clone()
+                                };
+                                session_manager.update_persisted_metadata(
+                                    &session_id,
+                                    &agent_id,
+                                    claude_session_id.as_deref(),
+                                    Some(&msg_preview),
+                                );
+
+                                // 存储助手响应消息
+                                session_manager.append_message(&session_id, &agent_id, "assistant", &content);
+
+                                let final_response = AcpResponse::success(request_id, serde_json::json!({
+                                    "stopReason": match stop_reason {
+                                        StopReason::EndTurn => "end_turn",
+                                        StopReason::Stop => "stop",
+                                        StopReason::Cancelled => "cancelled",
+                                        StopReason::Refusal => "refusal",
+                                        StopReason::Error => "error",
+                                    },
+                                    "response": content
+                                }));
+                                let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
                             }
-                        }));
-                        let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
+                            AsyncStreamingResult::Error(e) => {
+                                tracing::error!("Streaming error: {}", e);
+                                let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
+                                let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                            }
+                        }
                     }
-                    super::streaming::AsyncStreamingResult::Error(e) => {
-                        tracing::error!("Streaming error: {}", e);
-                        let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
-                        let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
-                    }
-                }
+                });
             }
-        });
+        }
 
         // Return immediately - streaming happens in background
         AcpResponse::success(request.id, serde_json::json!({
@@ -537,6 +675,54 @@ impl AcpHandler {
 
         AcpResponse::success(request.id, serde_json::json!({
             "success": true
+        }))
+    }
+
+    /// Handle getConversationMessages - read messages from aginx session storage
+    /// TODO: 实现从 aginx 自己的 session 存储中读取消息
+    async fn handle_get_conversation_messages(&self, request: AcpRequest) -> AcpResponse {
+        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                tracing::warn!("[getConversationMessages] Missing sessionId in request");
+                return AcpResponse::error(request.id, -32602, "Missing sessionId");
+            }
+        };
+
+        tracing::info!("[getConversationMessages] Request for session_id: {}", session_id);
+
+        // Find the agent that owns this session
+        let agents = self.agent_manager.list_agents().await;
+        let mut found_agent_id: Option<String> = None;
+
+        for agent in &agents {
+            if let Some(aid) = agent.get("id").and_then(|v| v.as_str()) {
+                if self.session_manager.get_persisted_metadata(&session_id, aid).is_some() {
+                    found_agent_id = Some(aid.to_string());
+                    break;
+                }
+            }
+        }
+
+        let agent_id = match found_agent_id {
+            Some(id) => id,
+            None => {
+                tracing::warn!("[getConversationMessages] Session {} not found", session_id);
+                return AcpResponse::success(request.id, serde_json::json!({
+                    "messages": []
+                }));
+            }
+        };
+
+        // 从 aginx session 存储中读取消息
+        // TODO: 实现真正的消息存储和读取
+        let messages = self.session_manager.get_session_messages(&session_id, &agent_id);
+
+        tracing::info!("[getConversationMessages] Returning {} messages for session {}", messages.len(), session_id);
+
+        AcpResponse::success(request.id, serde_json::json!({
+            "messages": messages
         }))
     }
 
@@ -695,15 +881,11 @@ impl AcpHandler {
             .and_then(|v| v.as_str())
             .unwrap_or("~");
 
-        let path = if path_str == "~" || path_str.is_empty() {
-            dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
-        } else if path_str.starts_with("~/") {
-            let rest = &path_str[2..];
-            dirs::home_dir()
-                .map(|h| h.join(rest))
-                .unwrap_or_else(|| std::path::PathBuf::from(path_str))
-        } else {
-            std::path::PathBuf::from(path_str)
+        let path = match Self::safe_resolve_path(path_str) {
+            Ok(p) => p,
+            Err(e) => {
+                return AcpResponse::error(request.id, 400, &e);
+            }
         };
 
         if !path.exists() {
@@ -785,7 +967,12 @@ impl AcpHandler {
             }
         };
 
-        let path = std::path::PathBuf::from(path_str);
+        let path = match Self::safe_resolve_path(path_str) {
+            Ok(p) => p,
+            Err(e) => {
+                return AcpResponse::error(request.id, 400, &e);
+            }
+        };
 
         if !path.exists() {
             return AcpResponse::error(request.id, 404, &format!("File not found: {}", path.display()));
@@ -903,7 +1090,7 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
 
                 // Handle request with streaming support
                 let method = request.method.clone();
-                if method == "prompt" {
+                if method == "prompt" || method == "session/prompt" {
                     // SPAWN: run streaming in a separate task so the main loop
                     // can continue reading the next request (e.g. permissionResponse)
                     let (tx, rx) = mpsc::channel::<String>(32);
@@ -924,18 +1111,13 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
                             }
                         });
 
-                        // Run streaming
-                        let response = handler_clone.handle_prompt_streaming(request, tx).await;
+                        // Run streaming (final response is sent through tx channel)
+                        let _response = handler_clone.handle_prompt(request, tx).await;
 
-                        // Wait for all notifications to be written
+                        // Wait for all notifications + final response to be written
                         let _ = notify_task.await;
 
-                        // Send final response
-                        if let Ok(json) = response.to_ndjson() {
-                            tracing::trace!("ACP prompt response: {}", json);
-                            let mut w = writer_clone.lock().await;
-                            let _ = write_ndjson(&mut *w, &json).await;
-                        }
+                        // Don't send _response to stdout - already sent via tx
                     });
 
                     // Main loop continues immediately

@@ -329,7 +329,7 @@ async fn handle_data_message(
 
     let method = request.method.clone();
 
-    if method == "prompt" {
+    if method == "session/prompt" {
         // SPAWN: run streaming in a separate task so the main message loop
         // can continue reading the next message (e.g. permissionResponse)
         let acp_handler = acp_handler.clone();
@@ -363,14 +363,13 @@ async fn handle_data_message(
                 }
             });
 
-            // Run streaming
-            let response = acp_handler.handle_prompt_streaming(request, tx).await;
+            // Run streaming (final response is sent through tx channel)
+            let _response = acp_handler.handle_prompt(request, tx).await;
 
-            // Wait for all notifications to be written
+            // Wait for all notifications + final response to be written
             let _ = notify_task.await;
 
-            // Send final response
-            let _ = send_acp_response(&writer, &client_id, &response).await;
+            // Don't send _response separately - already sent via tx
         });
 
         // Return immediately - main loop continues reading next message

@@ -1,11 +1,10 @@
 //! Session management for aginx
 //!
-//! 会话 = 一个长期运行的 agent 进程 (Process 类型)
-//! 或基于工作目录的会话 (Claude 类型)
+//! Session = metadata container for agent session state
+//! Actual agent process management is handled by AcpAgentProcess
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,42 +12,122 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use super::manager::AgentInfo;
+use crate::acp::agent_process::AcpAgentProcess;
 use crate::config::AgentType;
 
-/// 权限提示
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PermissionPrompt {
-    /// 请求 ID
-    pub request_id: String,
-    /// 描述文本
-    pub description: String,
-    /// 选项列表
-    pub options: Vec<PermissionOption>,
+/// 会话消息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionMessage {
+    /// 消息 ID
+    pub id: String,
+    /// 角色: "user" | "assistant"
+    pub role: String,
+    /// 消息内容
+    pub content: String,
+    /// 时间戳 (unix millis)
+    pub timestamp: u64,
 }
 
-/// 权限选项
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PermissionOption {
-    pub index: usize,
-    pub label: String,
-    #[serde(rename = "isDefault")]
-    pub is_default: bool,
+/// 会话完整数据（包含消息历史）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionData {
+    /// 会话 ID
+    pub id: String,
+    /// Agent ID
+    pub agent_id: String,
+    /// 工作目录
+    pub workdir: Option<String>,
+    /// 标题
+    pub title: Option<String>,
+    /// 创建时间 (unix millis)
+    pub created_at: u64,
+    /// 更新时间 (unix millis)
+    pub updated_at: u64,
+    /// 消息历史
+    pub messages: Vec<SessionMessage>,
 }
 
-/// 发送消息的结果
-#[derive(Debug, Clone, serde::Serialize)]
-pub enum SendMessageResult {
-    /// 正常响应
-    Response(String),
-    /// 需要权限确认
-    PermissionNeeded(PermissionPrompt),
-    /// 权限已处理，继续执行
-    PermissionHandled {
-        /// 原始请求 ID
-        request_id: String,
-        /// 最终响应
-        response: String,
-    },
+impl SessionData {
+    /// 创建新会话
+    pub fn new(session_id: &str, agent_id: &str, workdir: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        Self {
+            id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            workdir,
+            title: None,
+            created_at: now,
+            updated_at: now,
+            messages: Vec::new(),
+        }
+    }
+
+    /// 添加消息
+    pub fn add_message(&mut self, role: &str, content: &str) -> &SessionMessage {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let message = SessionMessage {
+            id: format!("msg_{}_{}", self.id, self.messages.len()),
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: now,
+        };
+
+        self.messages.push(message);
+        self.updated_at = now;
+
+        // 更新最后一条消息摘要
+        if content.len() > 100 {
+            self.title = Some(format!("{}...", content.chars().take(100).collect::<String>()));
+        } else {
+            self.title = Some(content.to_string());
+        }
+
+        self.messages.last().unwrap()
+    }
+
+    /// 转换为 JSON 格式的消息列表（兼容 API 返回）
+    pub fn to_api_messages(&self) -> Vec<serde_json::Value> {
+        self.messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "role": m.role,
+                    "content": m.content,
+                    "timestamp": m.timestamp
+                })
+            })
+            .collect()
+    }
+}
+
+/// 会话元数据（持久化到磁盘，用于快速列出会话）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionMetadata {
+    /// 会话 ID (ACP session_id)
+    pub session_id: String,
+    /// Agent ID
+    pub agent_id: String,
+    /// 工作目录
+    pub workdir: Option<String>,
+    /// 标题（第一条消息或工作目录）
+    pub title: Option<String>,
+    /// 最后一条消息摘要
+    pub last_message: Option<String>,
+    /// Claude 返回的 session_id (用于 --resume)
+    pub claude_session_id: Option<String>,
+    /// 创建时间 (unix millis)
+    pub created_at: u64,
+    /// 更新时间 (unix millis)
+    pub updated_at: u64,
 }
 
 /// 会话简要信息
@@ -62,97 +141,8 @@ pub struct SessionInfo {
     pub workdir: Option<String>,
     /// Session UUID (用于保持上下文)
     pub session_uuid: Option<String>,
-}
-
-/// 解析权限提示
-fn parse_permission_prompt(output: &str) -> Option<PermissionPrompt> {
-    let lines: Vec<&str> = output.lines().collect();
-    let mut description_lines = Vec::new();
-    let mut options = Vec::new();
-    let mut found_prompt = false;
-    let mut in_options = false;
-
-    for line in &lines {
-        let trimmed = line.trim();
-
-        // 检测权限提示关键词
-        if !found_prompt {
-            if trimmed.contains("Do you want") ||
-               trimmed.contains("Allow") ||
-               trimmed.contains("Proceed?") ||
-               trimmed.contains("Continue?") ||
-               trimmed.starts_with("❯") && trimmed.contains("1.") {
-                found_prompt = true;
-                // 如果行以 ❯ 开头，说明是选项行
-                if trimmed.starts_with("❯") {
-                    if let Some(opt) = parse_option_line(trimmed) {
-                        options.push(opt);
-                        in_options = true;
-                    }
-                } else {
-                    description_lines.push(trimmed.to_string());
-                }
-                continue;
-            }
-        }
-
-        if found_prompt {
-            // 检测选项行
-            if let Some(opt) = parse_option_line(trimmed) {
-                in_options = true;
-                options.push(opt);
-            } else if in_options && trimmed.is_empty() {
-                // 选项结束
-                break;
-            } else if !in_options && !trimmed.is_empty() && !trimmed.starts_with("❯") {
-                // 描述继续
-                description_lines.push(trimmed.to_string());
-            } else if trimmed.starts_with("❯") || trimmed.starts_with("  ") {
-                // 可能是选项行
-                if let Some(opt) = parse_option_line(trimmed) {
-                    options.push(opt);
-                    in_options = true;
-                }
-            }
-        }
-    }
-
-    if found_prompt && !options.is_empty() {
-        Some(PermissionPrompt {
-            request_id: format!("perm_{}", Uuid::new_v4().simple()),
-            description: if description_lines.is_empty() {
-                "Permission required".to_string()
-            } else {
-                description_lines.join("\n")
-            },
-            options,
-        })
-    } else {
-        None
-    }
-}
-
-/// 解析选项行
-fn parse_option_line(line: &str) -> Option<PermissionOption> {
-    // 移除前导符号 (❯, ●, ○, 空格)
-    let line = line.trim_start_matches(['❯', '●', '○', ' ']).trim();
-
-    // 匹配 "1. xxx" 或 "1) xxx" 格式
-    let re = regex::Regex::new(r"^(\d+)[.\)]\s*(.+)$").ok()?;
-
-    if let Some(caps) = re.captures(line) {
-        let index: usize = caps.get(1)?.as_str().parse().ok()?;
-        let label = caps.get(2)?.as_str().trim().to_string();
-        let is_default = line.starts_with('❯') || line.starts_with('●');
-
-        Some(PermissionOption {
-            index,
-            label,
-            is_default,
-        })
-    } else {
-        None
-    }
+    /// Claude 返回的 session_id (用于 --resume)
+    pub claude_session_id: Option<String>,
 }
 
 /// 会话配置
@@ -173,17 +163,6 @@ impl Default for SessionConfig {
     }
 }
 
-/// 待处理的权限请求
-#[derive(Debug, Clone)]
-struct PendingPermission {
-    /// 请求 ID
-    request_id: String,
-    /// 原始消息
-    original_message: String,
-    /// 权限提示
-    prompt: PermissionPrompt,
-}
-
 /// 会话状态
 pub struct Session {
     /// 会话 ID
@@ -202,23 +181,17 @@ pub struct Session {
     env_remove: Vec<String>,
     /// Session ID 参数模板 (从配置读取，支持 ${SESSION_ID} 变量)
     session_args: Vec<String>,
+    /// Claude 返回的 session_id (用于 --resume)
+    claude_session_id: Mutex<Option<String>>,
     /// 工作目录
     workdir: Option<String>,
-    /// 进程 stdin 写入端 (仅用于 Process 类型)
-    stdin: Mutex<Option<std::process::ChildStdin>>,
-    /// 进程 stdout 读取端 (仅用于 Process 类型)
-    stdout: Mutex<Option<BufReader<std::process::ChildStdout>>>,
     /// 最后活动时间
     pub last_activity: Mutex<Instant>,
-    /// 进程句柄（用于关闭时 kill, 仅用于 Process 类型）
-    process: Mutex<Option<std::process::Child>>,
     /// Session UUID (用于保持上下文)
     session_uuid: Option<String>,
     /// 信号量许可（持有它来限制并发）
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
-    /// 待处理的权限请求
-    pending_permission: Mutex<Option<PendingPermission>>,
 }
 
 impl std::fmt::Debug for Session {
@@ -232,56 +205,34 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     /// 创建新会话
+    /// 注意：实际进程管理由 AcpAgentProcess 处理，此处只创建会话元数据
     pub fn new(agent_info: &AgentInfo, workdir: Option<&str>, permit: OwnedSemaphorePermit) -> Result<Self, String> {
         let session_id = format!("sess_{}", Uuid::new_v4().simple());
 
         match agent_info.agent_type {
-            AgentType::Claude => {
-                // Claude 类型：生成 session UUID 用于保持上下文
-                let session_uuid = Uuid::new_v4().to_string();
-                tracing::info!("会话 [{}] 创建成功 (Claude 模式)，Agent: {}, Command: {}, Session UUID: {}",
-                    session_id, agent_info.id, agent_info.command, session_uuid);
+            AgentType::Claude | AgentType::Process => {
+                // 生成 session UUID 用于保持上下文（仅 Claude 类型使用）
+                let session_uuid = if agent_info.agent_type == AgentType::Claude {
+                    Some(Uuid::new_v4().to_string())
+                } else {
+                    None
+                };
+                tracing::info!("会话 [{}] 创建成功，Agent: {}, Type: {:?}",
+                    session_id, agent_info.id, agent_info.agent_type);
                 Ok(Self {
                     id: session_id,
                     agent_id: agent_info.id.clone(),
-                    agent_type: AgentType::Claude,
+                    agent_type: agent_info.agent_type.clone(),
                     command: agent_info.command.clone(),
                     args: agent_info.args.clone(),
                     env: agent_info.env.clone(),
                     env_remove: agent_info.env_remove.clone(),
                     session_args: agent_info.session_args.clone(),
+                    claude_session_id: Mutex::new(None),
                     workdir: workdir.map(|s| s.to_string()),
-                    stdin: Mutex::new(None),
-                    stdout: Mutex::new(None),
                     last_activity: Mutex::new(Instant::now()),
-                    process: Mutex::new(None),
-                    session_uuid: Some(session_uuid),
+                    session_uuid,
                     permit,
-                    pending_permission: Mutex::new(None),
-                })
-            }
-            AgentType::Process => {
-                // Process 类型：启动持久进程
-                let (stdin, stdout, process) = Self::spawn_process(agent_info, workdir)?;
-                tracing::info!("会话 [{}] 创建成功 (Process 模式)，Agent: {}, Command: {}",
-                    session_id, agent_info.id, agent_info.command);
-                Ok(Self {
-                    id: session_id,
-                    agent_id: agent_info.id.clone(),
-                    agent_type: AgentType::Process,
-                    command: agent_info.command.clone(),
-                    args: agent_info.args.clone(),
-                    env: agent_info.env.clone(),
-                    env_remove: agent_info.env_remove.clone(),
-                    session_args: agent_info.session_args.clone(),
-                    workdir: workdir.map(|s| s.to_string()),
-                    stdin: Mutex::new(Some(stdin)),
-                    stdout: Mutex::new(Some(stdout)),
-                    last_activity: Mutex::new(Instant::now()),
-                    process: Mutex::new(Some(process)),
-                    session_uuid: None,
-                    permit,
-                    pending_permission: Mutex::new(None),
                 })
             }
             AgentType::Builtin => {
@@ -290,229 +241,15 @@ impl Session {
         }
     }
 
-    /// 启动外部进程
-    fn spawn_process(agent_info: &AgentInfo, workdir: Option<&str>) -> Result<
-        (
-            std::process::ChildStdin,
-            BufReader<std::process::ChildStdout>,
-            std::process::Child,
-        ),
-        String,
-    > {
-        if agent_info.command.is_empty() {
-            return Err(format!("Agent {} has no command configured", agent_info.id));
-        }
-
-        let mut cmd = Command::new(&agent_info.command);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()); // 忽略 stderr
-
-        // 添加参数
-        for arg in &agent_info.args {
-            cmd.arg(arg);
-        }
-
-        // 设置工作目录 (优先使用传入的 workdir，其次使用配置的 working_dir)
-        if let Some(dir) = workdir {
-            cmd.current_dir(dir);
-        } else if let Some(ref dir) = agent_info.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        // 设置环境变量
-        for (key, value) in &agent_info.env {
-            cmd.env(key, value);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn {}: {}", agent_info.command, e))?;
-
-        let stdin = child.stdin.take().ok_or("Failed to get stdin")?;
-        let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
-        let reader = BufReader::new(stdout);
-
-        Ok((stdin, reader, child))
-    }
-
-    /// 发送消息并获取响应
-    pub async fn send_message(&self, message: &str) -> Result<SendMessageResult, String> {
-        // 更新活动时间
-        {
-            let mut last = self.last_activity.lock().await;
-            *last = Instant::now();
-        }
-
-        match self.agent_type {
-            AgentType::Claude => {
-                // Claude 类型：每次消息启动新进程，使用 -c 保持上下文
-                self.send_message_claude(message).await
-            }
-            AgentType::Process => {
-                // Process 类型：使用持久进程
-                self.send_message_process(message).await.map(|r| SendMessageResult::Response(r))
-            }
-            AgentType::Builtin => {
-                Err("Builtin agents do not support sessions".to_string())
-            }
-        }
-    }
-
-    /// Claude 类型：发送消息（每次启动新进程，使用 session_args 保持上下文）
-    async fn send_message_claude(&self, message: &str) -> Result<SendMessageResult, String> {
-        use tokio::process::Command as AsyncCommand;
-
-        // 获取 Session UUID
-        let session_uuid = self.session_uuid.as_ref()
-            .ok_or("Session UUID not set")?;
-
-        tracing::debug!("会话 [{}] 发送消息, Command: {}, Session UUID: {}", self.id, self.command, session_uuid);
-
-        let mut cmd = AsyncCommand::new(&self.command);
-
-        // 添加配置中的参数
-        for arg in &self.args {
-            cmd.arg(arg);
-        }
-
-        // 添加 session 参数（支持 ${SESSION_ID} 变量替换）
-        for arg in &self.session_args {
-            let processed_arg = arg.replace("${SESSION_ID}", session_uuid);
-            cmd.arg(processed_arg);
-        }
-
-        // 移除配置中指定的环境变量
-        for env_key in &self.env_remove {
-            cmd.env_remove(env_key);
-        }
-
-        // 添加配置中的环境变量
-        for (key, value) in &self.env {
-            cmd.env(key, value);
-        }
-
-        if let Some(ref dir) = self.workdir {
-            cmd.current_dir(dir);
-        }
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to spawn claude: {}", e))?;
-
-        // 写入消息到 stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(message.as_bytes())
-                .await
-                .map_err(|e| format!("Write error: {}", e))?;
-            stdin.flush()
-                .await
-                .map_err(|e| format!("Flush error: {}", e))?;
-        }
-
-        // 读取响应
-        let output = child.wait_with_output()
-            .await
-            .map_err(|e| format!("Wait error: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}{}", stdout, stderr);
-
-        // 检测权限提示
-        if let Some(perm) = parse_permission_prompt(&combined) {
-            // 存储待处理的权限请求
-            let pending = PendingPermission {
-                request_id: perm.request_id.clone(),
-                original_message: message.to_string(),
-                prompt: perm.clone(),
-            };
-            {
-                let mut pending_perm = self.pending_permission.lock().await;
-                *pending_perm = Some(pending);
-            }
-            return Ok(SendMessageResult::PermissionNeeded(perm));
-        }
-
-        if output.status.success() {
-            Ok(SendMessageResult::Response(stdout.trim().to_string()))
-        } else {
-            Err(format!("Claude error: {}", stderr))
-        }
-    }
-
-    /// Process 类型：发送消息（使用持久进程）
-    async fn send_message_process(&self, message: &str) -> Result<String, String> {
-        // 检查进程是否仍然存活
-        {
-            let mut process = self.process.lock().await;
-            if let Some(ref mut child) = *process {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        tracing::warn!("进程已退出，状态: {}", status);
-                        return Err("Process has exited".to_string());
-                    }
-                    Ok(None) => {
-                        // 进程仍在运行
-                    }
-                    Err(e) => {
-                        tracing::error!("检查进程状态失败: {}", e);
-                    }
-                }
-            }
-        }
-
-        // 写入消息
-        {
-            let mut stdin_opt = self.stdin.lock().await;
-            if let Some(ref mut stdin) = *stdin_opt {
-                writeln!(stdin, "{}", message).map_err(|e| format!("Write error: {}", e))?;
-                stdin.flush().map_err(|e| format!("Flush error: {}", e))?;
-            } else {
-                return Err("No stdin available".to_string());
-            }
-        }
-
-        // 读取响应
-        let mut response = String::new();
-        {
-            let mut stdout_opt = self.stdout.lock().await;
-            if let Some(ref mut stdout) = *stdout_opt {
-                match stdout.read_line(&mut response) {
-                    Ok(0) => return Err("Process closed".to_string()),
-                    Ok(_) => {}
-                    Err(e) => return Err(format!("Read error: {}", e)),
-                }
-            } else {
-                return Err("No stdout available".to_string());
-            }
-        }
-
-        Ok(response)
-    }
-
-    /// 关闭会话
+    /// 关闭会话（进程管理由 AcpAgentProcess 处理）
     pub async fn close(&self) {
-        let mut process = self.process.lock().await;
-        if let Some(mut child) = process.take() {
-            let _ = child.kill();
-            tracing::info!("会话 [{}] 已关闭", self.id);
-        }
+        tracing::debug!("会话 [{}] 已关闭", self.id);
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // 尝试同步关闭进程
-        if let Ok(mut process) = self.process.try_lock() {
-            if let Some(mut child) = process.take() {
-                let _ = child.kill();
-            }
-        }
+        // Session 元数据清理由 SessionManager 处理
     }
 }
 
@@ -520,19 +257,211 @@ impl Drop for Session {
 pub struct SessionManager {
     /// 会话存储
     sessions: Mutex<HashMap<String, Session>>,
+    /// ACP agent processes (session_id → process) for Claude-type agents
+    agent_processes: Mutex<HashMap<String, Arc<Mutex<AcpAgentProcess>>>>,
     /// 并发控制信号量
     semaphore: Arc<Semaphore>,
     /// 配置
     config: SessionConfig,
+    /// 数据目录 (~/.aginx/)
+    data_dir: PathBuf,
 }
 
 impl SessionManager {
     /// 创建会话管理器
     pub fn new(config: SessionConfig) -> Self {
+        let data_dir = dirs::home_dir()
+            .map(|h| h.join(".aginx"))
+            .unwrap_or_else(|| PathBuf::from(".aginx"));
         Self {
             sessions: Mutex::new(HashMap::new()),
+            agent_processes: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
             config,
+            data_dir,
+        }
+    }
+
+    /// 获取会话元数据目录
+    fn sessions_dir(&self, agent_id: &str) -> PathBuf {
+        self.data_dir.join("sessions").join(agent_id)
+    }
+
+    /// 从磁盘加载指定会话的持久化元数据
+    pub fn get_persisted_metadata(&self, session_id: &str, agent_id: &str) -> Option<SessionMetadata> {
+        let dir = self.sessions_dir(agent_id);
+        let path = dir.join(format!("{}.json", session_id));
+        if !path.exists() {
+            return None;
+        }
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<SessionMetadata>(&content).ok()
+    }
+
+    /// 持久化会话元数据到磁盘
+    fn persist_metadata(&self, metadata: &SessionMetadata) {
+        let dir = self.sessions_dir(&metadata.agent_id);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("Failed to create sessions dir: {}", e);
+            return;
+        }
+        let path = dir.join(format!("{}.json", metadata.session_id));
+        match serde_json::to_string_pretty(metadata) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to write session metadata: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize session metadata: {}", e);
+            }
+        }
+    }
+
+    /// 列出某个 agent 的所有持久化会话
+    pub fn list_persisted_sessions(&self, agent_id: &str) -> Vec<SessionMetadata> {
+        let dir = self.sessions_dir(agent_id);
+        if !dir.exists() {
+            return Vec::new();
+        }
+
+        let mut sessions = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&content) {
+                            sessions.push(metadata);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 按更新时间降序排列
+        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sessions
+    }
+
+    /// 获取会话的消息历史（从 aginx 自己的存储中读取）
+    pub fn get_session_messages(&self, session_id: &str, agent_id: &str) -> Vec<serde_json::Value> {
+        tracing::debug!("[get_session_messages] session_id={}, agent_id={}", session_id, agent_id);
+        if let Some(data) = self.load_session_data(session_id, agent_id) {
+            data.to_api_messages()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 获取会话数据文件路径
+    fn session_data_path(&self, session_id: &str, agent_id: &str) -> PathBuf {
+        self.sessions_dir(agent_id).join(format!("{}_data.json", session_id))
+    }
+
+    /// 从磁盘加载会话完整数据
+    fn load_session_data(&self, session_id: &str, agent_id: &str) -> Option<SessionData> {
+        let path = self.session_data_path(session_id, agent_id);
+        if !path.exists() {
+            return None;
+        }
+        let content = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str::<SessionData>(&content).ok()
+    }
+
+    /// 保存会话完整数据到磁盘
+    fn save_session_data(&self, data: &SessionData) {
+        let path = self.session_data_path(&data.id, &data.agent_id);
+        let dir = path.parent().unwrap_or(&path);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!("Failed to create session data dir: {}", e);
+            return;
+        }
+        match serde_json::to_string_pretty(data) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!("Failed to write session data: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize session data: {}", e);
+            }
+        }
+    }
+
+    /// 创建会话数据文件
+    pub fn create_session_data(&self, session_id: &str, agent_id: &str, workdir: Option<String>) -> SessionData {
+        let data = SessionData::new(session_id, agent_id, workdir);
+        self.save_session_data(&data);
+        data
+    }
+
+    /// 添加消息到会话（同时更新元数据）
+    pub fn append_message(&self, session_id: &str, agent_id: &str, role: &str, content: &str) {
+        let mut data = match self.load_session_data(session_id, agent_id) {
+            Some(d) => d,
+            None => {
+                tracing::warn!("Session data not found for {}, creating new", session_id);
+                self.create_session_data(session_id, agent_id, None)
+            }
+        };
+
+        data.add_message(role, content);
+        self.save_session_data(&data);
+
+        // 同时更新元数据的 last_message 和 updated_at
+        let dir = self.sessions_dir(agent_id);
+        let meta_path = dir.join(format!("{}.json", session_id));
+        if let Ok(content) = std::fs::read_to_string(&meta_path) {
+            if let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&content) {
+                metadata.last_message = data.title.clone();
+                metadata.updated_at = data.updated_at;
+                if metadata.title.is_none() {
+                    metadata.title = data.title.clone();
+                }
+                self.persist_metadata(&metadata);
+            }
+        }
+    }
+
+    /// 更新会话元数据（最后消息、claude_session_id 等）
+    pub fn update_persisted_metadata(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        claude_session_id: Option<&str>,
+        last_message: Option<&str>,
+    ) {
+        let dir = self.sessions_dir(agent_id);
+        let path = dir.join(format!("{}.json", session_id));
+
+        if !path.exists() {
+            return;
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&content) {
+                if let Some(sid) = claude_session_id {
+                    metadata.claude_session_id = Some(sid.to_string());
+                }
+                if let Some(msg) = last_message {
+                    metadata.last_message = Some(msg.to_string());
+                    metadata.updated_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                }
+                self.persist_metadata(&metadata);
+            }
+        }
+    }
+
+    /// 删除持久化的会话元数据
+    pub fn delete_persisted_session(&self, session_id: &str, agent_id: &str) {
+        let dir = self.sessions_dir(agent_id);
+        let path = dir.join(format!("{}.json", session_id));
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -567,18 +496,50 @@ impl SessionManager {
             self.config.max_concurrent
         );
 
+        // 持久化会话元数据
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let metadata = SessionMetadata {
+            session_id: session_id.clone(),
+            agent_id: agent_info.id.clone(),
+            workdir: workdir.map(|s| s.to_string()),
+            claude_session_id: None,
+            title: workdir.map(|s| s.to_string()),
+            last_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.persist_metadata(&metadata);
+
         Ok(session_id)
     }
 
-    /// 向会话发送消息
-    pub async fn send_message(&self, session_id: &str, message: &str) -> Result<SendMessageResult, String> {
-        let sessions = self.sessions.lock().await;
+    /// 用已有的 session_id 创建会话（用于 loadSession 恢复）
+    pub async fn create_session_with_id(
+        &self,
+        session_id: &str,
+        agent_info: &AgentInfo,
+        workdir: Option<&str>,
+    ) -> Result<String, String> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "Semaphore closed")?;
 
-        let session = sessions
-            .get(session_id)
-            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        let mut session = Session::new(agent_info, workdir, permit)?;
+        session.id = session_id.to_string();
 
-        session.send_message(message).await
+        {
+            let mut sessions = self.sessions.lock().await;
+            sessions.insert(session_id.to_string(), session);
+        }
+
+        tracing::info!("会话恢复成功: {}", session_id);
+        Ok(session_id.to_string())
     }
 
     /// 关闭会话
@@ -586,6 +547,7 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
 
         if let Some(session) = sessions.remove(session_id) {
+            let agent_id = session.agent_id.clone();
             session.close().await;
             tracing::info!(
                 "会话 [{}] 已关闭 (当前活跃: {}/{})",
@@ -594,7 +556,12 @@ impl SessionManager {
                 self.config.max_concurrent
             );
             // permit 会在 session drop 时自动释放
+            // 不删除持久化数据，保留会话记录
+            drop(agent_id);
         }
+
+        // Also close any ACP agent process for this session
+        self.remove_agent_process(session_id).await;
 
         Ok(())
     }
@@ -608,12 +575,31 @@ impl SessionManager {
     /// 获取会话信息 (用于流式输出)
     pub async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.lock().await;
-        sessions.get(session_id).map(|s| SessionInfo {
-            session_id: s.id.clone(),
-            agent_id: s.agent_id.clone(),
-            workdir: s.workdir.clone(),
-            session_uuid: s.session_uuid.clone(),
-        })
+        if let Some(s) = sessions.get(session_id) {
+            let claude_session_id = s.claude_session_id.lock().await.clone();
+            Some(SessionInfo {
+                session_id: s.id.clone(),
+                agent_id: s.agent_id.clone(),
+                workdir: s.workdir.clone(),
+                session_uuid: s.session_uuid.clone(),
+                claude_session_id,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// 更新 Claude session_id (用于 --resume)
+    pub async fn update_claude_session_id(&self, session_id: &str, claude_session_id: &str) -> Result<(), String> {
+        let sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(session_id) {
+            let mut sid = session.claude_session_id.lock().await;
+            *sid = Some(claude_session_id.to_string());
+            tracing::info!("Updated claude_session_id for session {}: {}", session_id, claude_session_id);
+            Ok(())
+        } else {
+            Err(format!("Session {} not found", session_id))
+        }
     }
 
     /// 清理超时会话
@@ -661,103 +647,24 @@ impl SessionManager {
         })
     }
 
-    /// 响应权限请求
-    pub async fn respond_permission(&self, session_id: &str, choice: usize) -> Result<SendMessageResult, String> {
-        use tokio::process::Command as AsyncCommand;
+    /// Store an ACP agent process for a session
+    pub async fn store_agent_process(&self, session_id: String, process: AcpAgentProcess) {
+        let mut processes = self.agent_processes.lock().await;
+        processes.insert(session_id, Arc::new(Mutex::new(process)));
+    }
 
-        // 获取 session
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(session_id)
-            .ok_or_else(|| format!("Session {} not found", session_id))?;
+    /// Get the ACP agent process for a session
+    pub async fn get_agent_process(&self, session_id: &str) -> Option<Arc<Mutex<AcpAgentProcess>>> {
+        let processes = self.agent_processes.lock().await;
+        processes.get(session_id).cloned()
+    }
 
-        // 获取待处理的权限请求
-        let pending = {
-            let mut pending_perm = session.pending_permission.lock().await;
-            pending_perm.take()
-        };
-
-        let pending = pending.ok_or("No pending permission request")?;
-        tracing::info!("响应权限请求 [{}]: choice={}", pending.request_id, choice);
-
-        // 获取 Session UUID
-        let session_uuid = session.session_uuid.as_ref()
-            .ok_or("Session UUID not set")?;
-
-        // 构建命令，使用配置的 command 和 session_args 保持上下文
-        let mut cmd = AsyncCommand::new(&session.command);
-
-        // 添加配置中的参数
-        for arg in &session.args {
-            cmd.arg(arg);
-        }
-
-        // 添加 session 参数（支持 ${SESSION_ID} 变量替换）
-        for arg in &session.session_args {
-            let processed_arg = arg.replace("${SESSION_ID}", session_uuid);
-            cmd.arg(processed_arg);
-        }
-
-        // 移除配置中指定的环境变量
-        for env_key in &session.env_remove {
-            cmd.env_remove(env_key);
-        }
-
-        // 添加配置中的环境变量
-        for (key, value) in &session.env {
-            cmd.env(key, value);
-        }
-
-        if let Some(ref dir) = session.workdir {
-            cmd.current_dir(dir);
-        }
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("Failed to spawn claude: {}", e))?;
-
-        // 写入权限选择到 stdin
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let choice_input = format!("{}\n", choice);
-            stdin.write_all(choice_input.as_bytes())
-                .await
-                .map_err(|e| format!("Write error: {}", e))?;
-            stdin.flush()
-                .await
-                .map_err(|e| format!("Flush error: {}", e))?;
-        }
-
-        // 读取响应
-        let output = child.wait_with_output()
-            .await
-            .map_err(|e| format!("Wait error: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}{}", stdout, stderr);
-
-        // 检测是否还有权限提示
-        if let Some(perm) = parse_permission_prompt(&combined) {
-            // 存储新的待处理权限请求
-            let new_pending = PendingPermission {
-                request_id: perm.request_id.clone(),
-                original_message: pending.original_message.clone(),
-                prompt: perm.clone(),
-            };
-            {
-                let mut pending_perm = session.pending_permission.lock().await;
-                *pending_perm = Some(new_pending);
-            }
-            return Ok(SendMessageResult::PermissionNeeded(perm));
-        }
-
-        if output.status.success() {
-            Ok(SendMessageResult::Response(stdout.trim().to_string()))
-        } else {
-            Err(format!("Claude error: {}", stderr))
+    /// Remove and close the ACP agent process for a session
+    pub async fn remove_agent_process(&self, session_id: &str) {
+        let mut processes = self.agent_processes.lock().await;
+        if let Some(process) = processes.remove(session_id) {
+            let mut p = process.lock().await;
+            p.close().await;
         }
     }
 }

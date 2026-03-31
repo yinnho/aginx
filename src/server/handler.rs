@@ -89,7 +89,7 @@ impl Handler {
                 continue;
             }
 
-            tracing::trace!("ACP received: {}", line);
+            tracing::info!("ACP received from {}: {}", peer_addr, line);
 
             // Parse ACP request
             let request: AcpRequest = match serde_json::from_str(line) {
@@ -104,42 +104,63 @@ impl Handler {
 
             let method = request.method.clone();
 
-            if method == "prompt" {
+            if method == "session/prompt" {
                 // SPAWN: run streaming in a separate task so the main loop
                 // can continue reading the next request (e.g. permissionResponse)
                 let acp_handler = self.acp_handler.clone();
                 let writer = writer.clone();
                 let (tx, rx) = mpsc::channel::<String>(32);
 
+                tracing::info!("[SERVER] Spawning prompt handler task");
                 tokio::spawn(async move {
-                    // Notification forwarder: writes streaming notifications to TCP
+                    tracing::info!("[SERVER] Prompt handler task started");
+                    // Notification forwarder: writes streaming notifications + final response to TCP
                     let writer_clone = writer.clone();
                     let notify_task = tokio::spawn(async move {
+                        tracing::info!("[SERVER] Notify task started");
                         let mut rx = rx;
                         while let Some(notification) = rx.recv().await {
+                            tracing::info!("[SERVER] Forwarding notification to TCP");
                             let mut w = writer_clone.lock().await;
                             if let Err(e) = write_ndjson(&mut *w, &notification).await {
                                 tracing::error!("Failed to write notification: {}", e);
                                 break;
                             }
                         }
+                        tracing::info!("[SERVER] Notify task ended");
                     });
 
-                    // Run the streaming prompt
-                    let response = acp_handler.handle_prompt_streaming(request, tx).await;
+                    // Run the streaming prompt (final response is sent through tx channel)
+                    tracing::info!("[SERVER] Calling handle_prompt");
+                    let response = acp_handler.handle_prompt(request, tx).await;
+                    tracing::info!("[SERVER] handle_prompt returned");
 
-                    // Wait for all notifications to be written
-                    let _ = notify_task.await;
-
-                    // Send final response
-                    if let Ok(json) = response.to_ndjson() {
-                        tracing::trace!("ACP prompt response: {}", json);
-                        let mut w = writer.lock().await;
-                        let _ = write_ndjson(&mut *w, &json).await;
+                    // If response is not streaming (error case), send it directly via TCP
+                    if response.result.as_ref().and_then(|r| r.get("streaming")).is_none() {
+                        tracing::warn!("[SERVER] Non-streaming response (error), sending directly");
+                        if let Err(e) = send_response(&writer, &response).await {
+                            tracing::error!("Failed to send error response: {}", e);
+                        }
                     }
+
+                    // Wait for all notifications + final response to be written
+                    let _ = notify_task.await;
+                    tracing::info!("[SERVER] All tasks done");
                 });
 
                 // Main loop continues immediately - does NOT wait for prompt to finish
+            } else if method == "loadSession" {
+                // SPAWN: loadSession spawns Claude CLI which takes time,
+                // must not block the main read loop
+                let acp_handler = self.acp_handler.clone();
+                let writer = writer.clone();
+
+                tokio::spawn(async move {
+                    let response = acp_handler.handle_request(request).await;
+                    if let Err(e) = send_response(&writer, &response).await {
+                        tracing::error!("Failed to send loadSession response: {}", e);
+                    }
+                });
             } else {
                 // Non-streaming methods: handle synchronously
                 let response = self.acp_handler.handle_request(request).await;

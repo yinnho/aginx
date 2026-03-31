@@ -39,18 +39,24 @@ pub fn load_config(args: &CliArgs) -> anyhow::Result<LoadResult> {
     };
 
     // Apply CLI overrides
+    // Priority: CLI args > config file > defaults
+    // Special case: --public-url implies Direct mode unless --mode is explicitly set
     if let Some(port) = args.port {
         config.server.port = port;
     }
     if let Some(host) = &args.host {
         config.server.host = host.clone();
     }
+    if let Some(public_url) = &args.public_url {
+        // public_url implies Direct mode (only if mode not explicitly set)
+        if args.mode.is_none() {
+            config.server.mode = ServerMode::Direct;
+        }
+        config.direct.public_url = Some(public_url.clone());
+    }
+    // Mode override should come after public_url to allow explicit override
     if let Some(mode) = &args.mode {
         config.server.mode = mode.clone();
-    }
-    if let Some(public_url) = &args.public_url {
-        config.server.mode = ServerMode::Direct;
-        config.direct.public_url = Some(public_url.clone());
     }
 
     Ok(LoadResult { config, config_path })

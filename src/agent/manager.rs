@@ -32,6 +32,8 @@ pub struct AgentInfo {
     pub env_remove: Vec<String>,
     /// Session ID 参数模板 (支持 ${SESSION_ID} 变量)
     pub session_args: Vec<String>,
+    /// 默认允许的工具列表 (用于 --permission-mode dontAsk --allowedTools)
+    pub default_allowed_tools: Vec<String>,
 }
 
 impl From<AgentConfig> for AgentInfo {
@@ -45,10 +47,11 @@ impl From<AgentConfig> for AgentInfo {
             args: config.args,
             help_command: config.help_command,
             working_dir: config.working_dir.map(|p| p.to_string_lossy().to_string()),
-            require_workdir: config.require_workdir,
+            require_workdir: config.session.require_workdir,
             env: config.env,
             env_remove: config.env_remove,
             session_args: config.session_args,
+            default_allowed_tools: Vec::new(),
         }
     }
 }
@@ -56,12 +59,144 @@ impl From<AgentConfig> for AgentInfo {
 impl AgentManager {
     /// Create agent manager from config
     pub fn from_config(config: &Config) -> Self {
-        let agents: HashMap<String, AgentInfo> = config
+        let mut agents: HashMap<String, AgentInfo> = config
             .agents
             .list
             .iter()
             .map(|ac| (ac.id.clone(), AgentInfo::from(ac.clone())))
             .collect();
+
+        // 添加内置 agents（总是可用）
+        let builtin_agents = vec![
+            AgentInfo {
+                id: "echo".to_string(),
+                name: "Echo".to_string(),
+                capabilities: vec!["chat".to_string()],
+                agent_type: AgentType::Builtin,
+                command: String::new(),
+                args: vec![],
+                help_command: String::new(),
+                working_dir: None,
+                require_workdir: false,
+                env: HashMap::new(),
+                env_remove: vec![],
+                session_args: vec![],
+                default_allowed_tools: vec![],
+            },
+            AgentInfo {
+                id: "info".to_string(),
+                name: "Info".to_string(),
+                capabilities: vec!["chat".to_string()],
+                agent_type: AgentType::Builtin,
+                command: String::new(),
+                args: vec![],
+                help_command: String::new(),
+                working_dir: None,
+                require_workdir: false,
+                env: HashMap::new(),
+                env_remove: vec![],
+                session_args: vec![],
+                default_allowed_tools: vec![],
+            },
+            // Shell agent - 使用 process 类型，每次执行一个命令
+            AgentInfo {
+                id: "shell".to_string(),
+                name: "Shell".to_string(),
+                capabilities: vec!["chat".to_string(), "code".to_string()],
+                agent_type: AgentType::Process,
+                command: "sh".to_string(),
+                args: vec!["-c".to_string()],
+                help_command: String::new(),
+                working_dir: None,
+                require_workdir: false,
+                env: HashMap::new(),
+                env_remove: vec![],
+                session_args: vec![],
+                default_allowed_tools: vec![],
+            },
+        ];
+
+        for agent in builtin_agents {
+            if !agents.contains_key(&agent.id) {
+                agents.insert(agent.id.clone(), agent);
+            }
+        }
+
+        // 自动扫描 ~/.aginx/agents/ 目录，加载 aginx.toml 配置的 agent
+        let agents_dir = dirs::home_dir()
+            .map(|h| h.join(".aginx").join("agents"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".aginx/agents"));
+
+        if agents_dir.exists() {
+            let discovered = super::discovery::scan_directory(&agents_dir, 5);
+            for agent in discovered {
+                if agent.available {
+                    let dc = &agent.config;
+                    if agents.contains_key(&dc.id) {
+                        continue;
+                    }
+
+                    // 将 discovery::AgentConfig 转换为 AgentInfo
+                    let agent_type = match dc.agent_type.as_str() {
+                        "claude" => AgentType::Claude,
+                        "process" => AgentType::Process,
+                        _ => AgentType::Builtin,
+                    };
+
+                    let command = dc.command.as_ref()
+                        .and_then(|c| c.path.clone())
+                        .unwrap_or_default();
+                    let args = dc.command.as_ref()
+                        .map(|c| c.args.clone())
+                        .unwrap_or_default();
+                    let env = dc.command.as_ref()
+                        .map(|c| c.env.clone())
+                        .unwrap_or_default();
+                    let env_remove = dc.command.as_ref()
+                        .map(|c| c.env_remove.clone())
+                        .unwrap_or_default();
+                    let session_args = dc.session.as_ref()
+                        .and_then(|s| s.resume.as_ref())
+                        .map(|r| r.resume_args.clone())
+                        .unwrap_or_default();
+                    let require_workdir = dc.session.as_ref()
+                        .map(|s| s.require_workdir)
+                        .unwrap_or(false);
+
+                    let mut capabilities = Vec::new();
+                    if let Some(ref caps) = dc.capabilities {
+                        if caps.chat { capabilities.push("chat".to_string()); }
+                        if caps.code { capabilities.push("code".to_string()); }
+                        if caps.streaming { capabilities.push("streaming".to_string()); }
+                    }
+
+                    let default_allowed_tools = dc.permissions.as_ref()
+                        .map(|p| p.default_allowed.clone())
+                        .unwrap_or_default();
+
+                    let info = AgentInfo {
+                        id: dc.id.clone(),
+                        name: dc.name.clone(),
+                        capabilities,
+                        agent_type,
+                        command,
+                        args,
+                        help_command: String::new(),
+                        working_dir: Some(agent.project_dir.to_string_lossy().to_string()),
+                        require_workdir,
+                        env,
+                        env_remove,
+                        session_args,
+                        default_allowed_tools,
+                    };
+
+                    tracing::info!("自动加载 agent: {} ({})", info.id, info.name);
+                    agents.insert(info.id.clone(), info);
+                } else {
+                    tracing::warn!("跳过不可用的 agent {}: {:?}", agent.config.id, agent.error);
+                }
+            }
+        }
 
         tracing::info!("已加载 {} 个 agent", agents.len());
         for (id, info) in &agents {
@@ -82,6 +217,11 @@ impl AgentManager {
                 serde_json::json!({
                     "id": a.id,
                     "name": a.name,
+                    "agent_type": match a.agent_type {
+                        AgentType::Claude => "claude",
+                        AgentType::Process => "process",
+                        AgentType::Builtin => "builtin",
+                    },
                     "capabilities": a.capabilities,
                     "require_workdir": a.require_workdir,
                     "working_dir": a.working_dir
@@ -182,120 +322,6 @@ impl AgentManager {
             }
             Ok(Err(e)) => Err(format!("Failed to execute help command: {}", e)),
             Err(_) => Err("Help command timeout (>10s)".to_string()),
-        }
-    }
-
-    /// Send message to agent
-    pub async fn send_message(&self, agent_id: &str, message: &str, workdir: Option<&str>) -> Result<String, String> {
-        let agents = self.agents.read().await;
-        let agent = agents
-            .get(agent_id)
-            .ok_or_else(|| format!("Agent not found: {}", agent_id))?;
-
-        // 确定工作目录：优先使用传入的，其次使用配置的
-        let effective_workdir = workdir
-            .map(|s| s.to_string())
-            .or_else(|| agent.working_dir.clone());
-
-        match &agent.agent_type {
-            AgentType::Builtin => self.handle_builtin(agent_id, message).await,
-            AgentType::Claude => self.call_claude(agent, message, effective_workdir.as_deref()).await,
-            AgentType::Process => self.call_process_with_dir(agent, message, effective_workdir.as_deref()).await,
-        }
-    }
-
-    /// Handle builtin agent
-    async fn handle_builtin(&self, agent_id: &str, message: &str) -> Result<String, String> {
-        match agent_id {
-            "echo" => Ok(message.to_string()),
-            "info" => Ok("aginx v0.1.0 - Agent Protocol Implementation".to_string()),
-            _ => Ok(format!("[{}] {}", agent_id, message)),
-        }
-    }
-
-    /// 调用 Claude CLI
-    async fn call_claude(&self, agent: &AgentInfo, message: &str, workdir: Option<&str>) -> Result<String, String> {
-        use tokio::process::Command;
-
-        tracing::info!("调用 Claude CLI: {} (workdir: {:?})", message, workdir);
-
-        // 必须配置 command
-        if agent.command.is_empty() {
-            return Err("Claude agent 未配置 command 字段，请在配置文件中指定 claude CLI 的路径".to_string());
-        }
-
-        let mut cmd = Command::new(&agent.command);
-        cmd.arg("--print").arg(message);
-
-        // 使用配置的 env_remove
-        for env in &agent.env_remove {
-            cmd.env_remove(env);
-        }
-
-        // 设置工作目录
-        if let Some(dir) = workdir {
-            cmd.current_dir(dir);
-        }
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to spawn {}: {}", agent.command, e))?;
-
-        if output.status.success() {
-            let result = String::from_utf8_lossy(&output.stdout).to_string();
-            tracing::info!("Claude 响应: {} bytes", result.len());
-            Ok(result)
-        } else {
-            let error = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(format!("Claude CLI error: {}", error))
-        }
-    }
-
-    /// 调用外部进程（带工作目录参数）
-    async fn call_process_with_dir(&self, agent: &AgentInfo, message: &str, workdir: Option<&str>) -> Result<String, String> {
-        use tokio::process::Command;
-
-        if agent.command.is_empty() {
-            return Err(format!("Agent {} has no command configured", agent.id));
-        }
-
-        tracing::info!("调用进程 [{}]: {}", agent.id, agent.command);
-
-        let mut cmd = Command::new(&agent.command);
-
-        // 添加参数
-        for arg in &agent.args {
-            cmd.arg(arg);
-        }
-
-        // 添加消息作为最后一个参数或通过 stdin
-        cmd.arg(message);
-
-        // 设置工作目录（优先使用传入的，其次使用配置的）
-        if let Some(dir) = workdir {
-            cmd.current_dir(dir);
-        } else if let Some(ref dir) = agent.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        // 设置环境变量
-        for (key, value) in &agent.env {
-            cmd.env(key, value);
-        }
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute {}: {}", agent.command, e))?;
-
-        if output.status.success() {
-            let result = String::from_utf8_lossy(&output.stdout).to_string();
-            tracing::info!("进程 [{}] 响应: {} bytes", agent.id, result.len());
-            Ok(result)
-        } else {
-            let error = String::from_utf8_lossy(&output.stderr).to_string();
-            Err(format!("Process error: {}", error))
         }
     }
 

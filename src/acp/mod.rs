@@ -6,6 +6,7 @@
 mod types;
 mod handler;
 mod streaming;
+pub mod agent_process;
 
 #[cfg(test)]
 mod tests;
@@ -13,3 +14,4 @@ mod tests;
 pub use types::*;
 pub use handler::*;
 pub use streaming::*;
+pub use agent_process::AcpAgentProcess;

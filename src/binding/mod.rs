@@ -15,6 +15,12 @@ const PAIR_CODE_TTL_SECS: i64 = 300;
 /// 配对码长度
 const PAIR_CODE_LENGTH: usize = 6;
 
+/// 最大失败尝试次数
+const MAX_FAILED_ATTEMPTS: u32 = 5;
+
+/// 失败尝试锁定时间（15分钟）
+const FAILED_ATTEMPTS_LOCKOUT_SECS: i64 = 900;
+
 /// 全局单例 BindingManager
 static BINDING_MANAGER: Lazy<Arc<Mutex<BindingManager>>> = Lazy::new(|| {
     Arc::new(Mutex::new(BindingManager::new_internal()))
@@ -55,6 +61,15 @@ struct PairCodeData {
     code: String,
     /// 创建时间（Unix 时间戳）
     created_at: i64,
+}
+
+/// 失败尝试记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailedAttemptsData {
+    /// 失败次数
+    count: u32,
+    /// 首次失败时间
+    first_failure: i64,
 }
 
 /// 配对结果
@@ -116,6 +131,11 @@ impl BindingManager {
     /// 配对码文件路径
     fn pair_code_path(&self) -> PathBuf {
         self.data_dir.join("pair_code.json")
+    }
+
+    /// 失败尝试记录文件路径
+    fn failed_attempts_path(&self) -> PathBuf {
+        self.data_dir.join("failed_attempts.json")
     }
 
     /// 设备文件路径
@@ -193,6 +213,69 @@ impl BindingManager {
         }
     }
 
+    /// 加载失败尝试记录
+    fn load_failed_attempts(&self) -> Option<FailedAttemptsData> {
+        let path = self.failed_attempts_path();
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()?
+    }
+
+    /// 保存失败尝试记录
+    fn save_failed_attempts(&self, data: &FailedAttemptsData) -> anyhow::Result<()> {
+        let content = serde_json::to_string(data)?;
+        fs::write(self.failed_attempts_path(), content)?;
+        Ok(())
+    }
+
+    /// 清除失败尝试记录
+    fn clear_failed_attempts(&self) {
+        if let Err(e) = fs::remove_file(self.failed_attempts_path()) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("清除失败尝试记录失败: {}", e);
+            }
+        }
+    }
+
+    /// 检查是否被临时锁定
+    fn is_locked_out(&self) -> bool {
+        if let Some(data) = self.load_failed_attempts() {
+            let now = chrono::Utc::now().timestamp();
+            // 如果在锁定时间内
+            if data.count >= MAX_FAILED_ATTEMPTS {
+                let lockout_end = data.first_failure + FAILED_ATTEMPTS_LOCKOUT_SECS;
+                if now < lockout_end {
+                    tracing::warn!("配对功能已被临时锁定，剩余 {} 秒", lockout_end - now);
+                    return true;
+                }
+                // 锁定已过期，清除记录
+                self.clear_failed_attempts();
+            }
+        }
+        false
+    }
+
+    /// 记录一次失败的配对尝试
+    fn record_failed_attempt(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let mut data = self.load_failed_attempts().unwrap_or(FailedAttemptsData {
+            count: 0,
+            first_failure: now,
+        });
+
+        data.count += 1;
+        if data.count == 1 {
+            data.first_failure = now;
+        }
+
+        if let Err(e) = self.save_failed_attempts(&data) {
+            tracing::warn!("保存失败尝试记录失败: {}", e);
+        }
+
+        if data.count >= MAX_FAILED_ATTEMPTS {
+            tracing::warn!("失败尝试次数过多，配对功能已锁定 {} 秒", FAILED_ATTEMPTS_LOCKOUT_SECS);
+        }
+    }
+
     /// 生成配对码
     pub fn generate_pair_code(&mut self) -> PairResult {
         // 生成随机配对码
@@ -219,10 +302,17 @@ impl BindingManager {
             };
         }
 
+        // 检查是否被临时锁定
+        if self.is_locked_out() {
+            return BindResult::InvalidCode;
+        }
+
         // 加载并验证配对码
         if self.load_pair_code(code).is_some() {
             // 删除配对码（一次性使用）
             self.delete_pair_code();
+            // 清除失败尝试记录
+            self.clear_failed_attempts();
 
             // 生成设备 ID 和 Token
             let device_id = format!("device-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
@@ -246,6 +336,8 @@ impl BindingManager {
             return BindResult::Success(device);
         }
 
+        // 记录失败尝试
+        self.record_failed_attempt();
         BindResult::InvalidCode
     }
 
@@ -305,12 +397,16 @@ impl BindingManager {
         }
     }
 
-    /// 生成随机配对码（6位数字）
+    /// 生成随机配对码（6位字母数字，区分大小写）
     fn generate_random_code(&self) -> String {
         use rand::Rng;
+        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
         let mut rng = rand::thread_rng();
         (0..PAIR_CODE_LENGTH)
-            .map(|_| rng.gen_range(0..10).to_string())
+            .map(|_| {
+                let idx = rng.gen_range(0..CHARSET.len());
+                CHARSET[idx] as char
+            })
             .collect()
     }
 }

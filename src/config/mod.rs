@@ -243,6 +243,31 @@ pub struct AgentsConfig {
     /// Agent 列表
     #[serde(default)]
     pub list: Vec<AgentConfig>,
+
+    /// Agent 发现目录 (扫描 aginx.toml 的默认路径)
+    /// 默认: ~/.aginx/agents/
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+}
+
+impl AgentsConfig {
+    /// 获取 agents 目录
+    pub fn get_agents_dir(&self) -> PathBuf {
+        self.dir.clone().unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".aginx").join("agents"))
+                .unwrap_or_else(|| PathBuf::from(".aginx/agents"))
+        })
+    }
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            list: vec![],
+            dir: None,
+        }
+    }
 }
 
 /// Agent 类型
@@ -293,9 +318,6 @@ pub struct AgentConfig {
     /// 工作目录 (固定目录)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
-    /// 是否需要用户选择工作目录 (App 端弹出选择)
-    #[serde(default)]
-    pub require_workdir: bool,
     /// 环境变量
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
@@ -306,6 +328,44 @@ pub struct AgentConfig {
     /// 例如: ["--session-id", "${SESSION_ID}"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_args: Vec<String>,
+
+    /// 会话存储配置 (Aginx 负责管理)
+    #[serde(default)]
+    pub session: SessionConfig,
+}
+
+/// 会话存储配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// 是否需要用户选择工作目录
+    #[serde(default)]
+    pub require_workdir: bool,
+    /// 存储目录 (相对于 ~/.aginx/agents/<agent_id>/)
+    /// 默认: "sessions"
+    #[serde(default = "default_session_dir")]
+    pub storage_dir: String,
+    /// 文件名模式
+    /// 默认: "{session_id}.json"
+    #[serde(default = "default_session_pattern")]
+    pub file_pattern: String,
+}
+
+fn default_session_dir() -> String {
+    "sessions".to_string()
+}
+
+fn default_session_pattern() -> String {
+    "{session_id}.json".to_string()
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            require_workdir: false,
+            storage_dir: default_session_dir(),
+            file_pattern: default_session_pattern(),
+        }
+    }
 }
 
 impl AgentConfig {
@@ -321,10 +381,10 @@ impl AgentConfig {
             args: Vec::new(),
             help_command: String::new(),
             working_dir: None,
-            require_workdir: false,
             env: std::collections::HashMap::new(),
             env_remove: Vec::new(),
             session_args: Vec::new(),
+            session: SessionConfig::default(),
         }
     }
 
@@ -340,22 +400,14 @@ impl AgentConfig {
             args: Vec::new(),
             help_command: String::new(),
             working_dir: None,
-            require_workdir: true,
             env: std::collections::HashMap::new(),
             env_remove: vec!["CLAUDECODE".to_string()],
             session_args: vec!["--session-id".to_string(), "${SESSION_ID}".to_string()],
-        }
-    }
-}
-
-impl Default for AgentsConfig {
-    fn default() -> Self {
-        Self {
-            list: vec![
-                AgentConfig::builtin("echo", "Echo Agent", vec!["echo"]),
-                AgentConfig::builtin("info", "Info Agent", vec!["info"]),
-                // Claude agent 需要用户显式配置 command
-            ],
+            session: SessionConfig {
+                require_workdir: true,
+                storage_dir: "sessions".to_string(),
+                file_pattern: "{session_id}.json".to_string(),
+            },
         }
     }
 }

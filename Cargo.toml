@@ -14,7 +14,6 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full", "process", "net", "io-util", "sync", "time", "rt-multi-thread"] }
-portable-pty = "0.8"
 futures = "0.3"
 async-trait = "0.1"
 
@@ -61,6 +60,7 @@ hex = "0.4"
 
 # Singleton
 once_cell = "1"
+which = "8.0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

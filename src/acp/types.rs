@@ -139,13 +139,6 @@ pub struct CancelParams {
     pub sessionId: String,
 }
 
-/// List sessions request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListSessionsParams {
-    #[serde(default)]
-    pub _meta: Option<serde_json::Value>,
-}
-
 /// Bind device request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BindDeviceParams {
@@ -156,32 +149,23 @@ pub struct BindDeviceParams {
     pub deviceName: Option<String>,
 }
 
-/// Bind device response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindDeviceResult {
-    /// Whether binding was successful
-    pub success: bool,
-    /// Device ID (if successful)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deviceId: Option<String>,
-    /// Token (if successful)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    /// Error message (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 // ============================================================================
 // Response Types
 // ============================================================================
 
-/// ACP response wrapper
+/// ACP response/notification wrapper
+///
+/// For responses: has `id` + `result` or `error`
+/// For notifications: has `method` + `params`, no `id`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpResponse {
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,24 +261,6 @@ pub struct AuthMethod {
     pub auth_type: String,
     #[serde(default)]
     pub label: Option<String>,
-}
-
-/// New session response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewSessionResult {
-    pub sessionId: String,
-}
-
-/// Load session response
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LoadSessionResult {
-    // Empty on success
-}
-
-/// Prompt response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptResult {
-    pub stopReason: StopReason,
 }
 
 /// Stop reason
@@ -505,6 +471,8 @@ impl AcpResponse {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
+            method: None,
+            params: None,
             result: Some(serde_json::to_value(result).unwrap_or(serde_json::Value::Null)),
             error: None,
         }
@@ -515,6 +483,8 @@ impl AcpResponse {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
+            method: None,
+            params: None,
             result: None,
             error: Some(AcpError {
                 code,
@@ -524,15 +494,14 @@ impl AcpResponse {
         }
     }
 
-    /// Create a notification (no id)
+    /// Create a notification (no id, has method + params at top level)
     pub fn notification(method: &str, params: impl Serialize) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id: None,
-            result: Some(serde_json::json!({
-                "method": method,
-                "params": serde_json::to_value(params).unwrap_or(serde_json::Value::Null)
-            })),
+            method: Some(method.to_string()),
+            params: Some(serde_json::to_value(params).unwrap_or(serde_json::Value::Null)),
+            result: None,
             error: None,
         }
     }
