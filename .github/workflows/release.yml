@@ -25,13 +25,12 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
-        working-directory: aginx
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: aginx-${{ matrix.target }}
-          path: aginx/target/${{ matrix.target }}/release/aginx
+          path: target/${{ matrix.target }}/release/aginx
 
   release:
     needs: build
