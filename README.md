@@ -75,17 +75,19 @@ aginx/
 curl -fsSL https://raw.githubusercontent.com/yinnho/aginx/main/install.sh | sh
 ```
 
+**从 crates.io 安装**
+
+```bash
+cargo install aginx
+```
+
 **从 GitHub Release 下载**
 
 到 [Releases](https://github.com/yinnho/aginx/releases) 页面下载对应平台的二进制。
 
 **从源码编译**
 
-需要 Rust 工具链：
-
 ```bash
-cargo install --path .
-# 或
 cargo install --git https://github.com/yinnho/aginx
 ```
 
@@ -169,8 +171,6 @@ Aginx 使用 **ACP (Agent Client Protocol)**，基于 JSON-RPC 2.0 over TCP (ndj
 | `getMessages` | 获取消息历史 |
 | `deleteConversation` | 删除对话 |
 | `listSessions` | 列出会话 |
-| `getMessages` | 获取消息历史 |
-| `deleteConversation` | 删除对话 |
 | `listDirectory` | 浏览服务器目录 |
 | `readFile` | 读取服务器文件 |
 | `bindDevice` | 绑定设备 |
@@ -185,7 +185,7 @@ agent://hostname[:port]
 agent://{id}.relay.aginx.net
 ```
 
-## 部署
+## 部署（开发者）
 
 ```bash
 # 同步代码
