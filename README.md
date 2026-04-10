@@ -1,382 +1,202 @@
-# Aginx - Agent Protocol 实现
+# Aginx
 
-> 让访问 Agent 像访问网站一样简单
+> Agent Protocol — 访问 Agent 就像访问网站一样简单。
 
-## 基本原则
+## 一句话
 
-### 1. Aginx 是纯粹的消息路由器
-
-Aginx **不关心** Agent 内部如何实现：
-- 用云端 API 还是本地服务
-- 用什么语言、什么框架
-- 如何处理请求
-
-Aginx **只负责**：
-```
-接收请求 --> 路由到 Agent --> 返回响应
-```
-
-### 2. Agent 内部实现与 Aginx 无关
+**让世界上每一个 Agent 都有一个地址。**
 
 ```
-Aginx --> Claude Agent --> 调用云端 API（Agent 内部）
-Aginx --> OpenCarrier Agent --> 调用本地服务（Agent 内部）
-Aginx --> Weather Agent --> 调用第三方 API（Agent 内部）
+agent://rcs0aj94.relay.aginx.net
 ```
 
-Agent 用什么、怎么实现，是 Agent 自己的事情。
+一个 URL，直达 Agent。不需要知道 IP、端口、协议。
 
-### 3. 任何 CLI 都可以是 Agent
+## 定位
 
-只要能通过命令行调用并返回结果，就能包装成 Agent。
+Aginx 是 Agent 互联网的基础设施，每一层都对应互联网的一个组件：
 
----
-
-## 核心理念
-
-一个 URL 搞定所有连接：
-
-```
-agent://rcs0aj94.relay.yinnho.cn
-```
-
-客户端不需要知道：
-- 服务器 IP 地址
-- 端口号
-- 协议细节
-- Agent ID
-
-只需要这一个 URL，就像访问 `https://google.com` 一样简单。
-
----
+| Aginx | 互联网 | 说明 |
+|-------|--------|------|
+| aginx | nginx | 消息路由器，把请求路由到 Agent |
+| aginxium | Chromium | 统一客户端引擎 |
+| aginx-app | Chrome | 用户产品（App） |
+| aginx-api | DNS / 注册中心 | 注册、发现、认证 |
+| aginx-relay | CDN / 骨干网 | NAT 穿透、连接转发 |
+| agent:// URL | https:// URL | 统一寻址 |
 
 ## 架构
 
 ```
 ┌─────────────┐                    ┌─────────────┐                    ┌─────────────┐
-│   客户端     │─── agent://URL ───▶│    Relay    │──── TCP/JSON-RPC ──▶│   Aginx     │
-│             │                    │  (中继服务器) │                    │  (Agent宿主) │
-└─────────────┘                    └─────────────┘                    └─────────────┘
+│   客户端     │─── agent://URL ───▶│    Relay    │──── TCP ──────────▶│   Aginx     │
+│ (App/IDE)   │                    │  (中继服务器) │                    │  (Agent宿主) │
+└─────────────┘                    └─────────────┘                    └──────┬──────┘
                                                                               │
                                                                               ▼
-                                                                       ┌─────────────┐
-                                                                       │   Agents    │
-                                                                       │ - Claude    │
-                                                                       │ - Echo      │
-                                                                       │ - Process   │
-                                                                       └─────────────┘
+                                                                    ┌─────────────────┐
+                                                                    │     Agents      │
+                                                                    │  Claude / 自定义 │
+                                                                    └─────────────────┘
 ```
 
-### 两种模式
+### 两种连接模式
 
-| 模式 | 说明 | 使用场景 |
-|------|------|----------|
-| **Relay** | 通过中继服务器 | 内网环境、NAT 穿透 |
-| **Direct** | 直接 TCP 监听 | 公网服务器、有公网 IP |
+| 模式 | 说明 | 场景 |
+|------|------|------|
+| **Relay** | 通过中继服务器 | 内网、NAT 穿透 |
+| **Direct** | 直接 TCP 监听 | 公网服务器 |
 
----
+### 核心原则
 
-## 快速开始
-
-### 安装
-
-```bash
-cargo install --path .
-```
-
-### 启动
-
-```bash
-# 默认 relay 模式，自动申请 ID
-aginx
-
-# 直连模式
-aginx --mode direct
-```
-
-### 启动输出
-
-```
-========================================
-aginx v0.1.0
-运行模式: Relay
-访问地址: agent://rcs0aj94.relay.yinnho.cn
-========================================
-```
-
-把这个 URL 分享给客户端即可连接。
-
----
-
-## 配置
-
-配置文件：`~/.aginx/config.toml`
-
-### Agent 配置（类似 nginx server blocks）
-
-```toml
-# 内置 Agent
-[[agents.list]]
-id = "echo"
-name = "Echo Agent"
-agent_type = "builtin"
-capabilities = ["echo"]
-
-# Claude Agent（调用本地 claude CLI）
-[[agents.list]]
-id = "claude"
-name = "Claude Agent"
-agent_type = "claude"
-capabilities = ["chat", "code", "ask"]
-
-# 进程 Agent（调用外部程序）
-[[agents.list]]
-id = "weather"
-name = "Weather Agent"
-agent_type = "process"
-capabilities = ["weather", "forecast"]
-command = "/usr/local/bin/weather-agent"
-args = ["--verbose"]
-working_dir = "/tmp"
-[agents.list.env]
-API_KEY = "your-api-key"
-```
-
-### Agent 类型
-
-| 类型 | 说明 | 必填字段 |
-|------|------|----------|
-| `builtin` | 内置 agent | id, name, capabilities |
-| `claude` | Claude CLI | id, name, capabilities, help_command (可选) |
-| `process` | 外部进程 | id, name, capabilities, command, help_command (可选) |
-
-### help_command 字段
-
-用于指定获取 agent 帮助信息的命令：
-
-```toml
-[[agents.list]]
-id = "claude"
-name = "Claude Agent"
-agent_type = "claude"
-capabilities = ["chat", "code", "ask"]
-help_command = "claude --help"
-
-[[agents.list]]
-id = "weather"
-name = "Weather Agent"
-agent_type = "process"
-command = "/usr/local/bin/weather-agent"
-help_command = "/usr/local/bin/weather-agent --help"
-```
-
-如果未配置 `help_command`，会自动尝试 `{command} --help`
-
----
-
-## 客户端使用
-
-### 连接
-
-```bash
-# 测试连接
-cargo run --example test_client_relay agent://rcs0aj94.relay.yinnho.cn
-
-# 调用 Claude Agent
-cargo run --example test_claude_agent agent://rcs0aj94.relay.yinnho.cn "你好"
-```
-
-### JSON-RPC API
-
-**getServerInfo**
-```json
-{"jsonrpc": "2.0", "id": "1", "method": "getServerInfo", "params": {}}
-```
-
-**listAgents**
-```json
-{"jsonrpc": "2.0", "id": "2", "method": "listAgents", "params": {}}
-```
-
-**getAgentHelp**
-```json
-{"jsonrpc": "2.0", "id": "3", "method": "getAgentHelp", "params": {
-  "agentId": "claude"
-}}
-```
-
-**Response:**
-```json
-{
-  "agentId": "claude",
-  "help": "claude [options] [prompt]\n  --print    非交互模式，  ..."
-}
-```
-
-**sendMessage**
-```json
-{"jsonrpc": "2.0", "id": "4", "method": "sendMessage", "params": {
-  "agentId": "claude",
-  "message": "你好"
-}
-```
-
----
-
-## 会话管理
-
-### 概念
-
-**会话 (Session)** = 一个长期运行的 agent 进程
-
-同一个会话内的多次消息在**同一个进程**里处理，保持上下文：
-
-```
-客户端 A 创建会话
-  └── 启动 claude 进程 A
-  └── 消息1 "你是谁？"     --> 同一个进程
-  └── 消息2 "写个hello"   --> 同一个进程（有上下文）
-  └── 消息3 "再加个注释"   --> 同一个进程（知道"hello"是什么）
-```
-
-### 会话 API
-
-**createSession** - 创建会话
-```json
-{"jsonrpc": "2.0", "id": "1", "method": "createSession", "params": {
-  "agentId": "claude"
-}}
-```
-
-**Response:**
-```json
-{
-  "result": {
-    "sessionId": "sess_abc123",
-    "agentId": "claude"
-  }
-}
-```
-
-**sendMessage** - 发送消息（使用会话）
-```json
-{"jsonrpc": "2.0", "id": "2", "method": "sendMessage", "params": {
-  "sessionId": "sess_abc123",
-  "message": "你好"
-}}
-```
-
-**closeSession** - 关闭会话
-```json
-{"jsonrpc": "2.0", "id": "3", "method": "closeSession", "params": {
-  "sessionId": "sess_abc123"
-}}
-```
-
-### 并发控制
-
-```toml
-[server]
-max_concurrent_sessions = 10    # 最大并发会话数
-session_timeout_seconds = 1800  # 会话超时（30分钟）
-```
-
-- 达到上限时，`createSession` 返回错误或排队等待
-- 超时未活动的会话自动关闭
-
-### 会话流程
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        客户端                                │
-└─────────────────────────────────────────────────────────────┘
-          │
-          │ 1. createSession("claude")
-          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  SessionManager                                              │
-│  ┌─────────────────┐                                        │
-│  │ 检查并发限制     │ ← semaphore (max=10)                   │
-│  └────────┬────────┘                                        │
-│           │                                                  │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ 启动 claude 进程 │                                        │
-│  │ stdin/stdout    │                                        │
-│  └────────┬────────┘                                        │
-│           │                                                  │
-│           ▼                                                  │
-│  ┌─────────────────┐                                        │
-│  │ 返回 sessionId  │                                        │
-│  │ "sess_abc123"   │                                        │
-│  └─────────────────┘                                        │
-└─────────────────────────────────────────────────────────────┘
-          │
-          │ 2. sendMessage("sess_abc123", "你好")
-          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  找到会话 → 写入 stdin → 读取 stdout → 返回响应             │
-│  （进程保持运行，有上下文）                                   │
-└─────────────────────────────────────────────────────────────┘
-          │
-          │ 3. closeSession("sess_abc123")
-          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  关闭进程 → 释放 semaphore                                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
+1. **aginx 是纯消息路由器** — 不关心 Agent 内部用什么模型、什么语言
+2. **任何 CLI 都可以是 Agent** — 通过 `aginx.toml` 配置即可接入
+3. **agent:// 统一寻址** — 客户端只需一个 URL
+4. **纯 TCP + JSON-RPC** — 不依赖 WebSocket，不依赖 SDK
 
 ## 项目结构
 
 ```
 aginx/
-├── src/
-│   ├── main.rs           # 入口
-│   ├── config/           # 配置管理
-│   ├── agent/            # Agent 管理
-│   ├── relay/            # Relay 客户端
-│   ├── server/           # 直连服务器
-│   └── protocol/         # JSON-RPC 协议
-├── examples/
-│   ├── test_client_relay.rs    # 测试客户端
-│   └── test_claude_agent.rs    # Claude Agent 测试
-└── aginx-relay/          # Relay 服务器（独立项目）
+├── aginx/            # Agent 网关 (Rust) - 消息路由、Agent 管理
+├── aginx-api/        # 云端 API (Rust/Axum) - 注册、认证
+├── aginx-relay/      # 中继服务 (Rust) - NAT 穿透、连接转发
+├── aginxium/         # 客户端引擎 (Rust) - 协议、连接、会话管理
+└── aginx-app/        # 用户 App (Android) - 已废弃，后续从 aginxium 重建
 ```
 
----
+## 快速开始
 
-## 待改进功能
+### 安装
 
-### 高优先级
+**一键安装（推荐）**
 
-- [ ] **认证机制** - API Key / JWT 认证
-- [ ] **WebSocket 支持** - 浏览器直连
-- [ ] **Agent 热加载** - 不重启更新配置
-- [ ] **日志持久化** - 请求/响应日志
-- [x] **会话管理** - 长连接会话、上下文保持、并发控制
+```bash
+curl -fsSL https://raw.githubusercontent.com/yinnho/aginx/main/install.sh | sh
+```
 
-### 中优先级
+**从 GitHub Release 下载**
 
-- [ ] **连接池** - 复用 TCP 连接
-- [ ] **流量控制** - 限流、配额
-- [ ] **监控指标** - Prometheus metrics
-- [ ] **配置校验** - 启动时校验配置
+到 [Releases](https://github.com/yinnho/aginx/releases) 页面下载对应平台的二进制。
 
-### 低优先级
+**从源码编译**
 
-- [ ] **集群支持** - 多 aginx 实例
-- [ ] **Agent 市场** - 发现和分享 agent
-- [ ] **Web UI** - 管理界面
+需要 Rust 工具链：
 
----
+```bash
+cargo install --path .
+# 或
+cargo install --git https://github.com/yinnho/aginx
+```
 
-## 相关项目
+### 启动
 
-- [aginx-relay](https://github.com/yinnho/aginx-relay) - Relay 服务器
+```bash
+# Relay 模式（默认）
+aginx
 
----
+# 直连模式
+aginx --mode direct
+
+# 指定端口
+aginx --port 8866
+```
+
+### Agent 配置
+
+每个 Agent 放一个 `aginx.toml`：
+
+```toml
+# ~/.aginx/agents/claude/aginx.toml
+id = "claude"
+name = "Claude"
+agent_type = "claude"
+description = "Anthropic coding assistant"
+
+[command]
+path = "claude"
+args = ["--print", "--output-format", "stream-json"]
+env_remove = ["CLAUDECODE"]
+
+[session]
+require_workdir = true
+
+[capabilities]
+chat = true
+code = true
+```
+
+### 发现和注册
+
+```bash
+# 扫描 ~/.aginx/agents/ 下的 aginx.toml
+# 通过 ACP 方法注册：
+# discoverAgents → 扫描 → registerAgent → 注册
+```
+
+## 协议
+
+Aginx 使用 **ACP (Agent Client Protocol)**，基于 JSON-RPC 2.0 over TCP (ndjson)。
+
+### 核心 ACP 方法
+
+| 方法 | 说明 |
+|------|------|
+| `initialize` | 握手，交换能力 |
+| `session/new` | 创建会话 |
+| `session/load` | 恢复已有会话 |
+| `session/prompt` | 发送消息（流式） |
+| `session/cancel` | 取消 |
+
+### 流式响应
+
+`session/prompt` 返回 `{"streaming": true}` 后，通过 `sessionUpdate` 通知推送：
+
+```json
+{"method":"sessionUpdate","params":{"sessionId":"xxx","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"..."}}}}
+{"method":"sessionUpdate","params":{"sessionId":"xxx","update":{"sessionUpdate":"tool_call","toolCallId":"tc_1","title":"Read(file.rs)","status":"in_progress"}}}
+{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","response":"..."}}
+```
+
+### Aginx 扩展方法
+
+| 方法 | 说明 |
+|------|------|
+| `listAgents` | 列出已注册 Agent |
+| `discoverAgents` | 扫描发现新 Agent |
+| `registerAgent` | 注册 Agent |
+| `listConversations` | 列出对话 |
+| `getMessages` | 获取消息历史 |
+| `deleteConversation` | 删除对话 |
+| `listSessions` | 列出会话 |
+| `getMessages` | 获取消息历史 |
+| `deleteConversation` | 删除对话 |
+| `listDirectory` | 浏览服务器目录 |
+| `readFile` | 读取服务器文件 |
+| `bindDevice` | 绑定设备 |
+
+## agent:// URL
+
+```
+# 直连
+agent://hostname[:port]
+
+# 中继
+agent://{id}.relay.aginx.net
+```
+
+## 部署
+
+```bash
+# 同步代码
+rsync -avz --exclude 'target' --exclude '.git' -e ssh ./ 86quan:/data/www/aginx/
+
+# 编译
+ssh 86quan "cd /data/www/aginx && cargo build --release"
+
+# 重启
+ssh 86quan "pkill -f aginx ; nohup /data/www/aginx/target/release/aginx > /data/www/aginx/aginx.log 2>&1 &"
+```
 
 ## License
 
