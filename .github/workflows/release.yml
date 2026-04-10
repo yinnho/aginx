@@ -26,11 +26,16 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Rename binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          mv aginx aginx-${{ matrix.target }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: aginx-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/aginx
+          path: target/${{ matrix.target }}/release/aginx-${{ matrix.target }}
 
   release:
     needs: build
