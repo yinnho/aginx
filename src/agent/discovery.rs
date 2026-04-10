@@ -36,9 +36,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub capabilities: Option<CapabilitiesConfig>,
 
-    /// 帮助命令
-    #[serde(default)]
-    pub help_command: Option<String>,
 
     /// 权限配置
     #[serde(default)]
@@ -271,86 +268,79 @@ fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Opt
                     (false, Some("Missing command config for process agent".to_string()))
                 }
             }
-            "builtin" => (true, None),
+            "builtin" => (false, Some("builtin type is no longer supported, use process or claude".to_string())),
             _ => (true, None),
         }
     }
 }
 
-/// 将 AgentConfig 转换为 AgentInfo（用于注册）
-impl From<AgentConfig> for super::manager::AgentInfo {
-    fn from(config: AgentConfig) -> Self {
-        use crate::config::AgentType;
+/// 将 AgentConfig 转换为 AgentInfo（用于注册和自动加载）
+pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path) -> super::manager::AgentInfo {
+    use crate::config::AgentType;
 
-        let agent_type = match config.agent_type.as_str() {
-            "claude" => AgentType::Claude,
-            "process" => AgentType::Process,
-            "builtin" => AgentType::Builtin,
-            _ => AgentType::Builtin,
-        };
+    let agent_type = match config.agent_type.as_str() {
+        "claude" => AgentType::Claude,
+        _ => AgentType::Process,
+    };
 
-        let command = config.command
-            .as_ref()
-            .and_then(|c| c.path.clone())
-            .unwrap_or_else(|| {
-                // 根据 agent_type 使用默认命令
-                match agent_type {
-                    AgentType::Claude => "claude".to_string(),
-                    _ => String::new(),
-                }
-            });
+    let command = config.command
+        .as_ref()
+        .and_then(|c| c.path.clone())
+        .unwrap_or_else(|| {
+            match agent_type {
+                AgentType::Claude => "claude".to_string(),
+                _ => String::new(),
+            }
+        });
 
-        let args = config.command
-            .as_ref()
-            .map(|c| c.args.clone())
-            .unwrap_or_default();
+    let args = config.command
+        .as_ref()
+        .map(|c| c.args.clone())
+        .unwrap_or_default();
 
-        let env = config.command
-            .as_ref()
-            .map(|c| c.env.clone())
-            .unwrap_or_default();
+    let env = config.command
+        .as_ref()
+        .map(|c| c.env.clone())
+        .unwrap_or_default();
 
-        let env_remove = config.command
-            .as_ref()
-            .map(|c| c.env_remove.clone())
-            .unwrap_or_default();
+    let env_remove = config.command
+        .as_ref()
+        .map(|c| c.env_remove.clone())
+        .unwrap_or_default();
 
-        let session_args = config.session
-            .as_ref()
-            .and_then(|s| s.resume.as_ref())
-            .map(|r| r.resume_args.clone())
-            .unwrap_or_default();
+    let session_args = config.session
+        .as_ref()
+        .and_then(|s| s.resume.as_ref())
+        .map(|r| r.resume_args.clone())
+        .unwrap_or_default();
 
-        // Build capabilities list from config
-        let mut capabilities = Vec::new();
-        if let Some(ref caps) = config.capabilities {
-            if caps.chat { capabilities.push("chat".to_string()); }
-            if caps.code { capabilities.push("code".to_string()); }
-            if caps.ask { capabilities.push("ask".to_string()); }
-            if caps.streaming { capabilities.push("streaming".to_string()); }
-            if caps.permissions { capabilities.push("permissions".to_string()); }
-        }
-        if capabilities.is_empty() {
-            capabilities = vec!["chat".to_string(), "code".to_string(), "ask".to_string()];
-        }
+    let mut capabilities = Vec::new();
+    if let Some(ref caps) = config.capabilities {
+        if caps.chat { capabilities.push("chat".to_string()); }
+        if caps.code { capabilities.push("code".to_string()); }
+        if caps.ask { capabilities.push("ask".to_string()); }
+        if caps.streaming { capabilities.push("streaming".to_string()); }
+        if caps.permissions { capabilities.push("permissions".to_string()); }
+    }
+    if capabilities.is_empty() {
+        capabilities = vec!["chat".to_string(), "code".to_string(), "ask".to_string()];
+    }
 
-        Self {
-            id: config.id,
-            name: config.name,
-            agent_type,
-            command,
-            args,
-            env,
-            env_remove,
-            session_args,
-            working_dir: None,
-            require_workdir: config.session.as_ref().map(|s| s.require_workdir).unwrap_or(false),
-            help_command: config.help_command.unwrap_or_default(),
-            capabilities,
-            default_allowed_tools: config.permissions.as_ref()
-                .map(|p| p.default_allowed.clone())
-                .unwrap_or_default(),
-        }
+    super::manager::AgentInfo {
+        id: config.id,
+        name: config.name,
+        agent_type,
+        command,
+        args,
+        env,
+        env_remove,
+        session_args,
+        working_dir: Some(project_dir.to_string_lossy().to_string()),
+        require_workdir: config.session.as_ref().map(|s| s.require_workdir).unwrap_or(false),
+        capabilities,
+        default_allowed_tools: config.permissions.as_ref()
+            .map(|p| p.default_allowed.clone())
+            .unwrap_or_default(),
     }
 }
 

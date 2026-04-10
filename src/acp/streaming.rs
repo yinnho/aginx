@@ -7,99 +7,13 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::types::{
-    AcpResponse, SessionUpdate, SessionUpdateParams,
-    MessageContent, ToolCallStatus, ToolCallContent, ToolKind, StopReason,
+use super::types::{StopReason, ToolCallStatus};
+use super::agent_event::{
+    format_tool_title, infer_tool_kind,
+    make_chunk_notification, make_tool_notification, make_tool_update_notification,
+    AgentEvent, ContentBlock,
 };
 use crate::agent::AgentInfo;
-
-/// Claude CLI stream-json output event
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type")]
-enum ClaudeEvent {
-    #[serde(rename = "system")]
-    System {
-        session_id: Option<String>,
-    },
-    #[serde(rename = "assistant")]
-    Assistant {
-        message: Option<AssistantMessage>,
-        session_id: Option<String>,
-    },
-    #[serde(rename = "stream_event")]
-    StreamEvent {
-        #[serde(rename = "event")]
-        inner: StreamInnerEvent,
-    },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        #[serde(rename = "tool_use_id")]
-        tool_use_id: String,
-        content: Option<serde_json::Value>,
-        #[serde(rename = "is_error")]
-        is_error: Option<bool>,
-    },
-    #[serde(rename = "result")]
-    Result {
-        result: Option<String>,
-        stop_reason: Option<String>,
-        session_id: Option<String>,
-        is_error: Option<bool>,
-    },
-}
-
-/// Inner event from stream_event (Anthropic API streaming format)
-#[derive(Debug, Clone, serde::Deserialize)]
-struct StreamInnerEvent {
-    #[serde(rename = "type")]
-    event_type: String,
-    delta: Option<StreamDelta>,
-}
-
-/// Delta from stream_event
-#[derive(Debug, Clone, serde::Deserialize)]
-struct StreamDelta {
-    #[serde(rename = "type")]
-    delta_type: String,
-    #[serde(default)]
-    text: String,
-    #[serde(rename = "stop_reason")]
-    stop_reason: Option<String>,
-}
-
-/// Assistant message structure from Claude CLI
-#[derive(Debug, Clone, serde::Deserialize)]
-struct AssistantMessage {
-    content: Vec<ContentBlock>,
-}
-
-/// Content block in assistant message
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type")]
-enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResultBlock {
-        #[serde(rename = "tool_use_id")]
-        tool_use_id: String,
-        content: Option<serde_json::Value>,
-    },
-}
 
 /// Async streaming result (sent through channel when complete)
 #[derive(Debug, Clone)]
@@ -219,7 +133,7 @@ impl StreamingSession {
                     continue;
                 }
 
-                tracing::debug!("[STREAM] Async line: {}", &line[..line.len().min(200)]);
+                tracing::debug!("[STREAM] Async line: {}", line.chars().take(200).collect::<String>());
 
                 match process_line(
                     &session_id_clone,
@@ -280,13 +194,13 @@ fn process_line(
     claude_session_id: &mut Option<String>,
     stop_reason: &mut StopReason,
 ) -> Result<Option<String>, String> {
-    let event: ClaudeEvent = match serde_json::from_str(line) {
+    let event: AgentEvent = match serde_json::from_str(line) {
         Ok(e) => e,
         Err(_) => return Ok(None),
     };
 
     match event {
-        ClaudeEvent::System { session_id: sid } => {
+        AgentEvent::System { session_id: sid, .. } => {
             if let Some(sid) = sid {
                 tracing::info!("Got Claude session_id from init: {}", sid);
                 *claude_session_id = Some(sid);
@@ -294,7 +208,7 @@ fn process_line(
             Ok(None)
         }
 
-        ClaudeEvent::Assistant { message, session_id: sid } => {
+        AgentEvent::Assistant { message, session_id: sid } => {
             if let Some(sid) = sid {
                 if claude_session_id.is_none() {
                     *claude_session_id = Some(sid);
@@ -318,12 +232,12 @@ fn process_line(
                             let tool_call_id = format!("tc_{}", id);
                             let title = format_tool_title(&name, &Some(input.clone()));
                             let kind = infer_tool_kind(&name);
-                            Some(make_tool_call_notification(session_id, &tool_call_id, &title, &kind))
+                            Some(make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref()))
                         }
                         ContentBlock::ToolResultBlock { tool_use_id, content } => {
                             let tool_call_id = format!("tc_{}", tool_use_id);
                             let output_text = content.as_ref().and_then(|c| c.as_str());
-                            Some(make_tool_call_update_notification(
+                            Some(make_tool_update_notification(
                                 session_id,
                                 &tool_call_id,
                                 ToolCallStatus::Completed,
@@ -339,14 +253,14 @@ fn process_line(
             Ok(last_notification)
         }
 
-        ClaudeEvent::ToolUse { id, name, input } => {
+        AgentEvent::ToolUse { id, name, input } => {
             let tool_call_id = format!("tc_{}", id);
             let title = format_tool_title(&name, &Some(input.clone()));
             let kind = infer_tool_kind(&name);
-            Ok(Some(make_tool_call_notification(session_id, &tool_call_id, &title, &kind)))
+            Ok(Some(make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref())))
         }
 
-        ClaudeEvent::ToolResult { tool_use_id, content, is_error } => {
+        AgentEvent::ToolResult { tool_use_id, content, is_error } => {
             let tool_call_id = format!("tc_{}", tool_use_id);
             let status = if is_error.unwrap_or(false) {
                 ToolCallStatus::Failed
@@ -354,17 +268,17 @@ fn process_line(
                 ToolCallStatus::Completed
             };
             let output_text = content.as_ref().and_then(|c| c.as_str());
-            Ok(Some(make_tool_call_update_notification(session_id, &tool_call_id, status, output_text)))
+            Ok(Some(make_tool_update_notification(session_id, &tool_call_id, status, output_text)))
         }
 
-        ClaudeEvent::StreamEvent { inner } => {
+        AgentEvent::StreamEvent { inner } => {
             match inner.event_type.as_str() {
                 "content_block_delta" => {
                     if let Some(delta) = inner.delta {
                         tracing::info!("[STREAM] content_block_delta: type={}, text_len={}", delta.delta_type, delta.text.len());
                         if delta.delta_type == "text_delta" && !delta.text.is_empty() {
                             accumulated_content.push_str(&delta.text);
-                            return Ok(Some(make_message_chunk_notification(session_id, &delta.text)));
+                            return Ok(Some(make_chunk_notification(session_id, &delta.text)));
                         }
                     }
                 }
@@ -385,7 +299,7 @@ fn process_line(
             Ok(None)
         }
 
-        ClaudeEvent::Result { result, stop_reason: reason, session_id: sid, is_error } => {
+        AgentEvent::Result { result, stop_reason: reason, session_id: sid, is_error, .. } => {
             if let Some(sid) = sid {
                 tracing::info!("Got Claude session_id from result: {}", sid);
                 *claude_session_id = Some(sid);
@@ -395,7 +309,7 @@ fn process_line(
                 tracing::info!("[STREAM] Result event, text_len={}, accumulated_empty={}", text.len(), accumulated_content.is_empty());
                 if !text.is_empty() && accumulated_content.is_empty() {
                     accumulated_content.push_str(&text);
-                    return Ok(Some(make_message_chunk_notification(session_id, &text)));
+                    return Ok(Some(make_chunk_notification(session_id, &text)));
                 }
                 if is_error.unwrap_or(false) {
                     return Err(format!("Claude error: {}", text));
@@ -411,128 +325,11 @@ fn process_line(
 
             Ok(None)
         }
+
+        AgentEvent::Error { error, .. } => {
+            tracing::error!("Claude CLI error: {:?}", error);
+            Ok(None)
+        }
     }
 }
 
-/// Create agent_message_chunk notification
-fn make_message_chunk_notification(session_id: &str, text: &str) -> String {
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::AgentMessageChunk {
-            content: MessageContent::Text { text: text.to_string() },
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Create tool_call notification
-fn make_tool_call_notification(session_id: &str, tool_call_id: &str, title: &str, kind: &Option<ToolKind>) -> String {
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::ToolCall {
-            toolCallId: tool_call_id.to_string(),
-            title: title.to_string(),
-            status: ToolCallStatus::InProgress,
-            rawInput: None,
-            kind: kind.clone(),
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Create tool_call_update notification
-fn make_tool_call_update_notification(session_id: &str, tool_call_id: &str, status: ToolCallStatus, output: Option<&str>) -> String {
-    let content = output.map(|o| vec![
-        ToolCallContent::Content {
-            content: MessageContent::Text { text: o.to_string() },
-        }
-    ]);
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::ToolCallUpdate {
-            toolCallId: tool_call_id.to_string(),
-            status: Some(status),
-            rawOutput: output.map(|o| serde_json::json!(o)),
-            content,
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Format tool title for display
-fn format_tool_title(name: &str, input: &Option<serde_json::Value>) -> String {
-    match name {
-        "Read" | "NBRead" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Read({})", path)
-        }
-        "Edit" | "NBEdit" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Edit({})", path)
-        }
-        "Write" | "NBWrite" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Write({})", path)
-        }
-        "Delete" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Delete({})", path)
-        }
-        "Bash" => {
-            let cmd = input.as_ref()
-                .and_then(|i| i.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let truncated = if cmd.chars().count() > 40 {
-                format!("{}...", cmd.chars().take(37).collect::<String>())
-            } else {
-                cmd.to_string()
-            };
-            format!("Bash({})", truncated)
-        }
-        "Glob" => {
-            let pattern = input.as_ref()
-                .and_then(|i| i.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("*");
-            format!("Glob({})", pattern)
-        }
-        "Grep" => {
-            let pattern = input.as_ref()
-                .and_then(|i| i.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("Grep({})", pattern)
-        }
-        _ => name.to_string(),
-    }
-}
-
-/// Infer tool kind from name
-fn infer_tool_kind(name: &str) -> Option<ToolKind> {
-    match name {
-        "Read" | "NBRead" => Some(ToolKind::Read),
-        "Edit" | "NBEdit" => Some(ToolKind::Edit),
-        "Write" | "NBWrite" => Some(ToolKind::Other),
-        "Delete" => Some(ToolKind::Delete),
-        "Glob" | "Grep" => Some(ToolKind::Search),
-        "Bash" => Some(ToolKind::Execute),
-        "WebFetch" => Some(ToolKind::Fetch),
-        _ => Some(ToolKind::Other),
-    }
-}

@@ -9,29 +9,17 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::agent::{AgentManager, SessionManager};
-use crate::binding::BindingManager;
 use crate::acp::{AcpHandler, AcpRequest, AcpResponse};
-
-/// Helper: write a line as NDJSON (with newline) and flush
-async fn write_ndjson<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
+use crate::acp::agent_event::write_ndjson;
 
 /// Request handler
 pub struct Handler {
-    config: Arc<Config>,
-    agent_manager: Arc<AgentManager>,
-    binding_manager: Arc<tokio::sync::Mutex<BindingManager>>,
-    session_manager: Arc<SessionManager>,
     acp_handler: Arc<AcpHandler>,
 }
 
@@ -40,7 +28,6 @@ impl Handler {
     pub fn new(
         config: Arc<Config>,
         agent_manager: AgentManager,
-        binding_manager: Arc<tokio::sync::Mutex<BindingManager>>,
         session_manager: Arc<SessionManager>,
     ) -> Self {
         // Get agents directory from config
@@ -48,8 +35,7 @@ impl Handler {
         tracing::info!("Agents directory: {}", agents_dir.display());
 
         let agent_manager = Arc::new(agent_manager);
-
-        // Create ACP handler using the same managers
+        // Create ACP handler
         let acp_handler = Arc::new(AcpHandler::with_agents_dir(
             agent_manager.clone(),
             session_manager.clone(),
@@ -57,11 +43,7 @@ impl Handler {
         ));
 
         Self {
-            config,
-            agent_manager,
-            binding_manager,
-            session_manager,
-            acp_handler
+            acp_handler,
         }
     }
 
@@ -149,7 +131,7 @@ impl Handler {
                 });
 
                 // Main loop continues immediately - does NOT wait for prompt to finish
-            } else if method == "loadSession" {
+            } else if method == "session/load" || method == "loadSession" {
                 // SPAWN: loadSession spawns Claude CLI which takes time,
                 // must not block the main read loop
                 let acp_handler = self.acp_handler.clone();

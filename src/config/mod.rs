@@ -7,6 +7,18 @@ pub use loader::*;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Get the aginx data directory (~/.aginx)
+pub fn data_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".aginx"))
+        .unwrap_or_else(|| PathBuf::from(".aginx"))
+}
+
+/// Get the aginx agents directory (~/.aginx/agents)
+pub fn agents_dir() -> PathBuf {
+    data_dir().join("agents")
+}
+
 /// 运行模式
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -18,10 +30,8 @@ pub enum ServerMode {
     Relay,
 }
 
-/// 默认 Relay 服务器地址
-pub const DEFAULT_RELAY_SERVER: &str = "relay.yinnho.cn:8600";
-
-/// 访问模式
+/// 默认 Relay 域名
+pub const DEFAULT_RELAY_DOMAIN: &str = "relay.yinnho.cn";
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessMode {
@@ -38,6 +48,10 @@ pub struct Config {
     /// 服务器配置
     #[serde(default)]
     pub server: ServerConfig,
+
+    /// API 配置
+    #[serde(default)]
+    pub api: ApiConfig,
 
     /// 中继配置
     #[serde(default)]
@@ -60,6 +74,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            api: ApiConfig::default(),
             relay: RelayConfig::default(),
             direct: DirectConfig::default(),
             auth: AuthConfig::default(),
@@ -132,16 +147,33 @@ impl Default for ServerConfig {
     }
 }
 
+/// 默认 Relay TLS 端口
+pub const DEFAULT_RELAY_PORT: u16 = 8443;
+
 /// 中继配置 (mode = "relay" 时使用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayConfig {
-    /// Aginx ID (首次启动自动申请)
+    /// Aginx ID (首次启动自动从 API 申请)
     #[serde(default)]
     pub id: Option<String>,
 
-    /// Relay 完整地址
-    /// 格式: {aginx_id}.relay.yinnho.cn:8600
-    /// 例如: abc123.relay.yinnho.cn:8600
+    /// API 返回的 JWT token (首次申请后保存)
+    #[serde(default)]
+    pub token: Option<String>,
+
+    /// Relay 域名 (用于构建连接地址和 URL)
+    #[serde(default = "default_relay_domain")]
+    pub domain: String,
+
+    /// Relay 连接端口
+    #[serde(default = "default_relay_port")]
+    pub port: u16,
+
+    /// 是否使用 TLS
+    #[serde(default = "default_true")]
+    pub use_tls: bool,
+
+    /// Relay 完整地址 (优先于 domain+port 构建)
     #[serde(default)]
     pub url: Option<String>,
 
@@ -154,6 +186,9 @@ pub struct RelayConfig {
     pub reconnect_interval: u64,
 }
 
+fn default_relay_domain() -> String { DEFAULT_RELAY_DOMAIN.to_string() }
+fn default_relay_port() -> u16 { DEFAULT_RELAY_PORT }
+fn default_true() -> bool { true }
 fn default_heartbeat_interval() -> u64 { 30 }
 fn default_reconnect_interval() -> u64 { 5 }
 
@@ -161,6 +196,10 @@ impl Default for RelayConfig {
     fn default() -> Self {
         Self {
             id: None,
+            token: None,
+            domain: default_relay_domain(),
+            port: default_relay_port(),
+            use_tls: default_true(),
             url: None,
             heartbeat_interval: default_heartbeat_interval(),
             reconnect_interval: default_reconnect_interval(),
@@ -170,14 +209,13 @@ impl Default for RelayConfig {
 
 impl RelayConfig {
     /// 获取连接地址
-    /// 如果有 url 则使用 url，否则用默认服务器地址
     pub fn get_connect_url(&self) -> String {
         if let Some(ref url) = self.url {
             url.clone()
         } else if let Some(ref id) = self.id {
-            format!("{}.relay.yinnho.cn:8600", id)
+            format!("{}.{}:{}", id, self.domain, self.port)
         } else {
-            DEFAULT_RELAY_SERVER.to_string()
+            format!("{}:{}", self.domain, self.port)
         }
     }
 
@@ -189,7 +227,7 @@ impl RelayConfig {
     /// 设置 ID（申请成功后调用）
     pub fn set_id(&mut self, id: String) {
         self.id = Some(id.clone());
-        self.url = Some(format!("{}.relay.yinnho.cn:8600", id));
+        self.url = Some(format!("{}.{}:{}", id, self.domain, self.port));
     }
 }
 
@@ -206,6 +244,24 @@ impl Default for DirectConfig {
     fn default() -> Self {
         Self {
             public_url: None,
+        }
+    }
+}
+
+/// API 配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// API 服务器地址
+    #[serde(default = "default_api_url")]
+    pub url: String,
+}
+
+fn default_api_url() -> String { "https://api.yinnho.cn".to_string() }
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            url: default_api_url(),
         }
     }
 }
@@ -242,7 +298,7 @@ pub struct UserConfig {
 pub struct AgentsConfig {
     /// Agent 列表
     #[serde(default)]
-    pub list: Vec<AgentConfig>,
+    pub list: Vec<AgentEntry>,
 
     /// Agent 发现目录 (扫描 aginx.toml 的默认路径)
     /// 默认: ~/.aginx/agents/
@@ -274,23 +330,21 @@ impl Default for AgentsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentType {
-    /// 内置 agent (echo, info 等)
-    Builtin,
-    /// Claude CLI
+    /// Claude CLI (stream-json 协议)
     Claude,
-    /// 外部进程
+    /// 外部进程 (stdin/stdout)
     Process,
 }
 
 impl Default for AgentType {
     fn default() -> Self {
-        Self::Builtin
+        Self::Process
     }
 }
 
-/// Agent 配置 (统一格式)
+/// Agent 配置项 (主配置文件中的条目)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
+pub struct AgentEntry {
     /// Agent ID (唯一标识)
     pub id: String,
     /// Agent 名称
@@ -312,9 +366,6 @@ pub struct AgentConfig {
     /// 进程参数
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// 获取帮助的命令 (如 "claude --help")
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub help_command: String,
     /// 工作目录 (固定目录)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<PathBuf>,
@@ -329,85 +380,25 @@ pub struct AgentConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_args: Vec<String>,
 
-    /// 会话存储配置 (Aginx 负责管理)
+    /// 会话配置
     #[serde(default)]
-    pub session: SessionConfig,
+    pub session: SessionField,
 }
 
-/// 会话存储配置
+/// 会话配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionConfig {
+pub struct SessionField {
     /// 是否需要用户选择工作目录
     #[serde(default)]
     pub require_workdir: bool,
-    /// 存储目录 (相对于 ~/.aginx/agents/<agent_id>/)
-    /// 默认: "sessions"
-    #[serde(default = "default_session_dir")]
-    pub storage_dir: String,
-    /// 文件名模式
-    /// 默认: "{session_id}.json"
-    #[serde(default = "default_session_pattern")]
-    pub file_pattern: String,
 }
 
-fn default_session_dir() -> String {
-    "sessions".to_string()
-}
-
-fn default_session_pattern() -> String {
-    "{session_id}.json".to_string()
-}
-
-impl Default for SessionConfig {
+impl Default for SessionField {
     fn default() -> Self {
         Self {
             require_workdir: false,
-            storage_dir: default_session_dir(),
-            file_pattern: default_session_pattern(),
         }
     }
 }
 
-impl AgentConfig {
-    /// 创建内置 agent 配置
-    pub fn builtin(id: &str, name: &str, capabilities: Vec<&str>) -> Self {
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            agent_type: AgentType::Builtin,
-            capabilities: capabilities.iter().map(|s| s.to_string()).collect(),
-            description: String::new(),
-            command: String::new(),
-            args: Vec::new(),
-            help_command: String::new(),
-            working_dir: None,
-            env: std::collections::HashMap::new(),
-            env_remove: Vec::new(),
-            session_args: Vec::new(),
-            session: SessionConfig::default(),
-        }
-    }
 
-    /// 创建 Claude agent 配置（需要用户配置 command）
-    pub fn claude() -> Self {
-        Self {
-            id: "claude".to_string(),
-            name: "Claude Agent".to_string(),
-            agent_type: AgentType::Claude,
-            capabilities: vec!["chat".to_string(), "code".to_string(), "ask".to_string()],
-            description: "AI programming assistant".to_string(),
-            command: String::new(),  // 必须由用户配置
-            args: Vec::new(),
-            help_command: String::new(),
-            working_dir: None,
-            env: std::collections::HashMap::new(),
-            env_remove: vec!["CLAUDECODE".to_string()],
-            session_args: vec!["--session-id".to_string(), "${SESSION_ID}".to_string()],
-            session: SessionConfig {
-                require_workdir: true,
-                storage_dir: "sessions".to_string(),
-                file_pattern: "{session_id}.json".to_string(),
-            },
-        }
-    }
-}

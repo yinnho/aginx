@@ -4,18 +4,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::agent::{AgentManager, SessionManager, SessionConfig};
-use crate::binding::BindingManager;
 use super::handler::Handler;
 
 /// aginx Server
 pub struct Server {
     config: Arc<Config>,
     agent_manager: AgentManager,
-    binding_manager: Arc<Mutex<BindingManager>>,
     session_manager: Arc<SessionManager>,
     conn_semaphore: Arc<Semaphore>,
 }
@@ -24,7 +22,6 @@ impl Server {
     /// Create a new server
     pub fn new(config: Arc<Config>, agent_manager: AgentManager) -> anyhow::Result<Self> {
         let conn_semaphore = Arc::new(Semaphore::new(config.server.max_connections));
-        let binding_manager = Arc::new(Mutex::new(BindingManager::new()));
 
         // 创建会话管理器
         let session_config = SessionConfig {
@@ -36,7 +33,6 @@ impl Server {
         Ok(Self {
             config,
             agent_manager,
-            binding_manager,
             session_manager,
             conn_semaphore,
         })
@@ -44,9 +40,13 @@ impl Server {
 
     /// Run the server
     pub async fn run(self) -> anyhow::Result<()> {
-        let addr: SocketAddr = format!("{}:{}", self.config.server.host, self.config.server.port)
-            .parse()
-            .expect("Invalid address");
+        let addr_str = if self.config.server.host.contains(':') {
+            format!("[{}]:{}", self.config.server.host, self.config.server.port)
+        } else {
+            format!("{}:{}", self.config.server.host, self.config.server.port)
+        };
+        let addr: SocketAddr = addr_str.parse()
+            .map_err(|e| anyhow::anyhow!("Invalid address {}: {}", addr_str, e))?;
 
         let listener = TcpListener::bind(addr).await?;
         tracing::info!("Listening on {}", addr);
@@ -60,6 +60,12 @@ impl Server {
                 Ok(permit) => permit,
                 Err(_) => {
                     tracing::warn!("Connection limit reached, rejecting {}", peer_addr);
+                    // Send error response before dropping the connection
+                    use tokio::io::AsyncWriteExt;
+                    let error_json = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Connection limit reached"},"id":null}"#;
+                    let mut s = stream;
+                    let _ = s.write_all(error_json.as_bytes()).await;
+                    let _ = s.write_all(b"\n").await;
                     continue;
                 }
             };
@@ -70,7 +76,6 @@ impl Server {
             let handler = Handler::new(
                 self.config.clone(),
                 self.agent_manager.clone(),
-                self.binding_manager.clone(),
                 self.session_manager.clone(),
             );
 

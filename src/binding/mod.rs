@@ -92,6 +92,7 @@ pub enum BindResult {
     InvalidCode,
 }
 
+#[allow(dead_code)]
 impl BindingManager {
     /// 创建新的绑定管理器（内部方法，使用 get_binding_manager 获取单例）
     fn new_internal() -> Self {
@@ -110,22 +111,9 @@ impl BindingManager {
         }
     }
 
-    /// 兼容旧接口 - 创建新的绑定管理器
-    /// 注意：推荐使用 get_binding_manager() 获取单例
-    pub fn new() -> Self {
-        // 从单例复制状态
-        let manager = get_binding_manager();
-        let singleton = manager.lock().unwrap();
-        Self {
-            data_dir: singleton.data_dir.clone(),
-            bound_device: singleton.bound_device.clone(),
-        }
-    }
-
     /// 获取数据目录
     fn get_data_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".aginx")
+        crate::config::data_dir()
     }
 
     /// 配对码文件路径
@@ -341,22 +329,9 @@ impl BindingManager {
         BindResult::InvalidCode
     }
 
-    /// 兼容旧接口
-    pub fn verify_pair_code(&mut self, code: &str, device_name: &str) -> Option<DeviceInfo> {
-        match self.bind_device(code, device_name) {
-            BindResult::Success(device) => Some(device),
-            _ => None,
-        }
-    }
-
     /// 获取已绑定设备
     pub fn get_bound_device(&self) -> Option<&DeviceInfo> {
         self.bound_device.as_ref()
-    }
-
-    /// 获取设备列表（兼容旧接口，返回单个设备的数组）
-    pub fn list_devices(&self) -> Vec<DeviceInfo> {
-        self.bound_device.iter().cloned().collect()
     }
 
     /// 解绑设备
@@ -387,6 +362,7 @@ impl BindingManager {
         self.bound_device.as_ref().filter(|d| d.token == token)
     }
 
+    #[allow(dead_code)]
     /// 更新设备活跃时间
     pub fn update_last_active(&mut self) {
         if let Some(ref mut device) = self.bound_device {
@@ -400,19 +376,9 @@ impl BindingManager {
     /// 生成随机配对码（6位字母数字，区分大小写）
     fn generate_random_code(&self) -> String {
         use rand::Rng;
-        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
         let mut rng = rand::thread_rng();
         (0..PAIR_CODE_LENGTH)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
+            .map(|_| rng.gen_range(0..10).to_string())
             .collect()
-    }
-}
-
-impl Default for BindingManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

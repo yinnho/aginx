@@ -1,17 +1,17 @@
 //! Relay client for aginx
 //!
 //! 连接到 relay 服务器，让内网的 aginx 可以对外提供服务
-//! 使用纯 TCP 长连接，不是 WebSocket
+//! 支持 TLS (通过 nginx stream 终止) 或纯 TCP
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::agent::{AgentManager, SessionConfig, SessionManager};
-use crate::config::{Config, DEFAULT_RELAY_SERVER};
+use crate::config::Config;
 use crate::acp::{AcpHandler, AcpRequest, AcpResponse};
 
 /// Relay 消息类型
@@ -27,12 +27,10 @@ pub enum RelayMessage {
     Pong,
 
     /// 注册请求 (aginx -> relay)
-    /// fingerprint: 硬件指纹，用于重置后恢复原 aginx_id
+    /// ID 从 API 预先获取，直接告诉 relay
     #[serde(rename = "register")]
     Register {
-        id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fingerprint: Option<String>,
+        id: String,
     },
 
     /// 注册成功 (relay -> aginx)
@@ -52,68 +50,70 @@ pub enum RelayMessage {
     Data { client_id: String, data: serde_json::Value },
 }
 
-/// 注册结果
+/// 注册结果（从 API 获取）
 #[derive(Debug, Clone)]
 pub struct Registration {
     pub id: String,
-    pub url: String,
+    pub token: String,
 }
 
-/// 向 relay 申请 ID（首次启动时调用）
-pub async fn register_id() -> anyhow::Result<Registration> {
-    tracing::info!("首次启动，正在向 {} 申请 ID...", DEFAULT_RELAY_SERVER);
+/// 通过 HTTP 向 API 注册，获取 ID 和 JWT token
+pub async fn register_id(api_url: &str) -> anyhow::Result<Registration> {
+    tracing::info!("正在向 {} 申请 ID...", api_url);
 
     // 生成硬件指纹
     let fingerprint = crate::fingerprint::HardwareFingerprint::generate();
     tracing::info!("硬件指纹: {}", fingerprint.as_str());
 
-    // 连接到 relay
-    let stream = TcpStream::connect(DEFAULT_RELAY_SERVER).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    // HTTP POST 到 API
+    let client = reqwest::Client::builder()
+        .build()?;
+    let resp = client
+        .post(format!("{}/api/v1/instances/register", api_url))
+        .json(&serde_json::json!({
+            "fingerprint_hash": fingerprint.as_str(),
+        }))
+        .send()
+        .await?;
 
-    // 发送注册请求（携带硬件指纹，让 relay 分配/恢复 ID）
-    let register = RelayMessage::Register {
-        id: None,
-        fingerprint: Some(fingerprint.as_str().to_string()),
-    };
-    let register_json = serde_json::to_string(&register)?;
-    writer.write_all(format!("{}\n", register_json).as_bytes()).await?;
-    writer.flush().await?;
-
-    // 等待响应
-    let mut response_line = String::new();
-    reader.read_line(&mut response_line).await?;
-    let response: RelayMessage = serde_json::from_str(response_line.trim())?;
-
-    match response {
-        RelayMessage::Registered { id, url } => {
-            tracing::info!("申请成功！ID: {}, URL: {}", id, url);
-            Ok(Registration { id, url })
-        }
-        RelayMessage::Error { message } => {
-            Err(anyhow::anyhow!("申请 ID 失败: {}", message))
-        }
-        _ => {
-            Err(anyhow::anyhow!("意外的响应: {:?}", response))
-        }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("API 注册失败 ({}): {}", status, body));
     }
+
+    let result: serde_json::Value = resp.json().await?;
+    let data = result.get("data")
+        .ok_or_else(|| anyhow::anyhow!("API 响应缺少 data 字段"))?;
+
+    let id = data.get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("API 响应缺少 id"))?
+        .to_string();
+
+    let token = data.get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("API 响应缺少 token"))?
+        .to_string();
+
+    tracing::info!("申请成功！ID: {}", id);
+    Ok(Registration { id, token })
 }
 
 /// Relay 客户端
 pub struct RelayClient {
-    /// Relay 地址
+    /// Relay 地址 (host:port)
     relay_url: String,
+    /// TLS 域名 (用于 SNI，可能与 relay_url 的 host 不同)
+    tls_domain: String,
+    /// 是否使用 TLS
+    use_tls: bool,
     /// Aginx ID
     aginx_id: String,
     /// 心跳间隔 (秒)
     heartbeat_interval: u64,
     /// 重连间隔 (秒)
     reconnect_interval: u64,
-    /// Agent Manager
-    agent_manager: Arc<AgentManager>,
-    /// Session Manager
-    session_manager: Arc<SessionManager>,
     /// ACP Handler (统一协议处理)
     acp_handler: Arc<AcpHandler>,
 }
@@ -122,6 +122,7 @@ impl RelayClient {
     /// 创建新的 relay 客户端
     pub fn new(config: &Config, agent_manager: AgentManager) -> Self {
         let relay_url = config.relay.get_connect_url();
+        let use_tls = config.relay.use_tls;
         let aginx_id = config
             .relay
             .id
@@ -146,18 +147,18 @@ impl RelayClient {
 
         Self {
             relay_url,
+            tls_domain: config.relay.domain.clone(),
+            use_tls,
             aginx_id,
             heartbeat_interval: config.relay.heartbeat_interval,
             reconnect_interval: config.relay.reconnect_interval,
-            agent_manager,
-            session_manager,
             acp_handler,
         }
     }
 
     /// 连接到 relay 服务器
     pub async fn connect(&mut self) -> anyhow::Result<()> {
-        tracing::info!("连接 Relay: {}", self.relay_url);
+        tracing::info!("连接 Relay: {} (TLS: {})", self.relay_url, self.use_tls);
 
         loop {
             match self.connect_once().await {
@@ -177,22 +178,62 @@ impl RelayClient {
 
     /// 单次连接
     async fn connect_once(&self) -> anyhow::Result<()> {
-        // 纯 TCP 连接
-        let stream = TcpStream::connect(&self.relay_url).await?;
+        // TCP 连接
+        let tcp_stream = TcpStream::connect(&self.relay_url).await?;
         tracing::info!("TCP 连接成功: {}", self.relay_url);
 
-        let (reader, writer) = stream.into_split();
+        // 根据配置决定是否使用 TLS
+        if self.use_tls {
+            self.connect_with_tls(tcp_stream).await
+        } else {
+            self.connect_with_stream(tcp_stream).await
+        }
+    }
+
+    /// TLS 连接处理
+    async fn connect_with_tls(&self, tcp_stream: TcpStream) -> anyhow::Result<()> {
+        let domain = self.extract_domain()?;
+        let tls_connector = native_tls::TlsConnector::new()?;
+        let tls_stream = tokio_native_tls::TlsConnector::from(tls_connector)
+            .connect(&domain, tcp_stream)
+            .await?;
+
+        tracing::info!("TLS 握手成功");
+
+        let (reader, writer) = tokio::io::split(tls_stream);
         let mut reader = BufReader::new(reader);
-        let writer = Arc::new(Mutex::new(writer));
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
 
-        // 生成硬件指纹
-        let fingerprint = crate::fingerprint::HardwareFingerprint::generate();
-        tracing::debug!("硬件指纹: {}", fingerprint.as_str());
+        self.relay_handshake(&mut reader, &writer).await?;
+        self.message_loop(&mut reader, &writer).await
+    }
 
-        // 发送注册请求 (携带已配置的 ID 和硬件指纹)
+    /// 纯 TCP 连接处理
+    async fn connect_with_stream(&self, tcp_stream: TcpStream) -> anyhow::Result<()> {
+        let (reader, writer) = tcp_stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let writer: Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>> =
+            Arc::new(Mutex::new(Box::new(writer)));
+
+        self.relay_handshake(&mut reader, &writer).await?;
+        self.message_loop(&mut reader, &writer).await
+    }
+
+    /// TLS 域名 (用于 SNI)
+    fn extract_domain(&self) -> anyhow::Result<String> {
+        Ok(self.tls_domain.clone())
+    }
+
+    /// Relay 握手 (注册)
+    async fn relay_handshake<R: AsyncBufReadExt + AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+        writer: &Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    ) -> anyhow::Result<()> {
+        // 发送注册请求 (ID 已从 API 获取)
         let register = RelayMessage::Register {
-            id: Some(self.aginx_id.clone()),
-            fingerprint: Some(fingerprint.as_str().to_string()),
+            id: self.aginx_id.clone(),
         };
         let register_json = serde_json::to_string(&register)?;
         {
@@ -223,6 +264,15 @@ impl RelayClient {
             }
         }
 
+        Ok(())
+    }
+
+    /// 消息处理循环 (启动心跳 + 处理消息)
+    async fn message_loop<R: AsyncBufReadExt + AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+        writer: &Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
+    ) -> anyhow::Result<()> {
         // 启动心跳任务
         let heartbeat_interval = self.heartbeat_interval;
         let writer_for_heartbeat = writer.clone();
@@ -312,7 +362,7 @@ impl RelayClient {
 /// 处理数据消息 (统一走 ACP, CONCURRENT MODEL)
 /// prompt 请求 spawn 独立 task, 主循环可以继续读 permissionResponse
 async fn handle_data_message(
-    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    writer: &Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     client_id: &str,
     data: serde_json::Value,
     acp_handler: &Arc<AcpHandler>,
@@ -384,7 +434,7 @@ async fn handle_data_message(
 
 /// 发送 ACP 响应给客户端 (包装 clientId)
 async fn send_acp_response(
-    writer: &Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    writer: &Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     client_id: &str,
     response: &AcpResponse,
 ) -> anyhow::Result<()> {

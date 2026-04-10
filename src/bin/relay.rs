@@ -3,7 +3,7 @@
 //! 中继服务器，让内网的 aginx 可以对外提供服务
 //!
 //! 协议:
-//! 1. aginx 注册: {"type":"register"} -> {"type":"registered","id":"xxx","url":"agent://xxx.relay.yinnho.cn"}
+//! 1. aginx 注册: {"type":"register"} -> {"type":"registered","id":"xxx","url":"agent://xxx.relay.aginx.net"}
 //! 2. 客户端连接: {"type":"connect","target":"xxx"} -> {"type":"connected"} 或 {"type":"error","message":"..."}
 //! 3. JSON-RPC 消息: 客户端发送纯 JSON-RPC，Relay 内部路由时包装，返回时解包
 //!
@@ -32,7 +32,7 @@ struct Args {
     host: String,
 
     /// Relay 域名 (用于生成 URL)
-    #[arg(long, default_value = "relay.yinnho.cn")]
+    #[arg(long, default_value = "relay.aginx.net")]
     domain: String,
 
     /// 启用调试日志

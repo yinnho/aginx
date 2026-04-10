@@ -1,5 +1,5 @@
+#![allow(non_snake_case)]
 //! ACP protocol type definitions
-//!
 //! Based on ACP 0.15.0 specification
 
 use serde::{Deserialize, Serialize};
@@ -139,16 +139,6 @@ pub struct CancelParams {
     pub sessionId: String,
 }
 
-/// Bind device request
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindDeviceParams {
-    /// Pairing code
-    pub pairCode: String,
-    /// Device name
-    #[serde(default)]
-    pub deviceName: Option<String>,
-}
-
 // ============================================================================
 // Response Types
 // ============================================================================
@@ -188,7 +178,7 @@ pub struct InitializeResult {
     #[serde(default)]
     pub agentCapabilities: AgentCapabilities,
     #[serde(default)]
-    pub agentInfo: AgentInfo,
+    pub agentInfo: AcpAgentInfo,
     #[serde(default)]
     pub authMethods: Vec<AuthMethod>,
 }
@@ -235,7 +225,7 @@ pub struct SessionCapabilities {
 
 /// Agent info
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInfo {
+pub struct AcpAgentInfo {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -244,7 +234,7 @@ pub struct AgentInfo {
     pub version: Option<String>,
 }
 
-impl Default for AgentInfo {
+impl Default for AcpAgentInfo {
     fn default() -> Self {
         Self {
             name: ACP_AGENT_NAME.to_string(),
@@ -277,25 +267,6 @@ pub enum StopReason {
     Refusal,
     #[serde(rename = "error")]
     Error,
-}
-
-/// List sessions response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListSessionsResult {
-    pub sessions: Vec<SessionInfo>,
-    pub nextCursor: Option<String>,
-}
-
-/// Session info
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub sessionId: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updatedAt: Option<String>,
 }
 
 // ============================================================================
@@ -394,76 +365,8 @@ pub struct CommandInfo {
 }
 
 // ============================================================================
-// Permission Request
-// ============================================================================
-
-/// Permission request notification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestPermissionParams {
-    pub requestId: String,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub toolCall: Option<ToolCallInfo>,
-    #[serde(default)]
-    pub options: Vec<PermissionOption>,
-}
-
-/// Tool call info for permission
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallInfo {
-    pub toolCallId: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub _meta: Option<serde_json::Value>,
-}
-
-/// Permission option
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermissionOption {
-    pub optionId: String,
-    pub label: String,
-    #[serde(default)]
-    pub kind: Option<String>,
-}
-
-/// Permission response (from client)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermissionResponse {
-    pub outcome: PermissionOutcome,
-}
-
-/// Permission outcome
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "outcome")]
-pub enum PermissionOutcome {
-    #[serde(rename = "selected")]
-    Selected { optionId: String },
-    #[serde(rename = "cancelled")]
-    Cancelled,
-}
-
-// ============================================================================
 // Helper implementations
 // ============================================================================
-
-impl AcpRequest {
-    /// Parse from JSON string
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
-    }
-
-    /// Convert to JSON string
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(self)
-    }
-
-    /// Check if this is a notification (no response expected)
-    pub fn is_notification(&self) -> bool {
-        self.id.is_none()
-    }
-}
 
 impl AcpResponse {
     /// Create a success response
@@ -527,7 +430,7 @@ impl InitializeResult {
         Self {
             protocolVersion: ACP_VERSION.to_string(),
             agentCapabilities: AgentCapabilities::default(),
-            agentInfo: AgentInfo {
+            agentInfo: AcpAgentInfo {
                 name: ACP_AGENT_NAME.to_string(),
                 title: Some(ACP_AGENT_TITLE.to_string()),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),

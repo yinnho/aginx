@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
 
-use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock, StopReason};
+use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock};
 use super::streaming::{AsyncStreamingResult, StreamingEvent};
+use super::agent_event::{write_ndjson, stop_reason_str, truncate_preview};
 use crate::agent::{AgentManager, SessionManager};
 use crate::binding::{self, BindResult};
 use crate::config::AgentType;
@@ -31,9 +32,7 @@ impl AcpHandler {
             agent_manager,
             session_manager,
             initialized: Mutex::new(false),
-            agents_dir: dirs::home_dir()
-                .map(|h| h.join(".aginx").join("agents"))
-                .unwrap_or_else(|| std::path::PathBuf::from(".aginx/agents")),
+            agents_dir: crate::config::agents_dir(),
         }
     }
 
@@ -70,14 +69,11 @@ impl AcpHandler {
         let home_dir = dirs::home_dir()
             .ok_or_else(|| "Cannot determine home directory".to_string())?;
 
-        let homecanonical = std::fs::canonicalize(&home_dir)
+        let home_canonical = std::fs::canonicalize(&home_dir)
             .map_err(|e| format!("Cannot resolve home directory: {}", e))?;
 
-        // Check if the canonical path starts with the home directory
-        let canonical_str = canonical.to_string_lossy();
-        let homecanonical_str = homecanonical.to_string_lossy();
-
-        if !canonical_str.starts_with(&*homecanonical_str) {
+        // Use ancestors() for proper path containment check (prevents /Users/aliceevil bypassing /Users/alice)
+        if canonical != home_canonical && !canonical.ancestors().any(|a| a == home_canonical) {
             return Err("Access denied: path outside home directory".to_string());
         }
 
@@ -92,7 +88,7 @@ impl AcpHandler {
             // 标准 ACP 核心方法
             "initialize" => self.handle_initialize(request).await,
             "session/new" => self.handle_new_session(request).await,
-            "session/load" => self.handle_load_session(request).await,
+            "session/load" | "loadSession" => self.handle_load_session(request).await,
             "session/prompt" => {
                 AcpResponse::error(request.id, -32601, "Use streaming endpoint for session/prompt")
             }
@@ -171,30 +167,17 @@ impl AcpHandler {
                     .map(String::from)
             });
 
-        // 如果没有指定 agentId，查找第一个支持 session 的 agent
+        // 如果没有指定 agentId，使用第一个可用的 agent
         let agent_id = match agent_id {
             Some(id) => id,
             None => {
-                // 获取配置中第一个支持 session 的 agent（非 builtin 类型）
                 let agents = self.agent_manager.list_agents().await;
                 if agents.is_empty() {
                     return AcpResponse::error(request.id, -32602, "No agent configured");
                 }
-                // 查找第一个非 builtin 的 agent
-                agents.iter()
-                    .find(|a| {
-                        let agent_type = a.get("agent_type")
-                            .or_else(|| a.get("type"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("builtin");
-                        agent_type != "builtin"
-                    })
-                    .and_then(|a| a.get("id").and_then(|v| v.as_str()))
+                agents[0].get("id").and_then(|v| v.as_str())
                     .map(String::from)
-                    .unwrap_or_else(|| {
-                        // 如果都是 builtin，使用第一个（可能会失败）
-                        agents[0].get("id").and_then(|v| v.as_str()).unwrap_or("echo").to_string()
-                    })
+                    .unwrap_or_else(|| "unknown".to_string())
             }
         };
 
@@ -234,56 +217,53 @@ impl AcpHandler {
             }
         };
 
-        tracing::info!("ACP loadSession: {}", params.sessionId);
+        // For Claude agents: session_id IS the Claude session ID
+        // Just need to create an aginx session that uses --resume with this ID
+        let claude_session_id = &params.sessionId;
+        tracing::info!("[LOAD] ACP loadSession: claude_session_id={}", claude_session_id);
 
-        // 1. 先检查内存中是否还有活跃会话
-        if self.session_manager.get_session_info(&params.sessionId).await.is_some() {
-            return AcpResponse::success(request.id, serde_json::json!({
-                "sessionId": params.sessionId,
-                "status": "active"
-            }));
-        }
-
-        // 2. 从持久化元数据加载（需要遍历所有 agent 目录查找）
+        // Look up agent info to get agent config
         let agents = self.agent_manager.list_agents().await;
-        let mut metadata = None;
-        let mut found_agent_id = None;
-        for agent in &agents {
-            if let Some(aid) = agent.get("id").and_then(|v| v.as_str()) {
-                if let Some(m) = self.session_manager.get_persisted_metadata(&params.sessionId, aid) {
-                    metadata = Some(m);
-                    found_agent_id = Some(aid.to_string());
-                    break;
-                }
-            }
-        }
+        // Find the "claude" agent specifically (not just any agent)
+        let agent_id = agents.iter()
+            .filter_map(|a| {
+                let agent_type = a.get("agent_type").or_else(|| a.get("type")).and_then(|v| v.as_str());
+                let id = a.get("id").and_then(|v| v.as_str());
+                if agent_type == Some("claude") { id } else { None }
+            })
+            .next()
+            .map(String::from);
 
-        let (meta, agent_id) = match (metadata, found_agent_id) {
-            (Some(m), Some(a)) => (m, a),
-            _ => {
-                return AcpResponse::error(request.id, 404, &format!("Session not found: {}", params.sessionId));
-            }
+        let agent_id = match agent_id {
+            Some(id) => id,
+            None => return AcpResponse::error(request.id, 404, "No agent found"),
         };
 
-        // 3. 获取 agent 信息
         let agent_info = match self.agent_manager.get_agent_info(&agent_id).await {
             Some(info) => info,
-            None => {
-                return AcpResponse::error(request.id, -32602, &format!("Agent not found: {}", agent_id));
-            }
+            None => return AcpResponse::error(request.id, 404, "Agent info not found"),
         };
 
-        // 4. 重建内存中的 session（后续 prompt 会用 claude_session_id 自动带上 --resume）
-        let _ = self.session_manager.create_session_with_id(
-            &params.sessionId,
+        // Find the JSONL path to extract workdir
+        let workdir = self.session_manager.find_workdir_for_claude_session(claude_session_id);
+
+        // Create session with claude session ID as the aginx session ID too
+        let session_id = match self.session_manager.create_session_with_claude_id(
+            claude_session_id,
             &agent_info,
-            meta.workdir.as_deref(),
-        ).await;
-        let claude_sid = meta.claude_session_id.as_deref().unwrap_or("");
-        tracing::info!("ACP loadSession: {} (claude session: {})", params.sessionId, claude_sid);
+            workdir.as_deref(),
+        ).await {
+            Ok(id) => id,
+            Err(e) => return AcpResponse::error(request.id, -32603, &format!("Failed to create session: {}", e)),
+        };
+
+        tracing::info!("ACP loadSession: session created {} for claude session {}", session_id, claude_session_id);
+
+        // Touch the session to prevent timeout cleanup while it's being used
+        self.session_manager.touch_session(&session_id).await;
 
         AcpResponse::success(request.id, serde_json::json!({
-            "sessionId": params.sessionId,
+            "sessionId": session_id,
             "status": "resumed"
         }))
     }
@@ -329,9 +309,13 @@ impl AcpHandler {
         let session_info = match self.session_manager.get_session_info(&params.sessionId).await {
             Some(info) => info,
             None => {
+                tracing::warn!("[PROMPT] Session not found: {} — caller may need to reload session", params.sessionId);
                 return AcpResponse::error(request.id, -32603, &format!("Session not found: {}", params.sessionId));
             }
         };
+
+        // Touch session to prevent timeout cleanup during prompt processing
+        self.session_manager.touch_session(&params.sessionId).await;
 
         // Try to get ACP agent process (for Claude-type agents)
         let agent_process = self.session_manager.get_agent_process(&params.sessionId).await;
@@ -348,12 +332,20 @@ impl AcpHandler {
 
             // Spawn task to run prompt via ACP process (takes ownership of event_tx)
             let process_clone = process.clone();
+            let error_tx = tx.clone();
+            let error_request_id = request_id.clone();
+            let cleanup_session_id = session_id.clone();
+            let cleanup_session_manager = self.session_manager.clone();
             tokio::spawn(async move {
                 let mut p = process_clone.lock().await;
                 if let Err(e) = p.prompt(&message, event_tx).await {
                     tracing::error!("ACP prompt error: {}", e);
-                    // event_tx was consumed by prompt(), error is logged
-                    // The client will see no completion event and timeout
+                    // Clean up broken process so next prompt starts fresh
+                    drop(p); // release lock before removing
+                    cleanup_session_manager.remove_agent_process(&cleanup_session_id).await;
+                    // send error response directly so client doesn't hang
+                    let error_response = AcpResponse::error(error_request_id, -32603, &format!("Prompt error: {}", e));
+                    let _ = error_tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
                 }
             });
 
@@ -376,11 +368,7 @@ impl AcpHandler {
                                     claude_session_id,
                                 } => {
                                     // Update persisted metadata
-                                    let msg_preview = if content.chars().count() > 100 {
-                                        format!("{}...", content.chars().take(100).collect::<String>())
-                                    } else {
-                                        content.clone()
-                                    };
+                                    let msg_preview = truncate_preview(&content, 100);
                                     session_manager.update_persisted_metadata(
                                         &session_id,
                                         &agent_id,
@@ -390,13 +378,7 @@ impl AcpHandler {
 
                                     // Send final response
                                     let final_response = AcpResponse::success(request_id, serde_json::json!({
-                                        "stopReason": match stop_reason {
-                                            StopReason::EndTurn => "end_turn",
-                                            StopReason::Stop => "stop",
-                                            StopReason::Cancelled => "cancelled",
-                                            StopReason::Refusal => "refusal",
-                                            StopReason::Error => "error",
-                                        },
+                                        "stopReason": stop_reason_str(&stop_reason),
                                         "response": content
                                     }));
                                     let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
@@ -433,56 +415,56 @@ impl AcpHandler {
 
             if use_legacy || agent_info.agent_type == AgentType::Claude {
                 // Legacy 模式：每次启动新进程，使用 stream-json 输出格式
-                    tracing::info!("[PROMPT] Starting legacy streaming for session {}", params.sessionId);
-                    let mut event_rx = match super::streaming::StreamingSession::run_claude_async(
-                        params.sessionId.clone(),
-                        agent_info,
-                        session_info.workdir.clone(),
-                        session_info.claude_session_id.clone(),
-                        &message,
-                    ).await {
-                        Ok(rx) => rx,
-                        Err(e) => {
-                            return AcpResponse::error(request.id, -32603, &format!("Failed to start streaming: {}", e));
-                        }
-                    };
+                tracing::info!("[PROMPT] Starting legacy streaming for session {}", params.sessionId);
+                let mut event_rx = match super::streaming::StreamingSession::run_claude_async(
+                    params.sessionId.clone(),
+                    agent_info,
+                    session_info.workdir.clone(),
+                    session_info.claude_session_id.clone(),
+                    &message,
+                ).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        return AcpResponse::error(request.id, -32603, &format!("Failed to start streaming: {}", e));
+                    }
+                };
 
-                    let session_id = params.sessionId.clone();
-                    let request_id = request.id.clone();
-                    let session_manager = self.session_manager.clone();
-                    let agent_id = session_info.agent_id.clone();
-                    let user_message = message.clone(); // 保存用户消息用于存储
+                let session_id = params.sessionId.clone();
+                let request_id = request.id.clone();
+                let session_manager = self.session_manager.clone();
+                let agent_id = session_info.agent_id.clone();
+                let user_message = message.clone();
 
-                    // 先存储用户消息
-                    tracing::info!("[PROMPT] Appending user message to session {}", session_id);
-                    session_manager.append_message(&session_id, &agent_id, "user", &user_message);
-                    tracing::info!("[PROMPT] User message saved, spawning notification task");
+                // 先存储用户消息
+                tracing::info!("[PROMPT] Appending user message to session {}", session_id);
+                session_manager.append_message(&session_id, &agent_id, "user", &user_message);
+                tracing::info!("[PROMPT] User message saved, spawning notification task");
 
-                    tokio::spawn(async move {
-                        let mut final_result: Option<AsyncStreamingResult> = None;
+                tokio::spawn(async move {
+                    let mut final_result: Option<AsyncStreamingResult> = None;
 
-                        while let Some(event) = event_rx.recv().await {
-                            match event {
-                                StreamingEvent::Notification(json) => {
-                                    tracing::info!("[PROMPT] Forwarding notification, json_len={}", json.len());
-                                    if tx.send(json).await.is_err() {
-                                        tracing::warn!("Client disconnected");
-                                        break;
-                                    }
-                                }
-                                StreamingEvent::Completed(result) => {
-                                    final_result = Some(result);
+                    while let Some(event) = event_rx.recv().await {
+                        match event {
+                            StreamingEvent::Notification(json) => {
+                                tracing::info!("[PROMPT] Forwarding notification, json_len={}", json.len());
+                                if tx.send(json).await.is_err() {
+                                    tracing::warn!("Client disconnected");
                                     break;
                                 }
                             }
+                            StreamingEvent::Completed(result) => {
+                                final_result = Some(result);
+                                break;
+                            }
                         }
+                    }
 
-                        if let Some(result) = final_result {
-                            match result {
-                                AsyncStreamingResult::Completed {
-                                    stop_reason,
-                                    content,
-                                    claude_session_id,
+                    if let Some(result) = final_result {
+                        match result {
+                            AsyncStreamingResult::Completed {
+                                stop_reason,
+                                content,
+                                claude_session_id,
                             } => {
                                 if let Some(ref sid) = claude_session_id {
                                     if let Err(e) = session_manager.update_claude_session_id(&session_id, sid).await {
@@ -490,11 +472,7 @@ impl AcpHandler {
                                     }
                                 }
 
-                                let msg_preview = if content.chars().count() > 100 {
-                                    format!("{}...", content.chars().take(100).collect::<String>())
-                                } else {
-                                    content.clone()
-                                };
+                                let msg_preview = truncate_preview(&content, 100);
                                 session_manager.update_persisted_metadata(
                                     &session_id,
                                     &agent_id,
@@ -506,13 +484,7 @@ impl AcpHandler {
                                 session_manager.append_message(&session_id, &agent_id, "assistant", &content);
 
                                 let final_response = AcpResponse::success(request_id, serde_json::json!({
-                                    "stopReason": match stop_reason {
-                                        StopReason::EndTurn => "end_turn",
-                                        StopReason::Stop => "stop",
-                                        StopReason::Cancelled => "cancelled",
-                                        StopReason::Refusal => "refusal",
-                                        StopReason::Error => "error",
-                                    },
+                                    "stopReason": stop_reason_str(&stop_reason),
                                     "response": content
                                 }));
                                 let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
@@ -525,14 +497,100 @@ impl AcpHandler {
                         }
                     }
                 });
+
+                // Return immediately - streaming happens in background
+                return AcpResponse::success(request.id, serde_json::json!({
+                    "streaming": true,
+                    "sessionId": params.sessionId
+                }));
+            } else {
+                // 非 Claude/legacy 类型 agent：使用 stdin/stdout 进程模式
+                tracing::info!("[PROMPT] Starting process streaming for session {}", params.sessionId);
+
+                let command = agent_info.command.clone();
+                let args: Vec<String> = agent_info.args.iter()
+                    .map(|arg| arg.replace("${SESSION_ID}", &params.sessionId))
+                    .collect();
+                let env = agent_info.env.clone();
+                let workdir = session_info.workdir.clone().or(agent_info.working_dir.clone());
+                let request_id = request.id.clone();
+                let session_id = params.sessionId.clone();
+
+                tokio::spawn(async move {
+                    let mut cmd = tokio::process::Command::new(&command);
+                    cmd.args(&args)
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped());
+
+                    if let Some(dir) = &workdir {
+                        cmd.current_dir(dir);
+                    }
+                    for (k, v) in &env {
+                        cmd.env(k, v);
+                    }
+
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            // Write message to stdin
+                            if let Some(mut stdin) = child.stdin.take() {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stdin.write_all(message.as_bytes()).await;
+                                let _ = stdin.write_all(b"\n").await;
+                                drop(stdin); // Close stdin to signal EOF
+                            }
+
+                            // Read stdout
+                            let mut full_output = String::new();
+                            if let Some(stdout) = child.stdout.take() {
+                                use tokio::io::AsyncBufReadExt;
+                                let reader = tokio::io::BufReader::new(stdout);
+                                let mut lines = reader.lines();
+
+                                while let Ok(Some(line)) = lines.next_line().await {
+                                    full_output.push_str(&line);
+                                    full_output.push('\n');
+
+                                    // Send as chunk notification
+                                    let notification = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "sessionUpdate",
+                                        "params": {
+                                            "sessionId": session_id,
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": {"type": "text", "text": line}
+                                            }
+                                        }
+                                    });
+                                    if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Always wait for child to prevent orphan processes
+                            let _ = child.wait().await;
+
+                            // Send final response
+                            let final_response = AcpResponse::success(request_id, serde_json::json!({
+                                "stopReason": "end_turn",
+                                "response": full_output.trim_end()
+                            }));
+                            let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
+                        }
+                        Err(e) => {
+                            let error_response = AcpResponse::error(request_id, -32603, &format!("Failed to start process: {}", e));
+                            let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                        }
+                    }
+                });
+
+                return AcpResponse::success(request.id, serde_json::json!({
+                    "streaming": true,
+                    "sessionId": params.sessionId
+                }));
             }
         }
-
-        // Return immediately - streaming happens in background
-        AcpResponse::success(request.id, serde_json::json!({
-            "streaming": true,
-            "sessionId": params.sessionId
-        }))
     }
 
     /// Handle cancel request
@@ -632,19 +690,30 @@ impl AcpHandler {
             }
         };
 
-        let sessions = self.session_manager.list_persisted_sessions(&agent_id);
+        // Check if this is a claude-type agent
+        let agent_info = self.agent_manager.get_agent_info(&agent_id).await;
+        let is_claude = agent_info.as_ref()
+            .map(|i| i.agent_type == AgentType::Claude)
+            .unwrap_or(false);
 
-        let conversations: Vec<serde_json::Value> = sessions.iter().map(|s| {
-            serde_json::json!({
-                "sessionId": s.session_id,
-                "agentId": s.agent_id,
-                "workdir": s.workdir,
-                "title": s.title,
-                "lastMessage": s.last_message,
-                "createdAt": s.created_at,
-                "updatedAt": s.updated_at
-            })
-        }).collect();
+        let conversations = if is_claude {
+            // Direct scan of Claude CLI JSONL sessions — no aginx metadata layer
+            self.session_manager.scan_claude_sessions_direct()
+        } else {
+            // Non-Claude agents: use persisted sessions
+            let sessions = self.session_manager.list_persisted_sessions(&agent_id);
+            sessions.iter().map(|s| {
+                serde_json::json!({
+                    "sessionId": s.session_id,
+                    "agentId": s.agent_id,
+                    "workdir": s.workdir,
+                    "title": s.title,
+                    "lastMessage": s.last_message,
+                    "createdAt": s.created_at,
+                    "updatedAt": s.updated_at
+                })
+            }).collect()
+        };
 
         AcpResponse::success(request.id, serde_json::json!({
             "conversations": conversations
@@ -660,66 +729,36 @@ impl AcpHandler {
                 return AcpResponse::error(request.id, -32602, "Missing sessionId");
             }
         };
-        let agent_id = match params.get("agentId").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing agentId");
-            }
-        };
 
-        // Close active session if exists
-        let _ = self.session_manager.close_session(&session_id).await;
+        // session_id IS the Claude session ID — just delete the JSONL file directly
+        let deleted = self.session_manager.delete_claude_jsonl_by_session_id(&session_id);
 
-        // Delete persisted metadata
-        self.session_manager.delete_persisted_session(&session_id, &agent_id);
+        tracing::info!("Delete conversation {}: {}", session_id, if deleted { "success" } else { "not found" });
 
         AcpResponse::success(request.id, serde_json::json!({
-            "success": true
+            "success": deleted
         }))
     }
 
-    /// Handle getConversationMessages - read messages from aginx session storage
-    /// TODO: 实现从 aginx 自己的 session 存储中读取消息
+    /// Handle getConversationMessages - read messages directly from Claude JSONL
     async fn handle_get_conversation_messages(&self, request: AcpRequest) -> AcpResponse {
         let params = request.params.clone().unwrap_or(serde_json::json!({}));
         let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => {
-                tracing::warn!("[getConversationMessages] Missing sessionId in request");
                 return AcpResponse::error(request.id, -32602, "Missing sessionId");
             }
         };
+        let limit = params.get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as usize;
 
-        tracing::info!("[getConversationMessages] Request for session_id: {}", session_id);
+        tracing::info!("[getConversationMessages] session_id={}, limit={}", session_id, limit);
 
-        // Find the agent that owns this session
-        let agents = self.agent_manager.list_agents().await;
-        let mut found_agent_id: Option<String> = None;
+        // session_id IS the Claude session ID — read directly from JSONL
+        let messages = self.session_manager.read_claude_jsonl_messages_limited(&session_id, limit);
 
-        for agent in &agents {
-            if let Some(aid) = agent.get("id").and_then(|v| v.as_str()) {
-                if self.session_manager.get_persisted_metadata(&session_id, aid).is_some() {
-                    found_agent_id = Some(aid.to_string());
-                    break;
-                }
-            }
-        }
-
-        let agent_id = match found_agent_id {
-            Some(id) => id,
-            None => {
-                tracing::warn!("[getConversationMessages] Session {} not found", session_id);
-                return AcpResponse::success(request.id, serde_json::json!({
-                    "messages": []
-                }));
-            }
-        };
-
-        // 从 aginx session 存储中读取消息
-        // TODO: 实现真正的消息存储和读取
-        let messages = self.session_manager.get_session_messages(&session_id, &agent_id);
-
-        tracing::info!("[getConversationMessages] Returning {} messages for session {}", messages.len(), session_id);
+        tracing::info!("[getConversationMessages] Returning {} messages", messages.len());
 
         AcpResponse::success(request.id, serde_json::json!({
             "messages": messages
@@ -728,15 +767,17 @@ impl AcpHandler {
 
     /// Handle discoverAgents request - scan directory for aginx.toml files
     async fn handle_discover_agents(&self, request: AcpRequest) -> AcpResponse {
-        use std::path::PathBuf;
         use crate::agent::scan_directory;
 
         // Parse params
         let params = request.params.clone().unwrap_or(serde_json::json!({}));
-        let scan_path = params.get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.agents_dir.clone());
+        let scan_path = match params.get("path").and_then(|v| v.as_str()) {
+            Some(p) => match Self::safe_resolve_path(p) {
+                Ok(resolved) => resolved,
+                Err(e) => return AcpResponse::error(request.id, 400, &e),
+            },
+            None => self.agents_dir.clone(),
+        };
 
         let max_depth = params.get("maxDepth")
             .and_then(|v| v.as_u64())
@@ -775,9 +816,9 @@ impl AcpHandler {
     }
 
     /// Handle registerAgent request - register a discovered agent
+    /// Only allows registration via local configPath (prevents remote command injection)
     async fn handle_register_agent(&self, request: AcpRequest) -> AcpResponse {
-        use std::path::PathBuf;
-        use crate::agent::{parse_aginx_toml, AgentConfig, AgentInfo};
+        use crate::agent::{parse_aginx_toml, agent_config_to_info};
 
         // Parse params
         let params = match &request.params {
@@ -787,30 +828,26 @@ impl AcpHandler {
             }
         };
 
-        // Either configPath or agent config is required
-        let agent_info = if let Some(config_path) = params.get("configPath").and_then(|v| v.as_str()) {
-            // Load from config file
-            let path = PathBuf::from(config_path);
-            let project_dir = path.parent().unwrap_or(&path).to_path_buf();
+        let config_path = match params.get("configPath").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => {
+                return AcpResponse::error(request.id, -32602, "configPath is required");
+            }
+        };
 
-            match parse_aginx_toml(&path, &project_dir) {
-                Ok(discovered) => {
-                    AgentInfo::from(discovered.config)
-                }
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Failed to parse config: {}", e));
-                }
+        // Validate path is within home directory
+        let path = match Self::safe_resolve_path(config_path) {
+            Ok(p) => p,
+            Err(e) => return AcpResponse::error(request.id, 400, &e),
+        };
+
+        let project_dir = path.parent().unwrap_or(&path).to_path_buf();
+
+        let agent_info = match parse_aginx_toml(&path, &project_dir) {
+            Ok(discovered) => agent_config_to_info(discovered.config, &project_dir),
+            Err(e) => {
+                return AcpResponse::error(request.id, -32602, &format!("Failed to parse config: {}", e));
             }
-        } else if let Some(agent_obj) = params.get("agent") {
-            // Direct config
-            match serde_json::from_value::<AgentConfig>(agent_obj.clone()) {
-                Ok(config) => AgentInfo::from(config),
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid agent config: {}", e));
-                }
-            }
-        } else {
-            return AcpResponse::error(request.id, -32602, "Missing configPath or agent");
         };
 
         // Register agent
@@ -845,7 +882,7 @@ impl AcpHandler {
             return AcpResponse::error(request.id, -32602, "pairCode is required");
         }
 
-        tracing::info!("ACP bindDevice: pairCode={}, deviceName={}", pair_code, device_name);
+        tracing::debug!("ACP bindDevice: pairCode={}, deviceName={}", pair_code, device_name);
 
         // 使用单例 BindingManager
         let manager = binding::get_binding_manager();
@@ -1035,13 +1072,6 @@ impl AcpHandler {
         }
     }
 }
-async fn write_ndjson<W: tokio::io::AsyncWriteExt + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
-}
-
 /// Run ACP protocol over stdin/stdout with streaming support
 pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Arc<SessionManager>) {
     let handler = Arc::new(AcpHandler::new(agent_manager, session_manager));

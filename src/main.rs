@@ -20,7 +20,6 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use crate::config::{Config, ServerMode, save_config, get_default_config_path};
 use crate::agent::AgentManager;
-use crate::binding::BindingManager;
 
 /// aginx - Agent Protocol 实现
 #[derive(Parser, Debug)]
@@ -39,12 +38,12 @@ struct Args {
     mode: Option<ModeArg>,
 
     /// 本地服务端口
-    #[arg(short = 'p', long, default_value = "86")]
-    port: u16,
+    #[arg(short = 'p', long)]
+    port: Option<u16>,
 
     /// 绑定地址
-    #[arg(short = 'H', long, default_value = "0.0.0.0")]
-    host: String,
+    #[arg(short = 'H', long)]
+    host: Option<String>,
 
     /// 公网访问地址 (mode=direct 时使用)
     #[arg(long, value_name = "URL")]
@@ -84,9 +83,6 @@ enum Commands {
         output: PathBuf,
     },
 
-    /// 查看状态
-    Status,
-
     /// 生成配对码（用于 App 绑定）
     Pair,
 
@@ -94,10 +90,7 @@ enum Commands {
     Devices,
 
     /// 解绑设备
-    Unbind {
-        /// 设备 ID
-        device_id: String,
-    },
+    Unbind,
 
     /// 显示设备硬件指纹
     Fingerprint,
@@ -150,14 +143,15 @@ async fn main() -> anyhow::Result<()> {
             // 检查是否需要申请 ID（首次启动）
             if !config.relay.has_id() {
                 tracing::info!("========================================");
-                tracing::info!("首次启动，正在向 relay.yinnho.cn 申请 ID...");
+                tracing::info!("首次启动，正在向 API 申请 ID...");
                 tracing::info!("========================================");
 
-                // 向 relay 申请 ID
-                let registration = relay::register_id().await?;
+                // 向 API 申请 ID（HTTP POST）
+                let registration = relay::register_id(&config.api.url).await?;
 
                 // 更新配置
                 config.relay.set_id(registration.id.clone());
+                config.relay.token = Some(registration.token);
 
                 // 保存配置
                 if let Err(e) = save_config(&config, &config_path) {
@@ -168,8 +162,7 @@ async fn main() -> anyhow::Result<()> {
 
                 tracing::info!("========================================");
                 tracing::info!("申请成功!");
-                tracing::info!("ID: {}", registration.id);
-                tracing::info!("URL: {}", registration.url);
+                tracing::info!("ID: {}", config.relay.id.as_deref().unwrap_or("?"));
                 tracing::info!("========================================");
             }
 
@@ -205,8 +198,8 @@ fn init_logging(verbose: bool, debug: bool) {
 fn load_config(args: &Args) -> anyhow::Result<config::LoadResult> {
     let cli_args = config::CliArgs {
         config: args.config.clone(),
-        port: Some(args.port),
-        host: Some(args.host.clone()),
+        port: args.port,
+        host: args.host.clone(),
         mode: args.mode.as_ref().map(|m| ServerMode::from(m.clone())),
         public_url: args.public_url.clone(),
     };
@@ -224,9 +217,9 @@ fn print_startup_info(config: &Config) {
         }
         ServerMode::Relay => {
             if let Some(ref id) = config.relay.id {
-                format!("agent://{}.relay.yinnho.cn", id)
+                format!("agent://{}.{}", id, config.relay.domain)
             } else {
-                "agent://xxx.relay.yinnho.cn (未配置)".to_string()
+                format!("agent://xxx.{} (未配置)", config.relay.domain)
             }
         }
     };
@@ -263,47 +256,70 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
 
             println!("配置文件已创建: {:?}", path);
         }
-        Commands::Status => {
-            println!("状态查看功能尚未实现");
-        }
         Commands::Pair => {
-            let mut manager = BindingManager::new();
-            let result = manager.generate_pair_code();
+            let manager = binding::get_binding_manager();
+            let mut mgr = manager.lock().unwrap();
+            let result = mgr.generate_pair_code();
+
+            // 加载配置获取正确的地址
+            let config_result = config::load_config(&config::CliArgs::default())?;
+            let address = match config_result.config.server.mode {
+                ServerMode::Relay => {
+                    if let Some(ref id) = config_result.config.relay.id {
+                        format!("agent://{}.{}", id, config_result.config.relay.domain)
+                    } else {
+                        let local_ip = local_ip_address::local_ip()
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|_| "<未知>".to_string());
+                        format!("agent://{}", local_ip)
+                    }
+                }
+                ServerMode::Direct => {
+                    if let Some(ref url) = config_result.config.direct.public_url {
+                        url.clone()
+                    } else {
+                        let local_ip = local_ip_address::local_ip()
+                            .map(|ip| ip.to_string())
+                            .unwrap_or_else(|_| "<未知>".to_string());
+                        format!("agent://{}", local_ip)
+                    }
+                }
+            };
 
             println!("========================================");
+            println!("服务器地址: {}", address);
             println!("配对码: {}", result.code);
             println!("有效期: {} 秒 (5分钟)", result.expires_in);
             println!("========================================");
             println!("");
-            println!("在 App 中输入此配对码完成绑定");
+            println!("在 App 中输入服务器地址和配对码完成绑定");
         }
         Commands::Devices => {
-            let manager = BindingManager::new();
-            let devices = manager.list_devices();
+            let manager = binding::get_binding_manager();
+            let mgr = manager.lock().unwrap();
 
-            if devices.is_empty() {
-                println!("没有已绑定的设备");
-            } else {
+            if let Some(device) = mgr.get_bound_device() {
                 println!("已绑定的设备:");
                 println!("");
-                for device in devices {
-                    let bound_time = chrono::DateTime::from_timestamp(device.bound_at, 0)
-                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "未知".to_string());
-                    println!("  ID: {}", device.id);
-                    println!("  名称: {}", device.name);
-                    println!("  绑定时间: {}", bound_time);
-                    println!("  ---");
-                }
+                let bound_time = chrono::DateTime::from_timestamp(device.bound_at, 0)
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "未知".to_string());
+                println!("  ID: {}", device.id);
+                println!("  名称: {}", device.name);
+                println!("  绑定时间: {}", bound_time);
+            } else {
+                println!("没有已绑定的设备");
             }
         }
-        Commands::Unbind { device_id } => {
-            let mut manager = BindingManager::new();
+        Commands::Unbind => {
+            let manager = binding::get_binding_manager();
+            let mut mgr = manager.lock().unwrap();
 
-            if manager.unbind_device(&device_id) {
-                println!("设备 {} 已解绑", device_id);
+            if mgr.get_bound_device().is_some() {
+                mgr.unbind_all();
+                println!("设备已解绑");
             } else {
-                println!("设备 {} 不存在", device_id);
+                println!("没有已绑定的设备");
             }
         }
         Commands::Fingerprint => {

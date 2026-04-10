@@ -1,0 +1,64 @@
+# aginx agent 配置文件
+# 放在 agent 项目的根目录，aginx 会扫描发现
+
+# Agent 基本信息
+id = "claude"
+name = "Claude Agent"
+description = "Anthropic Claude CLI - AI coding assistant"
+version = "1.0.0"
+
+# Agent 类型: claude, process, builtin
+agent_type = "claude"
+
+# 命令配置
+[command]
+# 可选，不填则自动发现（通过 which/where）
+# path = "/Users/sophiehe/.npm-global/bin/claude"
+
+# 默认参数
+args = ["--print", "--output-format", "json"]
+
+# 环境变量（可选）
+[command.env]
+# ANTHROPIC_API_KEY = "${ANTHROPIC_API_KEY}"
+
+# 需要移除的环境变量（可选）
+# command.env_remove = ["CLAUDECODE"]
+
+# 会话配置
+[session]
+# 是否需要工作目录
+require_workdir = true
+
+# 会话恢复配置（用于保持上下文）
+[session.resume]
+# 从响应 JSON 中提取会话 ID 的路径（支持 JSON path）
+session_id_path = "session_id"
+
+# 恢复会话时的参数模板
+# ${SESSION_ID} 会被替换为实际的 session_id
+resume_args = ["--resume", "${SESSION_ID}"]
+
+# 会话参数模板（可选，支持 ${SESSION_ID} 变量）
+# session_args = ["--session-id", "${SESSION_ID}"]
+
+# 能力声明
+[capabilities]
+# 支持的功能
+chat = true
+code = true
+ask = true
+streaming = true
+permissions = true
+
+# 帮助命令（用于用户了解 agent）
+help_command = "claude --help"
+
+# 检测配置（aginx 用于自动发现这个 agent）
+[detect]
+# 检测命令是否存在
+check_command = "claude"
+check_args = ["--version"]
+
+# 从输出解析版本号的正则（可选）
+# version_regex = "Claude Code v(\\d+\\.\\d+\\.\\d+)"

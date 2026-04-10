@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! AcpAgentProcess — persistent Claude CLI process for process-per-session model
 //!
 //! Manages a single Claude CLI process using the stream-json protocol:
@@ -14,98 +15,21 @@ use std::process::Stdio as StdStdio;
 
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::streaming::StreamingEvent;
 use super::types::StopReason;
+use super::agent_event::{
+    format_tool_title, infer_tool_kind,
+    make_chunk_notification, make_tool_notification, make_tool_update_notification,
+    AssistantMessage, ContentBlock,
+};
 
 /// Raw event from stdout reader
 #[derive(Debug)]
 pub enum RawEvent {
     Line(String),
     Eof,
-}
-
-/// Claude CLI stream-json output event types
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type")]
-enum ClaudeEvent {
-    #[serde(rename = "system")]
-    System {
-        session_id: Option<String>,
-        #[serde(default)]
-        subtype: Option<String>,
-    },
-    #[serde(rename = "assistant")]
-    Assistant {
-        message: Option<AssistantMessage>,
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-    #[serde(rename = "result")]
-    Result {
-        #[serde(default)]
-        result: Option<String>,
-        #[serde(default)]
-        stop_reason: Option<String>,
-        #[serde(default)]
-        session_id: Option<String>,
-        #[serde(default)]
-        is_error: Option<bool>,
-        #[serde(default)]
-        subtype: Option<String>,
-    },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        #[serde(rename = "tool_use_id")]
-        tool_use_id: String,
-        #[serde(default)]
-        content: Option<serde_json::Value>,
-        #[serde(default)]
-        is_error: Option<bool>,
-    },
-    #[serde(rename = "error")]
-    Error {
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        session_id: Option<String>,
-    },
-}
-
-/// Assistant message content blocks
-#[derive(Debug, Clone, serde::Deserialize)]
-struct AssistantMessage {
-    #[serde(default)]
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(tag = "type")]
-enum ContentBlock {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "thinking")]
-    Thinking { thinking: String },
-    #[serde(rename = "tool_use")]
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResultBlock {
-        #[serde(rename = "tool_use_id")]
-        tool_use_id: String,
-        #[serde(default)]
-        content: Option<serde_json::Value>,
-    },
 }
 
 /// ACP Agent Process — persistent Claude CLI process communicating via stream-json
@@ -179,13 +103,14 @@ impl AcpAgentProcess {
             alive: true,
         };
 
-        // Send a dummy prompt to trigger the init event
-        // This gets the session_id and puts Claude in a ready state
+        // Send a minimal prompt to trigger the init event and get session_id.
+        // stream-json mode requires a user message before emitting system/session events.
+        // Using a short prompt to minimize token cost.
         let dummy_msg = serde_json::json!({
             "type": "user",
             "message": {
                 "role": "user",
-                "content": "echo ok"
+                "content": "hi"
             }
         });
         let dummy_line = serde_json::to_string(&dummy_msg).map_err(|e| e.to_string())?;
@@ -389,15 +314,6 @@ impl AcpAgentProcess {
         Ok(())
     }
 
-    /// Cancel the current prompt
-    #[allow(unused_variables)]
-    pub async fn cancel(&mut self) -> Result<(), String> {
-        tracing::info!("Cancel requested for session {}", self.claude_session_id);
-        // Note: Claude CLI doesn't have a clean cancel mechanism in stream-json mode.
-        // The best we can do is let the process continue and ignore the result.
-        Ok(())
-    }
-
     /// Kill the child process
     pub async fn close(&mut self) {
         let _ = self.child.kill().await;
@@ -407,6 +323,12 @@ impl AcpAgentProcess {
     /// Get the Claude CLI session ID
     pub fn claude_session_id(&self) -> &str {
         &self.claude_session_id
+    }
+}
+
+impl Drop for AcpAgentProcess {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 
@@ -523,129 +445,5 @@ fn extract_session_id(line: &str) -> Option<String> {
             .map(String::from)
     } else {
         None
-    }
-}
-
-// ============================================================================
-// Notification builders
-// ============================================================================
-
-use super::types::{AcpResponse, MessageContent, SessionUpdate, SessionUpdateParams, ToolCallStatus, ToolKind, ToolCallContent};
-
-fn make_chunk_notification(session_id: &str, text: &str) -> String {
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::AgentMessageChunk {
-            content: MessageContent::Text { text: text.to_string() },
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-fn make_tool_notification(session_id: &str, tool_call_id: &str, title: &str, kind: Option<&ToolKind>) -> String {
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::ToolCall {
-            toolCallId: tool_call_id.to_string(),
-            title: title.to_string(),
-            status: ToolCallStatus::InProgress,
-            rawInput: None,
-            kind: kind.cloned(),
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-fn make_tool_update_notification(session_id: &str, tool_call_id: &str, status: ToolCallStatus, output: Option<&str>) -> String {
-    let content = output.map(|o| vec![
-        ToolCallContent::Content {
-            content: MessageContent::Text { text: o.to_string() },
-        }
-    ]);
-    let notification = SessionUpdateParams {
-        sessionId: session_id.to_string(),
-        update: SessionUpdate::ToolCallUpdate {
-            toolCallId: tool_call_id.to_string(),
-            status: Some(status),
-            rawOutput: output.map(|o| serde_json::json!(o)),
-            content,
-        },
-    };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", notification))
-        .unwrap_or_else(|_| "{}".to_string())
-}
-
-fn format_tool_title(name: &str, input: &Option<serde_json::Value>) -> String {
-    match name {
-        "Read" | "NBRead" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Read({})", path)
-        }
-        "Edit" | "NBEdit" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Edit({})", path)
-        }
-        "Write" | "NBWrite" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Write({})", path)
-        }
-        "Delete" => {
-            let path = input.as_ref()
-                .and_then(|i| i.get("file_path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("Delete({})", path)
-        }
-        "Bash" => {
-            let cmd = input.as_ref()
-                .and_then(|i| i.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let truncated = if cmd.chars().count() > 40 {
-                format!("{}...", cmd.chars().take(37).collect::<String>())
-            } else {
-                cmd.to_string()
-            };
-            format!("Bash({})", truncated)
-        }
-        "Glob" => {
-            let pattern = input.as_ref()
-                .and_then(|i| i.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("*");
-            format!("Glob({})", pattern)
-        }
-        "Grep" => {
-            let pattern = input.as_ref()
-                .and_then(|i| i.get("pattern"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            format!("Grep({})", pattern)
-        }
-        _ => name.to_string(),
-    }
-}
-
-fn infer_tool_kind(name: &str) -> Option<ToolKind> {
-    match name {
-        "Read" | "NBRead" => Some(ToolKind::Read),
-        "Edit" | "NBEdit" => Some(ToolKind::Edit),
-        "Write" | "NBWrite" => Some(ToolKind::Other),
-        "Delete" => Some(ToolKind::Delete),
-        "Glob" | "Grep" => Some(ToolKind::Search),
-        "Bash" => Some(ToolKind::Execute),
-        "WebFetch" => Some(ToolKind::Fetch),
-        _ => Some(ToolKind::Other),
     }
 }

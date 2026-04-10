@@ -93,20 +93,6 @@ impl SessionData {
         self.messages.last().unwrap()
     }
 
-    /// 转换为 JSON 格式的消息列表（兼容 API 返回）
-    pub fn to_api_messages(&self) -> Vec<serde_json::Value> {
-        self.messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "id": m.id,
-                    "role": m.role,
-                    "content": m.content,
-                    "timestamp": m.timestamp
-                })
-            })
-            .collect()
-    }
 }
 
 /// 会话元数据（持久化到磁盘，用于快速列出会话）
@@ -133,14 +119,10 @@ pub struct SessionMetadata {
 /// 会话简要信息
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
-    /// 会话 ID
-    pub session_id: String,
     /// Agent ID
     pub agent_id: String,
     /// 工作目录
     pub workdir: Option<String>,
-    /// Session UUID (用于保持上下文)
-    pub session_uuid: Option<String>,
     /// Claude 返回的 session_id (用于 --resume)
     pub claude_session_id: Option<String>,
 }
@@ -169,28 +151,14 @@ pub struct Session {
     pub id: String,
     /// Agent ID
     pub agent_id: String,
-    /// Agent 类型
-    agent_type: AgentType,
-    /// Agent 命令路径 (从配置读取)
-    command: String,
-    /// Agent 命令参数 (从配置读取)
-    args: Vec<String>,
-    /// Agent 环境变量 (从配置读取)
-    env: HashMap<String, String>,
-    /// 需要移除的环境变量 (从配置读取)
-    env_remove: Vec<String>,
-    /// Session ID 参数模板 (从配置读取，支持 ${SESSION_ID} 变量)
-    session_args: Vec<String>,
     /// Claude 返回的 session_id (用于 --resume)
     claude_session_id: Mutex<Option<String>>,
     /// 工作目录
     workdir: Option<String>,
     /// 最后活动时间
     pub last_activity: Mutex<Instant>,
-    /// Session UUID (用于保持上下文)
-    session_uuid: Option<String>,
     /// 信号量许可（持有它来限制并发）
-    #[allow(dead_code)]
+    #[allow(dead_code)] // RAII: held to keep semaphore permit alive
     permit: OwnedSemaphorePermit,
 }
 
@@ -211,32 +179,16 @@ impl Session {
 
         match agent_info.agent_type {
             AgentType::Claude | AgentType::Process => {
-                // 生成 session UUID 用于保持上下文（仅 Claude 类型使用）
-                let session_uuid = if agent_info.agent_type == AgentType::Claude {
-                    Some(Uuid::new_v4().to_string())
-                } else {
-                    None
-                };
                 tracing::info!("会话 [{}] 创建成功，Agent: {}, Type: {:?}",
                     session_id, agent_info.id, agent_info.agent_type);
                 Ok(Self {
                     id: session_id,
                     agent_id: agent_info.id.clone(),
-                    agent_type: agent_info.agent_type.clone(),
-                    command: agent_info.command.clone(),
-                    args: agent_info.args.clone(),
-                    env: agent_info.env.clone(),
-                    env_remove: agent_info.env_remove.clone(),
-                    session_args: agent_info.session_args.clone(),
                     claude_session_id: Mutex::new(None),
                     workdir: workdir.map(|s| s.to_string()),
                     last_activity: Mutex::new(Instant::now()),
-                    session_uuid,
                     permit,
                 })
-            }
-            AgentType::Builtin => {
-                Err("Builtin agents do not support sessions".to_string())
             }
         }
     }
@@ -270,9 +222,7 @@ pub struct SessionManager {
 impl SessionManager {
     /// 创建会话管理器
     pub fn new(config: SessionConfig) -> Self {
-        let data_dir = dirs::home_dir()
-            .map(|h| h.join(".aginx"))
-            .unwrap_or_else(|| PathBuf::from(".aginx"));
+        let data_dir = crate::config::data_dir();
         Self {
             sessions: Mutex::new(HashMap::new()),
             agent_processes: Mutex::new(HashMap::new()),
@@ -285,17 +235,6 @@ impl SessionManager {
     /// 获取会话元数据目录
     fn sessions_dir(&self, agent_id: &str) -> PathBuf {
         self.data_dir.join("sessions").join(agent_id)
-    }
-
-    /// 从磁盘加载指定会话的持久化元数据
-    pub fn get_persisted_metadata(&self, session_id: &str, agent_id: &str) -> Option<SessionMetadata> {
-        let dir = self.sessions_dir(agent_id);
-        let path = dir.join(format!("{}.json", session_id));
-        if !path.exists() {
-            return None;
-        }
-        let content = std::fs::read_to_string(&path).ok()?;
-        serde_json::from_str::<SessionMetadata>(&content).ok()
     }
 
     /// 持久化会话元数据到磁盘
@@ -342,16 +281,6 @@ impl SessionManager {
         // 按更新时间降序排列
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         sessions
-    }
-
-    /// 获取会话的消息历史（从 aginx 自己的存储中读取）
-    pub fn get_session_messages(&self, session_id: &str, agent_id: &str) -> Vec<serde_json::Value> {
-        tracing::debug!("[get_session_messages] session_id={}, agent_id={}", session_id, agent_id);
-        if let Some(data) = self.load_session_data(session_id, agent_id) {
-            data.to_api_messages()
-        } else {
-            Vec::new()
-        }
     }
 
     /// 获取会话数据文件路径
@@ -456,15 +385,6 @@ impl SessionManager {
         }
     }
 
-    /// 删除持久化的会话元数据
-    pub fn delete_persisted_session(&self, session_id: &str, agent_id: &str) {
-        let dir = self.sessions_dir(agent_id);
-        let path = dir.join(format!("{}.json", session_id));
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
     /// 创建新会话
     pub async fn create_session(&self, agent_info: &AgentInfo, workdir: Option<&str>) -> Result<String, String> {
         // 获取可用槽位数
@@ -501,6 +421,7 @@ impl SessionManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
         let metadata = SessionMetadata {
             session_id: session_id.clone(),
             agent_id: agent_info.id.clone(),
@@ -516,10 +437,39 @@ impl SessionManager {
         Ok(session_id)
     }
 
-    /// 用已有的 session_id 创建会话（用于 loadSession 恢复）
-    pub async fn create_session_with_id(
+    /// Find the working directory for a Claude session by scanning its JSONL file
+    pub fn find_workdir_for_claude_session(&self, claude_session_id: &str) -> Option<String> {
+        let claude_projects_dir = dirs::home_dir()
+            .map(|h| h.join(".claude").join("projects"))?;
+
+        let path = self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir)?;
+        let file = std::fs::File::open(&path).ok()?;
+        let reader = std::io::BufReader::new(file);
+
+        for (i, line) in std::io::BufRead::lines(reader).enumerate() {
+            if i >= 30 { break; }
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let line = line.trim();
+            if line.is_empty() { continue; }
+
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                if event.get("type").and_then(|t| t.as_str()) == Some("user") {
+                    if let Some(cwd) = event.get("cwd").and_then(|c| c.as_str()) {
+                        return Some(cwd.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Create a session using the Claude session ID directly (for --resume support)
+    pub async fn create_session_with_claude_id(
         &self,
-        session_id: &str,
+        claude_session_id: &str,
         agent_info: &AgentInfo,
         workdir: Option<&str>,
     ) -> Result<String, String> {
@@ -531,15 +481,21 @@ impl SessionManager {
             .map_err(|_| "Semaphore closed")?;
 
         let mut session = Session::new(agent_info, workdir, permit)?;
-        session.id = session_id.to_string();
+        session.id = claude_session_id.to_string();
+
+        // Store claude session ID for --resume
+        {
+            let mut sid = session.claude_session_id.lock().await;
+            *sid = Some(claude_session_id.to_string());
+        }
 
         {
             let mut sessions = self.sessions.lock().await;
-            sessions.insert(session_id.to_string(), session);
+            sessions.insert(claude_session_id.to_string(), session);
         }
 
-        tracing::info!("会话恢复成功: {}", session_id);
-        Ok(session_id.to_string())
+        tracing::info!("Session created with claude ID: {} (will use --resume)", claude_session_id);
+        Ok(claude_session_id.to_string())
     }
 
     /// 关闭会话
@@ -566,26 +522,27 @@ impl SessionManager {
         Ok(())
     }
 
-    /// 获取会话数量
-    pub async fn session_count(&self) -> usize {
-        let sessions = self.sessions.lock().await;
-        sessions.len()
-    }
-
     /// 获取会话信息 (用于流式输出)
     pub async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(session_id) {
             let claude_session_id = s.claude_session_id.lock().await.clone();
             Some(SessionInfo {
-                session_id: s.id.clone(),
                 agent_id: s.agent_id.clone(),
                 workdir: s.workdir.clone(),
-                session_uuid: s.session_uuid.clone(),
                 claude_session_id,
             })
         } else {
             None
+        }
+    }
+
+    /// 更新会话的最后活动时间（防止超时清理）
+    pub async fn touch_session(&self, session_id: &str) {
+        let sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(session_id) {
+            let mut last = session.last_activity.lock().await;
+            *last = Instant::now();
         }
     }
 
@@ -605,7 +562,7 @@ impl SessionManager {
     /// 清理超时会话
     pub async fn cleanup_timeout_sessions(&self) -> usize {
         let timeout = Duration::from_secs(self.config.timeout_seconds);
-        let mut sessions = self.sessions.lock().await;
+        let sessions = self.sessions.lock().await;
         let mut removed = 0;
 
         let timeout_ids: Vec<String> = sessions
@@ -620,9 +577,23 @@ impl SessionManager {
             })
             .collect();
 
+        // Release sessions lock before removing agent processes (which also takes locks)
+        drop(sessions);
+
         for id in timeout_ids {
+            // Remove and close the agent process first
+            self.remove_agent_process(&id).await;
+
+            // Re-check activity before removing (session may have been touched)
+            let mut sessions = self.sessions.lock().await;
+            if let Some(session) = sessions.get(&id) {
+                if let Ok(last) = session.last_activity.try_lock() {
+                    if last.elapsed() <= timeout {
+                        continue; // Re-activated since scan, skip
+                    }
+                }
+            }
             if let Some(session) = sessions.remove(&id) {
-                // 异步关闭需要 detach，但我们在这里直接 drop
                 drop(session);
                 removed += 1;
                 tracing::info!("会话 [{}] 超时已清理", id);
@@ -647,12 +618,6 @@ impl SessionManager {
         })
     }
 
-    /// Store an ACP agent process for a session
-    pub async fn store_agent_process(&self, session_id: String, process: AcpAgentProcess) {
-        let mut processes = self.agent_processes.lock().await;
-        processes.insert(session_id, Arc::new(Mutex::new(process)));
-    }
-
     /// Get the ACP agent process for a session
     pub async fn get_agent_process(&self, session_id: &str) -> Option<Arc<Mutex<AcpAgentProcess>>> {
         let processes = self.agent_processes.lock().await;
@@ -667,4 +632,462 @@ impl SessionManager {
             p.close().await;
         }
     }
+
+    // ========== Claude CLI Session Scanning ==========
+
+    // ========== Direct Claude Session Scanning (no aginx metadata) ==========
+
+    /// Find the JSONL file path in a Claude session by searching project directories
+    fn find_claude_jsonl_path(
+        &self,
+        claude_session_id: &str,
+        claude_projects_dir: &std::path::Path,
+    ) -> Option<PathBuf> {
+        let filename = format!("{}.jsonl", claude_session_id);
+
+        if let Ok(entries) = std::fs::read_dir(claude_projects_dir) {
+            for entry in entries.flatten() {
+                let project_dir = entry.path();
+                if !project_dir.is_dir() { continue; }
+                let candidate = project_dir.join(&filename);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Parse metadata from a Claude JSONL file (lightweight - only read first ~30 lines)
+    fn parse_jsonl_metadata(
+        &self,
+        path: &std::path::Path,
+        claude_session_id: &str,
+    ) -> Option<DiscoveredClaudeSession> {
+        let file = std::fs::File::open(path).ok()?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut first_user_message: Option<String> = None;
+        let mut last_assistant_text: Option<String> = None;
+        let mut first_timestamp: Option<u64> = None;
+        let mut cwd: Option<String> = None;
+
+        for (i, line) in std::io::BufRead::lines(reader).enumerate() {
+            if i >= 30 { break; }
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let line = line.trim();
+            if line.is_empty() { continue; }
+
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                let event_type = event.get("type").and_then(|t| t.as_str());
+
+                match event_type {
+                    Some("queue-operation") => {
+                        if first_user_message.is_none() {
+                            if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
+                                let truncated: String = content.chars().take(100).collect();
+                                first_user_message = Some(truncated);
+                            }
+                        }
+                        if first_timestamp.is_none() {
+                            first_timestamp = event.get("timestamp")
+                                .and_then(|t| t.as_str())
+                                .and_then(|ts| parse_iso_timestamp(ts));
+                        }
+                    }
+                    Some("user") => {
+                        if cwd.is_none() {
+                            cwd = event.get("cwd").and_then(|c| c.as_str()).map(String::from);
+                        }
+                        if first_user_message.is_none() {
+                            if let Some(msg) = event.get("message") {
+                                let content_val = msg.get("content");
+                                if let Some(text) = content_val.and_then(|c| c.as_str()) {
+                                    if !text.contains("<local-command-caveat>")
+                                        && !text.contains("<command-name>")
+                                        && !text.contains("This session is being continued")
+                                        && !text.contains("<local-command-stdout>")
+                                    {
+                                        let truncated: String = text.chars().take(100).collect();
+                                        first_user_message = Some(truncated);
+                                    }
+                                }
+                            }
+                        }
+                        if first_timestamp.is_none() {
+                            first_timestamp = event.get("timestamp")
+                                .and_then(|t| t.as_str())
+                                .and_then(|ts| parse_iso_timestamp(ts));
+                        }
+                    }
+                    Some("assistant") => {
+                        if let Some(msg) = event.get("message") {
+                            if let Some(content_blocks) = msg.get("content").and_then(|c| c.as_array()) {
+                                for block in content_blocks.iter().rev() {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                            if !text.is_empty() {
+                                                let truncated: String = text.chars().take(100).collect();
+                                                last_assistant_text = Some(truncated);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let file_modified = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+            .unwrap_or(0);
+
+        let project_path = cwd.unwrap_or_default();
+
+        Some(DiscoveredClaudeSession {
+            claude_session_id: claude_session_id.to_string(),
+            project_path,
+            first_user_message,
+            last_assistant_text,
+            file_modified,
+            first_timestamp,
+        })
+    }
+
+
+
+    /// Directly scan Claude CLI JSONL sessions, returning data straight from the source.
+    /// No aginx metadata layer involved. sessionId IS the Claude session ID.
+    pub fn scan_claude_sessions_direct(&self) -> Vec<serde_json::Value> {
+        let claude_projects_dir = match dirs::home_dir() {
+            Some(h) => h.join(".claude").join("projects"),
+            None => return Vec::new(),
+        };
+
+        if !claude_projects_dir.exists() {
+            return Vec::new();
+        }
+
+        let mut sessions: Vec<serde_json::Value> = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&claude_projects_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    self.scan_project_dir_direct(&path, &mut sessions);
+                }
+            }
+        }
+
+        // Sort by updatedAt descending
+        sessions.sort_by(|a, b| {
+            b.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0)
+                .cmp(&a.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0))
+        });
+
+        tracing::info!("Direct scanned {} Claude CLI sessions", sessions.len());
+        sessions
+    }
+
+    /// Scan a single project directory for direct listing
+    fn scan_project_dir_direct(
+        &self,
+        dir: &std::path::Path,
+        results: &mut Vec<serde_json::Value>,
+    ) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                // Skip subagent files
+                if path.to_str().map(|s| s.contains("/subagents/")).unwrap_or(false) {
+                    continue;
+                }
+
+                let claude_session_id = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(id) => id.to_string(),
+                    None => continue,
+                };
+
+                if let Some(session) = self.parse_jsonl_metadata(&path, &claude_session_id) {
+                    let file_modified = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+                        .unwrap_or(0);
+
+                    let title = session.first_user_message.clone().or_else(|| {
+                        session.project_path.split('/').last().map(String::from)
+                    });
+
+                    results.push(serde_json::json!({
+                        "sessionId": claude_session_id,
+                        "agentId": "claude",
+                        "title": title,
+                        "lastMessage": session.last_assistant_text,
+                        "workdir": session.project_path,
+                        "createdAt": session.first_timestamp.unwrap_or(file_modified),
+                        "updatedAt": file_modified
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Read messages from a Claude JSONL file, with limit and system message filtering.
+    /// Returns the last `limit` real conversation messages.
+    pub fn read_claude_jsonl_messages_limited(
+        &self,
+        claude_session_id: &str,
+        limit: usize,
+    ) -> Vec<serde_json::Value> {
+        let claude_projects_dir = match dirs::home_dir() {
+            Some(h) => h.join(".claude").join("projects"),
+            None => return Vec::new(),
+        };
+
+        let path = match self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir) {
+            Some(p) => p,
+            None => {
+                tracing::warn!("Claude JSONL not found for session {}", claude_session_id);
+                return Vec::new();
+            }
+        };
+
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("Failed to read Claude JSONL: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let reader = std::io::BufReader::new(file);
+        let mut all_messages: Vec<serde_json::Value> = Vec::new();
+        let mut pending_tools: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+
+        for line in std::io::BufRead::lines(reader) {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let line = line.trim();
+            if line.is_empty() { continue; }
+
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                let event_type = event.get("type").and_then(|t| t.as_str());
+
+                match event_type {
+                    Some("user") => {
+                        if let Some(msg) = event.get("message") {
+                            let content_val = msg.get("content");
+                            if let Some(text) = content_val.and_then(|c| c.as_str()) {
+                                if !is_system_message(text) {
+                                    all_messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": text
+                                    }));
+                                }
+                            } else if let Some(blocks) = content_val.and_then(|c| c.as_array()) {
+                                for block in blocks {
+                                    match block.get("type").and_then(|t| t.as_str()) {
+                                        Some("tool_result") => {
+                                            let tool_use_id = block.get("tool_use_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let result_content = block.get("content")
+                                                .and_then(|c| c.as_str())
+                                                .unwrap_or("");
+                                            let tool_label = pending_tools.remove(tool_use_id)
+                                                .map(|(name, args)| format!("{}({})", name, args))
+                                                .unwrap_or_else(|| "tool".to_string());
+                                            let display = if result_content.len() > 2000 {
+                                                let cut = result_content.char_indices()
+                                                    .take_while(|(i, _)| *i < 2000)
+                                                    .last()
+                                                    .map(|(i, c)| i + c.len_utf8())
+                                                    .unwrap_or(0);
+                                                format!("> **{}**\n\n{}...\n\n*(result truncated)*", tool_label, &result_content[..cut])
+                                            } else if result_content.is_empty() {
+                                                format!("> **{}**\n\n*(empty result)*", tool_label)
+                                            } else {
+                                                format!("> **{}**\n\n{}", tool_label, result_content)
+                                            };
+                                            all_messages.push(serde_json::json!({
+                                                "role": "tool",
+                                                "content": display
+                                            }));
+                                        }
+                                        Some("text") => {
+                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                if !text.is_empty() && !is_system_message(text) {
+                                                    all_messages.push(serde_json::json!({
+                                                        "role": "user",
+                                                        "content": text
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some("assistant") => {
+                        if let Some(msg) = event.get("message") {
+                            if let Some(content_blocks) = msg.get("content").and_then(|c| c.as_array()) {
+                                for block in content_blocks {
+                                    match block.get("type").and_then(|t| t.as_str()) {
+                                        Some("text") => {
+                                            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                                if !text.is_empty() {
+                                                    all_messages.push(serde_json::json!({
+                                                        "role": "assistant",
+                                                        "content": text
+                                                    }));
+                                                }
+                                            }
+                                        }
+                                        Some("tool_use") => {
+                                            let tool_id = block.get("id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("").to_string();
+                                            let tool_name = block.get("name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown").to_string();
+                                            let input = block.get("input")
+                                                .cloned()
+                                                .unwrap_or(serde_json::json!({}));
+                                            let key_args = crate::acp::agent_event::format_tool_title(&tool_name, &Some(input.clone()));
+                                            pending_tools.insert(tool_id, (tool_name, key_args));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Return last N messages
+        let start = if all_messages.len() > limit { all_messages.len() - limit } else { 0 };
+        all_messages[start..].to_vec()
+    }
+
+    /// Delete a Claude JSONL file by its session ID
+    pub fn delete_claude_jsonl_by_session_id(&self, claude_session_id: &str) -> bool {
+        let claude_projects_dir = match dirs::home_dir() {
+            Some(h) => h.join(".claude").join("projects"),
+            None => return false,
+        };
+
+        if let Some(path) = self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!("Deleted Claude JSONL: {}", path.display());
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to delete Claude JSONL {}: {}", path.display(), e);
+                    false
+                }
+            }
+        } else {
+            tracing::warn!("Claude JSONL not found for deletion: {}", claude_session_id);
+            false
+        }
+    }
+}
+
+/// Discovered Claude CLI session (temporary struct for scanning)
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DiscoveredClaudeSession {
+    claude_session_id: String,
+    project_path: String,
+    first_user_message: Option<String>,
+    last_assistant_text: Option<String>,
+    file_modified: u64,
+    first_timestamp: Option<u64>,
+}
+
+
+/// Parse ISO 8601 timestamp to unix millis
+/// e.g., "2026-03-26T04:37:44.598Z"
+fn parse_iso_timestamp(ts: &str) -> Option<u64> {
+    // Simple parsing: extract date/time components
+    let ts = ts.trim_end_matches('Z').trim_end_matches('z');
+    let parts: Vec<&str> = ts.split(|c: char| c == 'T' || c == ':' || c == '.' || c == '-').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+
+    let year: i32 = parts[0].parse().ok()?;
+    let month: u32 = parts[1].parse().ok()?;
+    let day: u32 = parts[2].parse().ok()?;
+    let hour: u32 = parts[3].parse().ok()?;
+    let minute: u32 = parts[4].parse().ok()?;
+    let second: u32 = parts[5].parse().unwrap_or(0);
+
+    // Calculate unix timestamp manually (days from 1970-01-01)
+    let days = days_from_epoch(year, month, day)?;
+    let secs = (days as u64 * 86400) + (hour as u64 * 3600) + (minute as u64 * 60) + (second as u64);
+    Some(secs * 1000)
+}
+
+/// Calculate days since 1970-01-01
+fn days_from_epoch(year: i32, month: u32, day: u32) -> Option<u64> {
+    if month < 1 || month > 12 || day < 1 || day > 31 {
+        return None;
+    }
+
+    let mut days: i64 = 0;
+    // Years
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    // Months
+    let days_in_months = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += days_in_months[m as usize] as i64;
+        if m == 2 && is_leap_year(year) {
+            days += 1;
+        }
+    }
+    // Days
+    days += day as i64;
+
+    if days < 0 { return None; }
+    Some(days as u64)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Format tool arguments into a short, human-readable summary.
+///
+/// Shows only the most relevant argument(s) for each tool type:
+
+/// Check if a message is a system/meta message that should be hidden from display
+fn is_system_message(text: &str) -> bool {
+    text.contains("<local-command-caveat>")
+        || text.contains("<command-name>")
+        || text.contains("<local-command-stdout>")
+        || text.contains("<local-command-stderr>")
+        || text.contains("This session is being continued from a previous conversation")
 }
