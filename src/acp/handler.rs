@@ -36,17 +36,6 @@ impl AcpHandler {
         }
     }
 
-    /// Create ACP handler with custom agents directory
-    #[allow(dead_code)]
-    pub fn with_agents_dir(agent_manager: Arc<AgentManager>, session_manager: Arc<SessionManager>, agents_dir: std::path::PathBuf) -> Self {
-        Self {
-            agent_manager,
-            session_manager,
-            agents_dir,
-            global_access: crate::config::AccessMode::default(),
-        }
-    }
-
     /// Create ACP handler with global access mode
     pub fn with_access(agent_manager: Arc<AgentManager>, session_manager: Arc<SessionManager>, agents_dir: std::path::PathBuf, global_access: crate::config::AccessMode) -> Self {
         Self {

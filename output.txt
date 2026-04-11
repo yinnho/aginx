@@ -1,2 +1,0 @@
-{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":false,"sse":false},"promptCapabilities":{"audio":false,"embeddedContext":true,"image":true},"sessionCapabilities":{"list":null}},"agentInfo":{"name":"aginx","title":"Aginx ACP Gateway","version":"0.1.0"},"authMethods":[],"protocolVersion":"0.15.0"}}
-{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess_a99d31eb021a416eb5da2c6b2e9192e4"}}
