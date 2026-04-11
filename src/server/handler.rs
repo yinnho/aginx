@@ -3,8 +3,9 @@
 //! This handler implements the ACP (Agent Client Protocol) over TCP.
 //! ACP uses JSON-RPC 2.0 with ndjson (newline-delimited JSON) format.
 //!
-//! CONCURRENT MODEL: `prompt` requests are spawned as independent tasks so
-//! the main loop can continue reading `permissionResponse` without deadlock.
+//! AUTH: Each connection maintains a ConnectionAuth state.
+//! - Pending: only public agents + bindDevice accessible
+//! - Authenticated: full access
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,13 +15,15 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
+use crate::config::AccessMode;
 use crate::agent::{AgentManager, SessionManager};
-use crate::acp::{AcpHandler, AcpRequest, AcpResponse};
+use crate::acp::{AcpHandler, AcpRequest, AcpResponse, ConnectionAuth};
 use crate::acp::agent_event::write_ndjson;
 
 /// Request handler
 pub struct Handler {
     acp_handler: Arc<AcpHandler>,
+    config: Arc<Config>,
 }
 
 impl Handler {
@@ -30,26 +33,33 @@ impl Handler {
         agent_manager: AgentManager,
         session_manager: Arc<SessionManager>,
     ) -> Self {
-        // Get agents directory from config
         let agents_dir = config.agents.get_agents_dir();
         tracing::info!("Agents directory: {}", agents_dir.display());
 
         let agent_manager = Arc::new(agent_manager);
-        // Create ACP handler
-        let acp_handler = Arc::new(AcpHandler::with_agents_dir(
+        let acp_handler = Arc::new(AcpHandler::with_access(
             agent_manager.clone(),
             session_manager.clone(),
-            agents_dir
+            agents_dir,
+            config.server.access.clone(),
         ));
 
         Self {
             acp_handler,
+            config,
         }
     }
 
     /// Handle the connection
     pub async fn handle(self, stream: TcpStream, peer_addr: SocketAddr) -> anyhow::Result<()> {
         tracing::info!("ACP connection from {}", peer_addr);
+
+        // Determine initial auth state based on access mode
+        let mut auth = if matches!(self.config.server.access, AccessMode::Public) {
+            ConnectionAuth::Authenticated
+        } else {
+            ConnectionAuth::Pending
+        };
 
         let (reader, writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -59,7 +69,6 @@ impl Handler {
         loop {
             line.clear();
 
-            // Read a line (ACP request in ndjson format)
             let bytes_read = reader.read_line(&mut line).await?;
             if bytes_read == 0 {
                 tracing::debug!("ACP connection closed by {}", peer_addr);
@@ -73,7 +82,6 @@ impl Handler {
 
             tracing::info!("ACP received from {}: {}", peer_addr, line);
 
-            // Parse ACP request
             let request: AcpRequest = match serde_json::from_str(line) {
                 Ok(req) => req,
                 Err(e) => {
@@ -87,65 +95,67 @@ impl Handler {
             let method = request.method.clone();
 
             if method == "session/prompt" {
-                // SPAWN: run streaming in a separate task so the main loop
-                // can continue reading the next request (e.g. permissionResponse)
+                // SPAWN: run streaming in a separate task
                 let acp_handler = self.acp_handler.clone();
                 let writer = writer.clone();
                 let (tx, rx) = mpsc::channel::<String>(32);
+                let current_auth = auth;
 
-                tracing::info!("[SERVER] Spawning prompt handler task");
                 tokio::spawn(async move {
-                    tracing::info!("[SERVER] Prompt handler task started");
-                    // Notification forwarder: writes streaming notifications + final response to TCP
                     let writer_clone = writer.clone();
                     let notify_task = tokio::spawn(async move {
-                        tracing::info!("[SERVER] Notify task started");
                         let mut rx = rx;
                         while let Some(notification) = rx.recv().await {
-                            tracing::info!("[SERVER] Forwarding notification to TCP");
                             let mut w = writer_clone.lock().await;
                             if let Err(e) = write_ndjson(&mut *w, &notification).await {
                                 tracing::error!("Failed to write notification: {}", e);
                                 break;
                             }
                         }
-                        tracing::info!("[SERVER] Notify task ended");
                     });
 
-                    // Run the streaming prompt (final response is sent through tx channel)
-                    tracing::info!("[SERVER] Calling handle_prompt");
-                    let response = acp_handler.handle_prompt(request, tx).await;
-                    tracing::info!("[SERVER] handle_prompt returned");
+                    let response = acp_handler.handle_prompt(request, tx, current_auth).await;
 
-                    // If response is not streaming (error case), send it directly via TCP
                     if response.result.as_ref().and_then(|r| r.get("streaming")).is_none() {
-                        tracing::warn!("[SERVER] Non-streaming response (error), sending directly");
                         if let Err(e) = send_response(&writer, &response).await {
                             tracing::error!("Failed to send error response: {}", e);
                         }
                     }
 
-                    // Wait for all notifications + final response to be written
                     let _ = notify_task.await;
-                    tracing::info!("[SERVER] All tasks done");
                 });
-
-                // Main loop continues immediately - does NOT wait for prompt to finish
             } else if method == "session/load" || method == "loadSession" {
-                // SPAWN: loadSession spawns Claude CLI which takes time,
-                // must not block the main read loop
                 let acp_handler = self.acp_handler.clone();
                 let writer = writer.clone();
+                let current_auth = auth;
 
                 tokio::spawn(async move {
-                    let response = acp_handler.handle_request(request).await;
+                    let (response, _) = acp_handler.handle_request(request, current_auth).await;
                     if let Err(e) = send_response(&writer, &response).await {
                         tracing::error!("Failed to send loadSession response: {}", e);
                     }
                 });
             } else {
-                // Non-streaming methods: handle synchronously
-                let response = self.acp_handler.handle_request(request).await;
+                let (response, upgrade) = self.acp_handler.handle_request(request, auth).await;
+
+                // Upgrade auth if bindDevice succeeded
+                if upgrade && matches!(auth, ConnectionAuth::Pending) {
+                    tracing::info!("Connection upgraded to Authenticated (device bound)");
+                    auth = ConnectionAuth::Authenticated;
+                }
+
+                // Check if initialize upgraded auth via token
+                if method == "initialize" && matches!(auth, ConnectionAuth::Pending) {
+                    if response.result.as_ref()
+                        .and_then(|r| r.get("authenticated"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        tracing::info!("Connection upgraded to Authenticated (token verified)");
+                        auth = ConnectionAuth::Authenticated;
+                    }
+                }
+
                 send_response(&writer, &response).await?;
             }
         }
@@ -154,7 +164,7 @@ impl Handler {
     }
 }
 
-/// Send ACP response (standalone function, no &self needed)
+/// Send ACP response
 async fn send_response(
     writer: &Arc<tokio::sync::Mutex<BufWriter<tokio::net::tcp::OwnedWriteHalf>>>,
     response: &AcpResponse

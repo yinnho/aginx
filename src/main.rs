@@ -128,6 +128,12 @@ async fn main() -> anyhow::Result<()> {
     // 创建 AgentManager
     let agent_manager = AgentManager::from_config(&config);
 
+    // 启动前检查：至少有一个 agent
+    if !agent_manager.has_agents() {
+        tracing::error!("没有配置任何 agent，无法启动。请在 ~/.aginx/agents/ 目录下添加 aginx.toml 配置文件。");
+        std::process::exit(1);
+    }
+
     // 根据模式启动
     match config.server.mode {
         ServerMode::Direct => {
@@ -356,6 +362,12 @@ async fn run_acp_mode(stdio: bool, default_agent: Option<String>) -> anyhow::Res
 
     // 创建 AgentManager
     let agent_manager = Arc::new(AgentManager::from_config(&config));
+
+    // 启动前检查：至少有一个 agent
+    if !agent_manager.has_agents() {
+        tracing::error!("没有配置任何 agent，无法启动。请在 ~/.aginx/agents/ 目录下添加 aginx.toml 配置文件。");
+        std::process::exit(1);
+    }
 
     // 创建 SessionManager
     let session_config = SessionConfig {

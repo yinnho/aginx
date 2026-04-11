@@ -29,11 +29,11 @@ aginx/                    # 仓库根目录
 │       │   └── tests.rs          # 测试
 │       ├── server/           # TCP 直连服务器
 │       │   ├── tcp.rs            # TCP 监听 + 连接限制
-│       │   └── handler.rs        # 单连接 JSON-RPC 读写循环
+│       │   └── handler.rs        # 单连接 JSON-RPC 读写循环 + 认证状态管理
 │       ├── relay/            # Relay 客户端
 │       │   └── mod.rs            # TCP 连接 relay、注册、心跳、消息转发
-│       ├── binding/          # 设备绑定（配对码）
-│       ├── auth/             # 认证（未实现）
+│       ├── binding/          # 设备绑定（配对码 + token 校验）
+│       ├── auth/             # 认证模块（连接级认证状态管理）
 │       ├── fingerprint/      # 硬件指纹（内存生成，不持久化）
 │       └── bin/
 │           └── relay.rs      # relay-server 独立 binary（未完成）
@@ -76,8 +76,128 @@ aginx/                    # 仓库根目录
 - `discoverAgents` → 扫描 → `registerAgent` → 注册
 
 ### 设备绑定
-- 生成配对码 → App 输入配对码 → `bindDevice` 绑定
-- 命令: `aginx pair` 生成, `aginx devices` 查看
+- 生成配对码 → App 输入配对码 → `bindDevice` 绑定 → 拿到 token
+- 命令: `aginx pair` 生成, `aginx devices` 查看, `aginx unbind` 解绑
+- 绑定数据: `~/.aginx/binding.json`（设备 ID、名称、token、绑定时间）
+- 配对码一次性使用，5 分钟过期，5 次失败后锁定 15 分钟
+
+### 连接认证（借鉴 nginx per-location 权限模型）
+
+#### 设计思路
+
+nginx 的权限不是全局开关，而是 per-location 规则：
+
+```nginx
+server {
+    location /public/ { }           # 公开
+    location /admin/ { auth_basic; } # 需要认证
+}
+```
+
+aginx 借鉴这个思路：**每个 Agent 就是一个 location**，有自己的访问权限。全局有个默认值，每个 Agent 可以覆盖。
+
+#### 三级权限
+
+1. **全局默认**: `server.access`（默认 `private`）
+2. **Agent 覆盖**: `aginx.toml` 中的 `access` 字段，覆盖全局默认
+3. **方法级规则**: 部分方法始终公开（initialize、bindDevice）
+
+```toml
+# ~/.aginx/config.toml — 全局默认
+[server]
+access = "private"          # 所有 agent 默认私有
+
+# ~/.aginx/agents/echo/aginx.toml — 覆盖为公开
+id = "echo"
+access = "public"
+
+# ~/.aginx/agents/claude/aginx.toml — 无 access 字段，继承全局 private
+id = "claude"
+```
+
+效果：
+
+| Agent | access | 未认证连接 | 已认证连接 |
+|-------|--------|-----------|-----------|
+| echo | public | 可用 | 可用 |
+| claude | private | 不可见 | 可用 |
+| my-tool | private | 不可见 | 可用 |
+
+#### 方法级权限
+
+| 方法 | 未认证连接 | 已认证连接 |
+|------|-----------|-----------|
+| `initialize` | 允许（同时完成认证） | 允许 |
+| `bindDevice` | 允许（新设备绑定） | 允许 |
+| `listAgents` | 只返回 public agent | 返回全部 |
+| `session/new` | 只能用 public agent | 全部可用 |
+| `session/prompt` | 只能用 public agent | 全部可用 |
+| `listDirectory` | 拒绝 | 允许 |
+| `readFile` | 拒绝 | 允许 |
+| 其他扩展方法 | 拒绝 | 允许 |
+
+#### 认证流程
+
+```
+客户端 TCP 连接
+    │
+    ├─ initialize 带 authToken → verify_token() → Authenticated
+    │                                          → 无效 token → 断开
+    │
+    └─ initialize 不带 authToken → Pending（受限模式）
+         │
+         ├─ bindDevice → 允许（绑定成功后该连接变为 Authenticated）
+         ├─ listAgents → 只返回 public agent
+         ├─ session/new(public agent) → 允许
+         └─ 其他方法 → 返回 {"error": "Authentication required"}
+```
+
+#### 连接级状态
+
+```rust
+enum ConnectionAuth {
+    Pending,        // 未认证，只能用 public agent + bindDevice
+    Authenticated,  // 已认证，全功能可用
+}
+```
+
+#### initialize 带 token
+
+```json
+{
+  "method": "initialize",
+  "params": {
+    "protocolVersion": "0.1.0",
+    "clientInfo": {"name": "aginx-controller", "version": "1.0"},
+    "_meta": {"authToken": "token-xxxxxxxxxxxx"}
+  }
+}
+```
+
+#### 完整绑定流程
+
+```
+首次绑定:
+  1. 服务端: aginx pair → 输出配对码 "123456"
+  2. App: 连接 aginx → initialize（无 token）→ Pending
+  3. App: bindDevice("123456", "Pixel 9") → 返回 token "token-abc..."
+  4. App: 保存 token 到本地（Room DB）
+  5. 服务端: 保存绑定到 binding.json，该连接变为 Authenticated
+
+后续连接:
+  1. App: 从本地读取 token
+  2. App: 连接 aginx → initialize(authToken="token-abc...") → Authenticated
+  3. 正常使用所有 ACP 方法
+```
+
+#### 安全措施
+
+- **per-agent 权限**: 像 nginx per-location，精细控制每个 Agent 的可见性
+- **token 足够长**: UUID v4 无连字符，32 字符随机
+- **配对码一次性**: 绑定成功后立即删除
+- **暴力破解防护**: 5 次失败后锁定 15 分钟
+- **解绑重置**: `aginx unbind` 清除绑定，需要重新配对
+- **Relay 透明**: Relay 不参与认证，只做数据转发
 
 ## ACP 协议
 
@@ -87,13 +207,15 @@ aginx/                    # 仓库根目录
 
 | 方法 | 方向 | 参数 | 返回 |
 |------|------|------|------|
-| `initialize` | req→resp | `{protocolVersion, clientInfo}` | `{protocolVersion, agentInfo, capabilities}` |
+| `initialize` | req→resp | `{protocolVersion, clientInfo, _meta.authToken?}` | `{protocolVersion, agentInfo, capabilities}` |
 | `session/new` | req→resp | `{cwd?, _meta.agentId?}` | `{sessionId}` |
 | `session/load` | req→resp | `{sessionId}` | `{sessionId, status}` |
 | `session/prompt` | req→stream | `{sessionId, prompt:[{type,text}]}` | `{streaming:true}` + 通知 + 最终响应 |
 | `session/cancel` | req→resp | `{sessionId}` | `{cancelled}` |
 
 注意：`session/prompt` 不走普通 request/response，必须通过流式通道处理。非流式调用会返回错误 "Use streaming endpoint"。
+
+`initialize` 同时承担认证职责：`_meta.authToken` 用于验证设备身份。Private 模式下无 token 的连接只能调用 `bindDevice`。
 
 方法别名：`session/load` = `loadSession`，`getMessages` = `getConversationMessages`
 
@@ -145,7 +267,7 @@ name = "aginx"
 version = "0.1.0"
 port = 86               # 本地监听端口（direct 模式）
 host = "0.0.0.0"
-access = "public"       # public | private
+access = "private"      # public | private（默认 private）
 max_connections = 100
 max_concurrent_sessions = 10
 session_timeout_seconds = 1800
@@ -175,6 +297,7 @@ name = "Claude"
 agent_type = "claude"
 description = "Anthropic coding assistant"
 version = "1.0"
+# access = "private"       # public | private，不设则继承全局默认
 
 [command]
 path = "claude"

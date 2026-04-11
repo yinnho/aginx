@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use crate::config::AccessMode;
 
 /// aginx.toml 配置文件结构
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -19,6 +20,10 @@ pub struct AgentConfig {
     /// 描述
     #[serde(default)]
     pub description: String,
+
+    /// 访问模式: public | private，不设则继承全局默认
+    #[serde(default)]
+    pub access: Option<AccessMode>,
 
     /// 命令配置
     #[serde(default)]
@@ -275,8 +280,10 @@ fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Opt
 }
 
 /// 将 AgentConfig 转换为 AgentInfo（用于注册和自动加载）
-pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path) -> super::manager::AgentInfo {
+pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, global_access: &AccessMode) -> super::manager::AgentInfo {
     use crate::config::AgentType;
+
+    let access = config.access.clone().unwrap_or_else(|| global_access.clone());
 
     let agent_type = match config.agent_type.as_str() {
         "claude" => AgentType::Claude,
@@ -341,6 +348,7 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path) 
         default_allowed_tools: config.permissions.as_ref()
             .map(|p| p.default_allowed.clone())
             .unwrap_or_default(),
+        access,
     }
 }
 

@@ -105,6 +105,10 @@ async fn run_test<S: AsyncRead + AsyncWrite + Unpin>(stream: S, target: String) 
             "clientInfo": {"name": "test-client", "version": "0.1.0"}
         })),
         ("listAgents", serde_json::json!({})),
+        ("session/new", serde_json::json!({
+            "cwd": "/tmp",
+            "_meta": {"agentId": "claude"}
+        })),
     ];
 
     let mut id_counter = 1u64;

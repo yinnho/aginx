@@ -3,6 +3,7 @@
 //! 连接到 relay 服务器，让内网的 aginx 可以对外提供服务
 //! 支持 TLS (通过 nginx stream 终止) 或纯 TCP
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -116,6 +117,10 @@ pub struct RelayClient {
     reconnect_interval: u64,
     /// ACP Handler (统一协议处理)
     acp_handler: Arc<AcpHandler>,
+    /// Per-client 认证状态
+    client_auth: Arc<Mutex<HashMap<String, crate::acp::ConnectionAuth>>>,
+    /// 全局访问模式
+    access: crate::config::AccessMode,
 }
 
 impl RelayClient {
@@ -139,10 +144,11 @@ impl RelayClient {
 
         // 创建 ACP handler (统一协议处理)
         let agents_dir = config.agents.get_agents_dir();
-        let acp_handler = Arc::new(AcpHandler::with_agents_dir(
+        let acp_handler = Arc::new(AcpHandler::with_access(
             agent_manager.clone(),
             session_manager.clone(),
             agents_dir,
+            config.server.access.clone(),
         ));
 
         Self {
@@ -153,6 +159,8 @@ impl RelayClient {
             heartbeat_interval: config.relay.heartbeat_interval,
             reconnect_interval: config.relay.reconnect_interval,
             acp_handler,
+            client_auth: Arc::new(Mutex::new(HashMap::new())),
+            access: config.server.access.clone(),
         }
     }
 
@@ -322,6 +330,8 @@ impl RelayClient {
                                     &client_id,
                                     data,
                                     &self.acp_handler,
+                                    &self.client_auth,
+                                    &self.access,
                                 )
                                 .await
                                 {
@@ -330,6 +340,7 @@ impl RelayClient {
                             }
                             RelayMessage::Disconnected { client_id } => {
                                 tracing::info!("客户端 [{}] 断开连接", client_id);
+                                self.client_auth.lock().await.remove(&client_id);
                             }
                             RelayMessage::Error { message } => {
                                 tracing::error!("Relay 错误: {}", message);
@@ -366,6 +377,8 @@ async fn handle_data_message(
     client_id: &str,
     data: serde_json::Value,
     acp_handler: &Arc<AcpHandler>,
+    client_auth: &Arc<Mutex<HashMap<String, crate::acp::ConnectionAuth>>>,
+    global_access: &crate::config::AccessMode,
 ) -> anyhow::Result<()> {
     // 解析 ACP 请求
     let request: AcpRequest = match serde_json::from_value(data) {
@@ -379,16 +392,25 @@ async fn handle_data_message(
 
     let method = request.method.clone();
 
+    // Get or init auth state for this client
+    let auth = {
+        let mut states = client_auth.lock().await;
+        *states.entry(client_id.to_string()).or_insert_with(|| {
+            if matches!(global_access, crate::config::AccessMode::Public) {
+                crate::acp::ConnectionAuth::Authenticated
+            } else {
+                crate::acp::ConnectionAuth::Pending
+            }
+        })
+    };
+
     if method == "session/prompt" {
-        // SPAWN: run streaming in a separate task so the main message loop
-        // can continue reading the next message (e.g. permissionResponse)
         let acp_handler = acp_handler.clone();
         let writer = writer.clone();
         let client_id = client_id.to_string();
         let (tx, rx) = mpsc::channel::<String>(32);
 
         tokio::spawn(async move {
-            // Notification forwarder: inject clientId and write to relay
             let writer_clone = writer.clone();
             let client_id_clone = client_id.clone();
             let notify_task = tokio::spawn(async move {
@@ -413,19 +435,23 @@ async fn handle_data_message(
                 }
             });
 
-            // Run streaming (final response is sent through tx channel)
-            let _response = acp_handler.handle_prompt(request, tx).await;
+            let _response = acp_handler.handle_prompt(request, tx, auth).await;
 
-            // Wait for all notifications + final response to be written
             let _ = notify_task.await;
-
-            // Don't send _response separately - already sent via tx
         });
-
-        // Return immediately - main loop continues reading next message
     } else {
-        // Non-streaming: handle synchronously
-        let response = acp_handler.handle_request(request).await;
+        let (response, upgrade) = acp_handler.handle_request(request, auth).await;
+
+        // Upgrade auth if needed
+        if upgrade || (method == "initialize" && response.result.as_ref()
+            .and_then(|r| r.get("authenticated"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+        {
+            let mut states = client_auth.lock().await;
+            states.insert(client_id.to_string(), crate::acp::ConnectionAuth::Authenticated);
+        }
+
         send_acp_response(writer, client_id, &response).await?;
     }
 

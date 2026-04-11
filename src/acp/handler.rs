@@ -4,10 +4,11 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use super::types::{AcpRequest, AcpResponse, InitializeParams, InitializeResult, NewSessionParams, LoadSessionParams, PromptParams, ContentBlock};
 use super::streaming::{AsyncStreamingResult, StreamingEvent};
+use super::ConnectionAuth;
 use super::agent_event::{write_ndjson, stop_reason_str, truncate_preview};
 use crate::agent::{AgentManager, SessionManager};
 use crate::binding::{self, BindResult};
@@ -19,10 +20,10 @@ pub struct AcpHandler {
     agent_manager: Arc<AgentManager>,
     /// Session manager for creating/managing sessions
     session_manager: Arc<SessionManager>,
-    /// Initialize result (cached after first initialize)
-    initialized: Mutex<bool>,
     /// Default agents directory for discovery
     agents_dir: std::path::PathBuf,
+    /// Global default access mode (from config)
+    global_access: crate::config::AccessMode,
 }
 
 impl AcpHandler {
@@ -31,18 +32,29 @@ impl AcpHandler {
         Self {
             agent_manager,
             session_manager,
-            initialized: Mutex::new(false),
             agents_dir: crate::config::agents_dir(),
+            global_access: crate::config::AccessMode::default(),
         }
     }
 
     /// Create ACP handler with custom agents directory
+    #[allow(dead_code)]
     pub fn with_agents_dir(agent_manager: Arc<AgentManager>, session_manager: Arc<SessionManager>, agents_dir: std::path::PathBuf) -> Self {
         Self {
             agent_manager,
             session_manager,
-            initialized: Mutex::new(false),
             agents_dir,
+            global_access: crate::config::AccessMode::default(),
+        }
+    }
+
+    /// Create ACP handler with global access mode
+    pub fn with_access(agent_manager: Arc<AgentManager>, session_manager: Arc<SessionManager>, agents_dir: std::path::PathBuf, global_access: crate::config::AccessMode) -> Self {
+        Self {
+            agent_manager,
+            session_manager,
+            agents_dir,
+            global_access,
         }
     }
 
@@ -81,27 +93,67 @@ impl AcpHandler {
     }
 
     /// Handle an ACP request
-    pub async fn handle_request(&self, request: AcpRequest) -> AcpResponse {
-        tracing::info!("ACP request: {} ({:?})", request.method, request.id);
+    pub async fn handle_request(&self, request: AcpRequest, auth: ConnectionAuth) -> (AcpResponse, bool) {
+        tracing::info!("ACP request: {} ({:?}) auth={:?}", request.method, request.id, auth);
 
-        match request.method.as_str() {
-            // 标准 ACP 核心方法
-            "initialize" => self.handle_initialize(request).await,
-            "session/new" => self.handle_new_session(request).await,
-            "session/load" | "loadSession" => self.handle_load_session(request).await,
-            "session/prompt" => {
-                AcpResponse::error(request.id, -32601, "Use streaming endpoint for session/prompt")
+        let method = request.method.clone();
+
+        // Methods always allowed regardless of auth
+        match method.as_str() {
+            "initialize" => return (self.handle_initialize(request).await, false),
+            "bindDevice" => {
+                let resp = self.handle_bind_device(request).await;
+                // Only upgrade auth if binding actually succeeded (result.success == true)
+                let upgrade = resp.result.as_ref()
+                    .and_then(|r| r.get("success"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                return (resp, upgrade);
             }
-            "session/cancel" => self.handle_cancel(request).await,
+            _ => {}
+        }
 
-            // Aginx 扩展方法
+        // For other methods: check auth
+        match method.as_str() {
+            "listAgents" => (self.handle_list_agents(request, auth).await, false),
+            "session/new" => (self.handle_new_session_with_auth(request, auth).await, false),
+            "session/load" | "loadSession" => {
+                if auth == ConnectionAuth::Pending {
+                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
+                } else {
+                    (self.handle_load_session(request).await, false)
+                }
+            }
+            "session/cancel" => {
+                if auth == ConnectionAuth::Pending {
+                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
+                } else {
+                    (self.handle_cancel(request).await, false)
+                }
+            }
+            "session/prompt" => {
+                (AcpResponse::error(request.id, -32601, "Use streaming endpoint for session/prompt"), false)
+            }
+            // All other extension methods require authentication
+            _ => {
+                if auth == ConnectionAuth::Pending {
+                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
+                } else {
+                    (self.handle_request_internal(request).await, false)
+                }
+            }
+        }
+    }
+
+    /// Internal handler for methods that require auth (already checked)
+    async fn handle_request_internal(&self, request: AcpRequest) -> AcpResponse {
+        match request.method.as_str() {
             "listConversations" => self.handle_list_conversations(request).await,
             "deleteConversation" => self.handle_delete_conversation(request).await,
             "getMessages" | "getConversationMessages" => self.handle_get_conversation_messages(request).await,
-            "listAgents" => self.handle_list_agents(request).await,
+            "listAgents" => self.handle_list_agents(request, ConnectionAuth::Authenticated).await,
             "discoverAgents" => self.handle_discover_agents(request).await,
             "registerAgent" => self.handle_register_agent(request).await,
-            "bindDevice" => self.handle_bind_device(request).await,
             "listDirectory" => self.handle_list_directory(request).await,
             "readFile" => self.handle_read_file(request).await,
             "listSessions" => self.handle_list_sessions(request).await,
@@ -130,19 +182,31 @@ impl AcpHandler {
             }
         };
 
-        tracing::info!("ACP initialize from {} v{}", params.clientInfo.name, params.clientInfo.version);
+        // Check authToken from _meta
+        let authenticated = params._meta
+            .as_ref()
+            .and_then(|m| m.get("authToken"))
+            .and_then(|v| v.as_str())
+            .map(|token| {
+                let mgr = crate::binding::get_binding_manager();
+                let mgr = mgr.lock().unwrap();
+                mgr.verify_token(token).is_some()
+            })
+            .unwrap_or(false);
 
-        // Mark as initialized
-        {
-            let mut init = self.initialized.lock().await;
-            *init = true;
+        if authenticated {
+            tracing::info!("ACP initialize from {} v{} (authenticated)", params.clientInfo.name, params.clientInfo.version);
+        } else {
+            tracing::info!("ACP initialize from {} v{} (unauthenticated)", params.clientInfo.name, params.clientInfo.version);
         }
 
-        AcpResponse::success(request.id, InitializeResult::new())
+        let mut result = InitializeResult::new();
+        result.authenticated = authenticated;
+        AcpResponse::success(request.id, result)
     }
 
     /// Handle newSession request
-    async fn handle_new_session(&self, request: AcpRequest) -> AcpResponse {
+    async fn handle_new_session(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
         let params: NewSessionParams = match &request.params {
             Some(p) => match serde_json::from_value(p.clone()) {
                 Ok(params) => params,
@@ -167,15 +231,22 @@ impl AcpHandler {
                     .map(String::from)
             });
 
-        // 如果没有指定 agentId，使用第一个可用的 agent
+        // 如果没有指定 agentId，使用第一个可用的 agent（按 auth 过滤）
         let agent_id = match agent_id {
             Some(id) => id,
             None => {
                 let agents = self.agent_manager.list_agents().await;
-                if agents.is_empty() {
+                let filtered: Vec<_> = if auth == ConnectionAuth::Authenticated {
+                    agents
+                } else {
+                    agents.into_iter().filter(|a| {
+                        a.get("access").and_then(|v| v.as_str()) == Some("public")
+                    }).collect()
+                };
+                if filtered.is_empty() {
                     return AcpResponse::error(request.id, -32602, "No agent configured");
                 }
-                agents[0].get("id").and_then(|v| v.as_str())
+                filtered[0].get("id").and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| "unknown".to_string())
             }
@@ -274,6 +345,7 @@ impl AcpHandler {
         &self,
         request: AcpRequest,
         tx: mpsc::Sender<String>,
+        auth: ConnectionAuth,
     ) -> AcpResponse {
         let params: PromptParams = match &request.params {
             Some(p) => match serde_json::from_value(p.clone()) {
@@ -286,6 +358,15 @@ impl AcpHandler {
                 return AcpResponse::error(request.id, -32602, "Missing params");
             }
         };
+
+        // Check if session's agent is accessible
+        if auth == ConnectionAuth::Pending {
+            if let Some(agent_id) = self.get_session_agent_id(&params.sessionId).await {
+                if !self.is_agent_public(&agent_id).await {
+                    return AcpResponse::error(request.id, 401, "Authentication required for this agent");
+                }
+            }
+        }
 
         // Extract text from prompt blocks
         let message: String = params.prompt.iter()
@@ -671,13 +752,85 @@ impl AcpHandler {
     }
 
     /// Handle listAgents request
-    async fn handle_list_agents(&self, request: AcpRequest) -> AcpResponse {
+    async fn handle_list_agents(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
         let agents = self.agent_manager.list_agents().await;
 
+        let filtered: Vec<serde_json::Value> = if auth == ConnectionAuth::Authenticated {
+            agents
+        } else {
+            // Pending: only show public agents
+            agents.into_iter().filter(|a| {
+                a.get("access").and_then(|v| v.as_str()) == Some("public")
+            }).collect()
+        };
+
         AcpResponse::success(request.id, serde_json::json!({
-            "agents": agents,
+            "agents": filtered,
             "nextCursor": null
         }))
+    }
+
+    /// Check if an agent is public
+    async fn is_agent_public(&self, agent_id: &str) -> bool {
+        let agent = self.agent_manager.get_agent_info(agent_id).await;
+        match agent {
+            Some(info) => matches!(info.access, crate::config::AccessMode::Public),
+            None => false,
+        }
+    }
+
+    /// Get the agent ID associated with a session
+    async fn get_session_agent_id(&self, session_id: &str) -> Option<String> {
+        self.session_manager.get_session_info(session_id).await
+            .map(|s| s.agent_id.clone())
+    }
+
+    /// Handle new session with auth check
+    async fn handle_new_session_with_auth(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
+        let params: NewSessionParams = match &request.params {
+            Some(p) => match serde_json::from_value(p.clone()) {
+                Ok(params) => params,
+                Err(e) => {
+                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
+                }
+            }
+            None => NewSessionParams::default()
+        };
+
+        // Get agent ID
+        let agent_id = params._meta
+            .as_ref()
+            .and_then(|m| m.get("agentId"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                request.params.as_ref()
+                    .and_then(|p| p.get("agentId"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
+
+        // Check agent access
+        match agent_id {
+            Some(ref aid) => {
+                if auth == ConnectionAuth::Pending && !self.is_agent_public(aid).await {
+                    return AcpResponse::error(request.id, 401, "Authentication required for this agent");
+                }
+            }
+            None => {
+                // No agent specified — Pending users can only use this if there's a public agent to fall back to
+                if auth == ConnectionAuth::Pending {
+                    let agents = self.agent_manager.list_agents().await;
+                    let has_public = agents.iter().any(|a| a.get("access").and_then(|v| v.as_str()) == Some("public"));
+                    if !has_public {
+                        return AcpResponse::error(request.id, 401, "Authentication required");
+                    }
+                }
+            }
+        }
+
+        // Delegate to existing handler — reconstruct request since we consumed params
+        self.handle_new_session(request, auth).await
     }
 
     /// Handle listConversations request - list persisted sessions for an agent
@@ -844,7 +997,7 @@ impl AcpHandler {
         let project_dir = path.parent().unwrap_or(&path).to_path_buf();
 
         let agent_info = match parse_aginx_toml(&path, &project_dir) {
-            Ok(discovered) => agent_config_to_info(discovered.config, &project_dir),
+            Ok(discovered) => agent_config_to_info(discovered.config, &project_dir, &self.global_access),
             Err(e) => {
                 return AcpResponse::error(request.id, -32602, &format!("Failed to parse config: {}", e));
             }
@@ -1142,7 +1295,7 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
                         });
 
                         // Run streaming (final response is sent through tx channel)
-                        let _response = handler_clone.handle_prompt(request, tx).await;
+                        let _response = handler_clone.handle_prompt(request, tx, ConnectionAuth::Authenticated).await;
 
                         // Wait for all notifications + final response to be written
                         let _ = notify_task.await;
@@ -1153,7 +1306,7 @@ pub async fn run_acp_stdio(agent_manager: Arc<AgentManager>, session_manager: Ar
                     // Main loop continues immediately
                 } else {
                     // Non-streaming methods
-                    let response = handler.handle_request(request).await;
+                    let (response, _) = handler.handle_request(request, ConnectionAuth::Authenticated).await;
 
                     // Send response
                     if let Ok(json) = response.to_ndjson() {

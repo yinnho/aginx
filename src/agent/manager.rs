@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::config::{AgentEntry, AgentType, Config};
+use crate::config::{AccessMode, AgentEntry, AgentType, Config};
 
 /// Agent Manager
 #[derive(Clone)]
@@ -34,6 +34,8 @@ pub struct AgentInfo {
     pub session_args: Vec<String>,
     /// 默认允许的工具列表 (用于 --permission-mode dontAsk --allowedTools)
     pub default_allowed_tools: Vec<String>,
+    /// 访问模式: public | private
+    pub access: AccessMode,
 }
 
 impl From<AgentEntry> for AgentInfo {
@@ -51,6 +53,7 @@ impl From<AgentEntry> for AgentInfo {
             env_remove: config.env_remove,
             session_args: config.session_args,
             default_allowed_tools: Vec::new(),
+            access: AccessMode::default(),
         }
     }
 }
@@ -58,11 +61,16 @@ impl From<AgentEntry> for AgentInfo {
 impl AgentManager {
     /// Create agent manager from config
     pub fn from_config(config: &Config) -> Self {
+        let global_access = config.server.access.clone();
         let mut agents: HashMap<String, AgentInfo> = config
             .agents
             .list
             .iter()
-            .map(|ac| (ac.id.clone(), AgentInfo::from(ac.clone())))
+            .map(|ac| {
+                let mut info = AgentInfo::from(ac.clone());
+                info.access = global_access.clone();
+                (ac.id.clone(), info)
+            })
             .collect();
 
         // 自动扫描 ~/.aginx/agents/ 目录，加载 aginx.toml 配置的 agent
@@ -79,6 +87,7 @@ impl AgentManager {
                     let info = super::discovery::agent_config_to_info(
                         agent.config,
                         &agent.project_dir,
+                        &global_access,
                     );
 
                     tracing::info!("自动加载 agent: {} ({})", info.id, info.name);
@@ -114,7 +123,11 @@ impl AgentManager {
                     },
                     "capabilities": a.capabilities,
                     "require_workdir": a.require_workdir,
-                    "working_dir": a.working_dir
+                    "working_dir": a.working_dir,
+                    "access": match a.access {
+                        AccessMode::Public => "public",
+                        AccessMode::Private => "private",
+                    }
                 })
             })
             .collect()
@@ -131,5 +144,14 @@ impl AgentManager {
         let mut agents = self.agents.write().await;
         tracing::info!("注册 agent: {} ({})", info.id, info.name);
         agents.insert(info.id.clone(), info);
+    }
+
+    /// Check if any agent is loaded (sync, for startup validation)
+    pub fn has_agents(&self) -> bool {
+        // Use try_read to avoid blocking — we just created it so no write locks exist
+        match self.agents.try_read() {
+            Ok(agents) => !agents.is_empty(),
+            Err(_) => true, // if locked, assume agents exist
+        }
     }
 }

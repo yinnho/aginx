@@ -42,6 +42,8 @@ pub struct InitializeParams {
     pub clientCapabilities: ClientCapabilities,
     #[serde(default)]
     pub clientInfo: ClientInfo,
+    #[serde(default)]
+    pub _meta: Option<serde_json::Value>,
 }
 
 /// Client capabilities
@@ -181,6 +183,8 @@ pub struct InitializeResult {
     pub agentInfo: AcpAgentInfo,
     #[serde(default)]
     pub authMethods: Vec<AuthMethod>,
+    #[serde(default)]
+    pub authenticated: bool,
 }
 
 /// Agent capabilities
@@ -436,6 +440,7 @@ impl InitializeResult {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             },
             authMethods: vec![],
+            authenticated: false,
         }
     }
 }

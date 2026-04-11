@@ -5,7 +5,6 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::collections::HashMap;
 
     use super::super::*;
     use crate::agent::{AgentManager, SessionManager, SessionConfig};
@@ -35,7 +34,7 @@ mod tests {
             })),
         };
 
-        let response = handler.handle_request(request).await;
+        let (response, _) = handler.handle_request(request, crate::acp::ConnectionAuth::Authenticated).await;
 
         assert!(response.error.is_none(), "初始化不应该出错");
         assert!(response.result.is_some(), "应该有结果");
@@ -67,7 +66,7 @@ mod tests {
             })),
         };
 
-        let response = handler.handle_request(request).await;
+        let (response, _) = handler.handle_request(request, crate::acp::ConnectionAuth::Authenticated).await;
 
         // newSession may fail if no suitable agent is configured, that's OK
         // Just verify the handler processes the request without panic

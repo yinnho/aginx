@@ -18,6 +18,20 @@ const PAIR_CODE_LENGTH: usize = 6;
 /// 最大失败尝试次数
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 
+/// Constant-time string comparison to prevent timing attacks.
+/// Returns true if both strings are equal.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut result = if a_bytes.len() == b_bytes.len() { 0u8 } else { 0xFF };
+
+    // XOR all byte pairs (shorter iter ends first, rest of longer is ignored)
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 /// 失败尝试锁定时间（15分钟）
 const FAILED_ATTEMPTS_LOCKOUT_SECS: i64 = 900;
 
@@ -176,9 +190,8 @@ impl BindingManager {
         let content = fs::read_to_string(path).ok()?;
         let data: PairCodeData = serde_json::from_str(&content).ok()?;
 
-        // 验证配对码是否匹配
-        if data.code != code {
-            tracing::warn!("配对码不匹配: 输入={}, 存储={}", code, data.code);
+        // 验证配对码是否匹配 (constant-time)
+        if !constant_time_eq(&data.code, code) {
             return None;
         }
 
@@ -357,9 +370,9 @@ impl BindingManager {
         tracing::info!("所有设备已解绑");
     }
 
-    /// 验证 Token
+    /// 验证 Token (constant-time comparison)
     pub fn verify_token(&self, token: &str) -> Option<&DeviceInfo> {
-        self.bound_device.as_ref().filter(|d| d.token == token)
+        self.bound_device.as_ref().filter(|d| constant_time_eq(&d.token, token))
     }
 
     #[allow(dead_code)]
