@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use super::manager::AgentInfo;
 use crate::acp::agent_process::AcpAgentProcess;
-use crate::config::AgentType;
 
 /// 会话消息
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -109,7 +108,7 @@ pub struct SessionMetadata {
     /// 最后一条消息摘要
     pub last_message: Option<String>,
     /// Claude 返回的 session_id (用于 --resume)
-    pub claude_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
     /// 创建时间 (unix millis)
     pub created_at: u64,
     /// 更新时间 (unix millis)
@@ -124,7 +123,7 @@ pub struct SessionInfo {
     /// 工作目录
     pub workdir: Option<String>,
     /// Claude 返回的 session_id (用于 --resume)
-    pub claude_session_id: Option<String>,
+    pub agent_session_id: Option<String>,
 }
 
 /// 会话配置
@@ -152,7 +151,7 @@ pub struct Session {
     /// Agent ID
     pub agent_id: String,
     /// Claude 返回的 session_id (用于 --resume)
-    claude_session_id: Mutex<Option<String>>,
+    agent_session_id: Mutex<Option<String>>,
     /// 工作目录
     workdir: Option<String>,
     /// 最后活动时间
@@ -177,14 +176,14 @@ impl Session {
     pub fn new(agent_info: &AgentInfo, workdir: Option<&str>, permit: OwnedSemaphorePermit) -> Result<Self, String> {
         let session_id = format!("sess_{}", Uuid::new_v4().simple());
 
-        match agent_info.agent_type {
-            AgentType::Claude | AgentType::Process => {
-                tracing::info!("会话 [{}] 创建成功，Agent: {}, Type: {:?}",
+        match agent_info.agent_type.as_str() {
+            _ => {
+                tracing::info!("会话 [{}] 创建成功，Agent: {}, Type: {}",
                     session_id, agent_info.id, agent_info.agent_type);
                 Ok(Self {
                     id: session_id,
                     agent_id: agent_info.id.clone(),
-                    claude_session_id: Mutex::new(None),
+                    agent_session_id: Mutex::new(None),
                     workdir: workdir.map(|s| s.to_string()),
                     last_activity: Mutex::new(Instant::now()),
                     permit,
@@ -353,12 +352,12 @@ impl SessionManager {
         }
     }
 
-    /// 更新会话元数据（最后消息、claude_session_id 等）
+    /// 更新会话元数据（最后消息、agent_session_id 等）
     pub fn update_persisted_metadata(
         &self,
         session_id: &str,
         agent_id: &str,
-        claude_session_id: Option<&str>,
+        agent_session_id: Option<&str>,
         last_message: Option<&str>,
     ) {
         let dir = self.sessions_dir(agent_id);
@@ -370,8 +369,8 @@ impl SessionManager {
 
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&content) {
-                if let Some(sid) = claude_session_id {
-                    metadata.claude_session_id = Some(sid.to_string());
+                if let Some(sid) = agent_session_id {
+                    metadata.agent_session_id = Some(sid.to_string());
                 }
                 if let Some(msg) = last_message {
                     metadata.last_message = Some(msg.to_string());
@@ -426,7 +425,7 @@ impl SessionManager {
             session_id: session_id.clone(),
             agent_id: agent_info.id.clone(),
             workdir: workdir.map(|s| s.to_string()),
-            claude_session_id: None,
+            agent_session_id: None,
             title: workdir.map(|s| s.to_string()),
             last_message: None,
             created_at: now,
@@ -437,12 +436,17 @@ impl SessionManager {
         Ok(session_id)
     }
 
-    /// Find the working directory for a Claude session by scanning its JSONL file
-    pub fn find_workdir_for_claude_session(&self, claude_session_id: &str) -> Option<String> {
-        let claude_projects_dir = dirs::home_dir()
-            .map(|h| h.join(".claude").join("projects"))?;
+    /// Find the working directory for a session by scanning its JSONL file
+    pub fn find_workdir_for_session(&self, agent_session_id: &str, storage_path: Option<&str>) -> Option<String> {
+        let storage_dir = match storage_path {
+            Some(path) => {
+                let expanded = shellexpand::tilde(path).to_string();
+                std::path::PathBuf::from(expanded)
+            }
+            None => return None,
+        };
 
-        let path = self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir)?;
+        let path = self.find_jsonl_path(agent_session_id, &storage_dir)?;
         let file = std::fs::File::open(&path).ok()?;
         let reader = std::io::BufReader::new(file);
 
@@ -467,9 +471,9 @@ impl SessionManager {
     }
 
     /// Create a session using the Claude session ID directly (for --resume support)
-    pub async fn create_session_with_claude_id(
+    pub async fn create_session_with_agent_id(
         &self,
-        claude_session_id: &str,
+        agent_session_id: &str,
         agent_info: &AgentInfo,
         workdir: Option<&str>,
     ) -> Result<String, String> {
@@ -481,21 +485,21 @@ impl SessionManager {
             .map_err(|_| "Semaphore closed")?;
 
         let mut session = Session::new(agent_info, workdir, permit)?;
-        session.id = claude_session_id.to_string();
+        session.id = agent_session_id.to_string();
 
         // Store claude session ID for --resume
         {
-            let mut sid = session.claude_session_id.lock().await;
-            *sid = Some(claude_session_id.to_string());
+            let mut sid = session.agent_session_id.lock().await;
+            *sid = Some(agent_session_id.to_string());
         }
 
         {
             let mut sessions = self.sessions.lock().await;
-            sessions.insert(claude_session_id.to_string(), session);
+            sessions.insert(agent_session_id.to_string(), session);
         }
 
-        tracing::info!("Session created with claude ID: {} (will use --resume)", claude_session_id);
-        Ok(claude_session_id.to_string())
+        tracing::info!("Session created with claude ID: {} (will use --resume)", agent_session_id);
+        Ok(agent_session_id.to_string())
     }
 
     /// 关闭会话
@@ -526,11 +530,11 @@ impl SessionManager {
     pub async fn get_session_info(&self, session_id: &str) -> Option<SessionInfo> {
         let sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(session_id) {
-            let claude_session_id = s.claude_session_id.lock().await.clone();
+            let agent_session_id = s.agent_session_id.lock().await.clone();
             Some(SessionInfo {
                 agent_id: s.agent_id.clone(),
                 workdir: s.workdir.clone(),
-                claude_session_id,
+                agent_session_id,
             })
         } else {
             None
@@ -547,12 +551,12 @@ impl SessionManager {
     }
 
     /// 更新 Claude session_id (用于 --resume)
-    pub async fn update_claude_session_id(&self, session_id: &str, claude_session_id: &str) -> Result<(), String> {
+    pub async fn update_agent_session_id(&self, session_id: &str, agent_session_id: &str) -> Result<(), String> {
         let sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
-            let mut sid = session.claude_session_id.lock().await;
-            *sid = Some(claude_session_id.to_string());
-            tracing::info!("Updated claude_session_id for session {}: {}", session_id, claude_session_id);
+            let mut sid = session.agent_session_id.lock().await;
+            *sid = Some(agent_session_id.to_string());
+            tracing::info!("Updated agent_session_id for session {}: {}", session_id, agent_session_id);
             Ok(())
         } else {
             Err(format!("Session {} not found", session_id))
@@ -638,12 +642,12 @@ impl SessionManager {
     // ========== Direct Claude Session Scanning (no aginx metadata) ==========
 
     /// Find the JSONL file path in a Claude session by searching project directories
-    fn find_claude_jsonl_path(
+    fn find_jsonl_path(
         &self,
-        claude_session_id: &str,
+        agent_session_id: &str,
         claude_projects_dir: &std::path::Path,
     ) -> Option<PathBuf> {
-        let filename = format!("{}.jsonl", claude_session_id);
+        let filename = format!("{}.jsonl", agent_session_id);
 
         if let Ok(entries) = std::fs::read_dir(claude_projects_dir) {
             for entry in entries.flatten() {
@@ -663,8 +667,8 @@ impl SessionManager {
     fn parse_jsonl_metadata(
         &self,
         path: &std::path::Path,
-        claude_session_id: &str,
-    ) -> Option<DiscoveredClaudeSession> {
+        agent_session_id: &str,
+    ) -> Option<DiscoveredSession> {
         let file = std::fs::File::open(path).ok()?;
         let reader = std::io::BufReader::new(file);
 
@@ -753,8 +757,8 @@ impl SessionManager {
 
         let project_path = cwd.unwrap_or_default();
 
-        Some(DiscoveredClaudeSession {
-            claude_session_id: claude_session_id.to_string(),
+        Some(DiscoveredSession {
+            agent_session_id: agent_session_id.to_string(),
             project_path,
             first_user_message,
             last_assistant_text,
@@ -767,23 +771,21 @@ impl SessionManager {
 
     /// Directly scan Claude CLI JSONL sessions, returning data straight from the source.
     /// No aginx metadata layer involved. sessionId IS the Claude session ID.
-    pub fn scan_claude_sessions_direct(&self) -> Vec<serde_json::Value> {
-        let claude_projects_dir = match dirs::home_dir() {
-            Some(h) => h.join(".claude").join("projects"),
-            None => return Vec::new(),
-        };
+    pub fn scan_external_sessions(&self, storage_path: &str, agent_id: &str) -> Vec<serde_json::Value> {
+        let storage_dir = shellexpand::tilde(storage_path).to_string();
+        let storage_dir = std::path::Path::new(&storage_dir);
 
-        if !claude_projects_dir.exists() {
+        if !storage_dir.exists() {
             return Vec::new();
         }
 
         let mut sessions: Vec<serde_json::Value> = Vec::new();
 
-        if let Ok(entries) = std::fs::read_dir(&claude_projects_dir) {
+        if let Ok(entries) = std::fs::read_dir(storage_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    self.scan_project_dir_direct(&path, &mut sessions);
+                    self.scan_project_dir_direct(&path, &mut sessions, agent_id);
                 }
             }
         }
@@ -794,7 +796,7 @@ impl SessionManager {
                 .cmp(&a.get("updatedAt").and_then(|v| v.as_u64()).unwrap_or(0))
         });
 
-        tracing::info!("Direct scanned {} Claude CLI sessions", sessions.len());
+        tracing::info!("Direct scanned {} sessions from {}", sessions.len(), storage_path);
         sessions
     }
 
@@ -803,6 +805,7 @@ impl SessionManager {
         &self,
         dir: &std::path::Path,
         results: &mut Vec<serde_json::Value>,
+        agent_id: &str,
     ) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -815,12 +818,12 @@ impl SessionManager {
                     continue;
                 }
 
-                let claude_session_id = match path.file_stem().and_then(|s| s.to_str()) {
+                let agent_session_id = match path.file_stem().and_then(|s| s.to_str()) {
                     Some(id) => id.to_string(),
                     None => continue,
                 };
 
-                if let Some(session) = self.parse_jsonl_metadata(&path, &claude_session_id) {
+                if let Some(session) = self.parse_jsonl_metadata(&path, &agent_session_id) {
                     let file_modified = std::fs::metadata(&path)
                         .and_then(|m| m.modified())
                         .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
@@ -831,8 +834,8 @@ impl SessionManager {
                     });
 
                     results.push(serde_json::json!({
-                        "sessionId": claude_session_id,
-                        "agentId": "claude",
+                        "sessionId": agent_session_id,
+                        "agentId": agent_id,
                         "title": title,
                         "lastMessage": session.last_assistant_text,
                         "workdir": session.project_path,
@@ -846,20 +849,24 @@ impl SessionManager {
 
     /// Read messages from a Claude JSONL file, with limit and system message filtering.
     /// Returns the last `limit` real conversation messages.
-    pub fn read_claude_jsonl_messages_limited(
+    pub fn read_jsonl_messages_limited(
         &self,
-        claude_session_id: &str,
+        agent_session_id: &str,
         limit: usize,
+        storage_path: Option<&str>,
     ) -> Vec<serde_json::Value> {
-        let claude_projects_dir = match dirs::home_dir() {
-            Some(h) => h.join(".claude").join("projects"),
+        let storage_dir = match storage_path {
+            Some(path) => {
+                let expanded = shellexpand::tilde(path).to_string();
+                std::path::PathBuf::from(expanded)
+            }
             None => return Vec::new(),
         };
 
-        let path = match self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir) {
+        let path = match self.find_jsonl_path(agent_session_id, &storage_dir) {
             Some(p) => p,
             None => {
-                tracing::warn!("Claude JSONL not found for session {}", claude_session_id);
+                tracing::warn!("Claude JSONL not found for session {}", agent_session_id);
                 return Vec::new();
             }
         };
@@ -988,26 +995,29 @@ impl SessionManager {
         all_messages[start..].to_vec()
     }
 
-    /// Delete a Claude JSONL file by its session ID
-    pub fn delete_claude_jsonl_by_session_id(&self, claude_session_id: &str) -> bool {
-        let claude_projects_dir = match dirs::home_dir() {
-            Some(h) => h.join(".claude").join("projects"),
+    /// Delete a JSONL file by its session ID
+    pub fn delete_jsonl_by_session_id(&self, agent_session_id: &str, storage_path: Option<&str>) -> bool {
+        let storage_dir = match storage_path {
+            Some(path) => {
+                let expanded = shellexpand::tilde(path).to_string();
+                std::path::PathBuf::from(expanded)
+            }
             None => return false,
         };
 
-        if let Some(path) = self.find_claude_jsonl_path(claude_session_id, &claude_projects_dir) {
+        if let Some(path) = self.find_jsonl_path(agent_session_id, &storage_dir) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
-                    tracing::info!("Deleted Claude JSONL: {}", path.display());
+                    tracing::info!("Deleted session file: {}", path.display());
                     true
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to delete Claude JSONL {}: {}", path.display(), e);
+                    tracing::warn!("Failed to delete session file {}: {}", path.display(), e);
                     false
                 }
             }
         } else {
-            tracing::warn!("Claude JSONL not found for deletion: {}", claude_session_id);
+            tracing::warn!("Session file not found for deletion: {}", agent_session_id);
             false
         }
     }
@@ -1016,8 +1026,8 @@ impl SessionManager {
 /// Discovered Claude CLI session (temporary struct for scanning)
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-struct DiscoveredClaudeSession {
-    claude_session_id: String,
+struct DiscoveredSession {
+    agent_session_id: String,
     project_path: String,
     first_user_message: Option<String>,
     last_assistant_text: Option<String>,

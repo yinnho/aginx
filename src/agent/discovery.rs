@@ -45,6 +45,12 @@ pub struct AgentConfig {
     /// 权限配置
     #[serde(default)]
     pub permissions: Option<PermissionsConfig>,
+
+    /// Agent 通信协议: "acp" (默认) | "claude-stream"
+    /// acp: agent 原生说 ACP，aginx 透传
+    /// claude-stream: Claude CLI 专用 stream-json 协议，aginx adapter 翻译
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -70,6 +76,11 @@ pub struct SessionConfig {
 
     /// 会话恢复配置
     pub resume: Option<SessionResumeConfig>,
+
+    /// 会话存储路径（Agent 自己的会话文件目录，如 ~/.claude/projects）
+    /// 配置此项后，listConversations/getMessages/delete 会从该目录读取
+    #[serde(default)]
+    pub storage_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,56 +258,46 @@ fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Opt
             (true, None)
         }
     } else {
-        // 没有检测配置，根据 agent_type 检测默认命令
-        match config.agent_type.as_str() {
-            "claude" => {
-                // 检查 claude 命令是否可用
-                if which::which("claude").is_ok() {
+        // 没有检测配置，用 agent_type 作为命令名检测
+        let cmd = config.agent_type.as_str();
+        if !cmd.is_empty() && cmd != "process" && cmd != "builtin" {
+            if which::which(cmd).is_ok() {
+                (true, None)
+            } else {
+                (false, Some(format!("{} command not found in PATH", cmd)))
+            }
+        } else if let Some(ref cmd_config) = config.command {
+            if let Some(ref path) = cmd_config.path {
+                if Path::new(path).exists() || which::which(path).is_ok() {
                     (true, None)
                 } else {
-                    (false, Some("claude command not found in PATH".to_string()))
+                    (false, Some(format!("Command not found: {}", path)))
                 }
+            } else {
+                (false, Some("Missing command.path".to_string()))
             }
-            "process" => {
-                // 需要配置 command.path
-                if let Some(ref cmd_config) = config.command {
-                    if let Some(ref path) = cmd_config.path {
-                        if Path::new(path).exists() || which::which(path).is_ok() {
-                            (true, None)
-                        } else {
-                            (false, Some(format!("Command not found: {}", path)))
-                        }
-                    } else {
-                        (false, Some("Missing command.path for process agent".to_string()))
-                    }
-                } else {
-                    (false, Some("Missing command config for process agent".to_string()))
-                }
-            }
-            "builtin" => (false, Some("builtin type is no longer supported, use process or claude".to_string())),
-            _ => (true, None),
+        } else {
+            (false, Some("No command configured".to_string()))
         }
     }
 }
 
 /// 将 AgentConfig 转换为 AgentInfo（用于注册和自动加载）
 pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, global_access: &AccessMode) -> super::manager::AgentInfo {
-    use crate::config::AgentType;
-
     let access = config.access.clone().unwrap_or_else(|| global_access.clone());
 
-    let agent_type = match config.agent_type.as_str() {
-        "claude" => AgentType::Claude,
-        _ => AgentType::Process,
-    };
+    let agent_type = config.agent_type.clone();
+    let agent_type_for_protocol = agent_type.clone();
 
     let command = config.command
         .as_ref()
         .and_then(|c| c.path.clone())
         .unwrap_or_else(|| {
-            match agent_type {
-                AgentType::Claude => "claude".to_string(),
-                _ => String::new(),
+            // 未配置 command.path 时，用 agent_type 作为命令名
+            if agent_type.is_empty() || agent_type == "process" {
+                String::new()
+            } else {
+                agent_type.clone()
             }
         });
 
@@ -349,6 +350,16 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
             .map(|p| p.default_allowed.clone())
             .unwrap_or_default(),
         access,
+        storage_path: config.session.as_ref()
+            .and_then(|s| s.storage_path.clone()),
+        protocol: config.protocol.unwrap_or_else(|| {
+            // 向后兼容：未显式配置 protocol 时，claude agent 默认用 claude-stream
+            if agent_type_for_protocol == "claude" {
+                "claude-stream".to_string()
+            } else {
+                "acp".to_string()
+            }
+        }),
     }
 }
 

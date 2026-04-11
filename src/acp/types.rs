@@ -89,6 +89,8 @@ pub struct NewSessionParams {
 pub struct LoadSessionParams {
     pub sessionId: String,
     #[serde(default)]
+    pub agentId: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub mcpServers: Vec<McpServer>,

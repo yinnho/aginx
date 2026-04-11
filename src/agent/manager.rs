@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::config::{AccessMode, AgentEntry, AgentType, Config};
+use crate::config::{AccessMode, AgentEntry, Config};
 
 /// Agent Manager
 #[derive(Clone)]
@@ -22,7 +22,7 @@ pub struct AgentInfo {
     pub id: String,
     pub name: String,
     pub capabilities: Vec<String>,
-    pub agent_type: AgentType,
+    pub agent_type: String,
     pub command: String,
     pub args: Vec<String>,
     pub working_dir: Option<String>,
@@ -36,6 +36,10 @@ pub struct AgentInfo {
     pub default_allowed_tools: Vec<String>,
     /// 访问模式: public | private
     pub access: AccessMode,
+    /// 会话存储路径（Agent 自己的会话文件目录）
+    pub storage_path: Option<String>,
+    /// 通信协议: "acp" | "claude-stream"
+    pub protocol: String,
 }
 
 impl From<AgentEntry> for AgentInfo {
@@ -54,6 +58,8 @@ impl From<AgentEntry> for AgentInfo {
             session_args: config.session_args,
             default_allowed_tools: Vec::new(),
             access: AccessMode::default(),
+            storage_path: None,
+            protocol: "acp".to_string(),
         }
     }
 }
@@ -117,10 +123,7 @@ impl AgentManager {
                 serde_json::json!({
                     "id": a.id,
                     "name": a.name,
-                    "agent_type": match a.agent_type {
-                        AgentType::Claude => "claude",
-                        AgentType::Process => "process",
-                    },
+                    "agent_type": a.agent_type,
                     "capabilities": a.capabilities,
                     "require_workdir": a.require_workdir,
                     "working_dir": a.working_dir,

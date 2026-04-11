@@ -12,7 +12,6 @@ use super::ConnectionAuth;
 use super::agent_event::{write_ndjson, stop_reason_str, truncate_preview};
 use crate::agent::{AgentManager, SessionManager};
 use crate::binding::{self, BindResult};
-use crate::config::AgentType;
 
 /// ACP Handler that processes ACP protocol messages
 pub struct AcpHandler {
@@ -154,8 +153,6 @@ impl AcpHandler {
             "listAgents" => self.handle_list_agents(request, ConnectionAuth::Authenticated).await,
             "discoverAgents" => self.handle_discover_agents(request).await,
             "registerAgent" => self.handle_register_agent(request).await,
-            "listDirectory" => self.handle_list_directory(request).await,
-            "readFile" => self.handle_read_file(request).await,
             "listSessions" => self.handle_list_sessions(request).await,
             _ => {
                 tracing::warn!("Unknown ACP method: {}", request.method);
@@ -290,24 +287,12 @@ impl AcpHandler {
 
         // For Claude agents: session_id IS the Claude session ID
         // Just need to create an aginx session that uses --resume with this ID
-        let claude_session_id = &params.sessionId;
-        tracing::info!("[LOAD] ACP loadSession: claude_session_id={}", claude_session_id);
+        let agent_session_id = &params.sessionId;
+        tracing::info!("[LOAD] ACP loadSession: agent_session_id={}", agent_session_id);
 
-        // Look up agent info to get agent config
-        let agents = self.agent_manager.list_agents().await;
-        // Find the "claude" agent specifically (not just any agent)
-        let agent_id = agents.iter()
-            .filter_map(|a| {
-                let agent_type = a.get("agent_type").or_else(|| a.get("type")).and_then(|v| v.as_str());
-                let id = a.get("id").and_then(|v| v.as_str());
-                if agent_type == Some("claude") { id } else { None }
-            })
-            .next()
-            .map(String::from);
-
-        let agent_id = match agent_id {
-            Some(id) => id,
-            None => return AcpResponse::error(request.id, 404, "No agent found"),
+        let agent_id = match &params.agentId {
+            Some(id) => id.clone(),
+            None => return AcpResponse::error(request.id, -32602, "agentId is required"),
         };
 
         let agent_info = match self.agent_manager.get_agent_info(&agent_id).await {
@@ -316,11 +301,14 @@ impl AcpHandler {
         };
 
         // Find the JSONL path to extract workdir
-        let workdir = self.session_manager.find_workdir_for_claude_session(claude_session_id);
+        let workdir = self.session_manager.find_workdir_for_session(
+            agent_session_id,
+            agent_info.storage_path.as_deref(),
+        );
 
         // Create session with claude session ID as the aginx session ID too
-        let session_id = match self.session_manager.create_session_with_claude_id(
-            claude_session_id,
+        let session_id = match self.session_manager.create_session_with_agent_id(
+            agent_session_id,
             &agent_info,
             workdir.as_deref(),
         ).await {
@@ -328,7 +316,7 @@ impl AcpHandler {
             Err(e) => return AcpResponse::error(request.id, -32603, &format!("Failed to create session: {}", e)),
         };
 
-        tracing::info!("ACP loadSession: session created {} for claude session {}", session_id, claude_session_id);
+        tracing::info!("ACP loadSession: session created {} for claude session {}", session_id, agent_session_id);
 
         // Touch the session to prevent timeout cleanup while it's being used
         self.session_manager.touch_session(&session_id).await;
@@ -446,14 +434,14 @@ impl AcpHandler {
                                 AsyncStreamingResult::Completed {
                                     stop_reason,
                                     content,
-                                    claude_session_id,
+                                    agent_session_id,
                                 } => {
                                     // Update persisted metadata
                                     let msg_preview = truncate_preview(&content, 100);
                                     session_manager.update_persisted_metadata(
                                         &session_id,
                                         &agent_id,
-                                        claude_session_id.as_deref(),
+                                        agent_session_id.as_deref(),
                                         Some(&msg_preview),
                                     );
 
@@ -490,18 +478,15 @@ impl AcpHandler {
                 }
             };
 
-            // 对于 Claude 类型和所有其他 agent，统一使用 legacy streaming 模式
-            // 检查是否使用 legacy 模式 (args 包含 --print 表示使用 stream-json 输出)
-            let use_legacy = agent_info.args.iter().any(|arg| arg == "--print");
-
-            if use_legacy || agent_info.agent_type == AgentType::Claude {
+            // 根据协议选择处理路径
+            if agent_info.protocol == "claude-stream" {
                 // Legacy 模式：每次启动新进程，使用 stream-json 输出格式
                 tracing::info!("[PROMPT] Starting legacy streaming for session {}", params.sessionId);
-                let mut event_rx = match super::streaming::StreamingSession::run_claude_async(
+                let mut event_rx = match super::streaming::StreamingSession::run_streaming_async(
                     params.sessionId.clone(),
                     agent_info,
                     session_info.workdir.clone(),
-                    session_info.claude_session_id.clone(),
+                    session_info.agent_session_id.clone(),
                     &message,
                 ).await {
                     Ok(rx) => rx,
@@ -545,11 +530,11 @@ impl AcpHandler {
                             AsyncStreamingResult::Completed {
                                 stop_reason,
                                 content,
-                                claude_session_id,
+                                agent_session_id,
                             } => {
-                                if let Some(ref sid) = claude_session_id {
-                                    if let Err(e) = session_manager.update_claude_session_id(&session_id, sid).await {
-                                        tracing::warn!("Failed to save claude_session_id: {}", e);
+                                if let Some(ref sid) = agent_session_id {
+                                    if let Err(e) = session_manager.update_agent_session_id(&session_id, sid).await {
+                                        tracing::warn!("Failed to save agent_session_id: {}", e);
                                     }
                                 }
 
@@ -557,7 +542,7 @@ impl AcpHandler {
                                 session_manager.update_persisted_metadata(
                                     &session_id,
                                     &agent_id,
-                                    claude_session_id.as_deref(),
+                                    agent_session_id.as_deref(),
                                     Some(&msg_preview),
                                 );
 
@@ -843,15 +828,17 @@ impl AcpHandler {
             }
         };
 
-        // Check if this is a claude-type agent
+        // Check if agent has external session storage
         let agent_info = self.agent_manager.get_agent_info(&agent_id).await;
-        let is_claude = agent_info.as_ref()
-            .map(|i| i.agent_type == AgentType::Claude)
+        let has_storage = agent_info.as_ref()
+            .map(|i| i.storage_path.is_some())
             .unwrap_or(false);
+        let storage_path = agent_info.as_ref()
+            .and_then(|i| i.storage_path.clone());
 
-        let conversations = if is_claude {
-            // Direct scan of Claude CLI JSONL sessions — no aginx metadata layer
-            self.session_manager.scan_claude_sessions_direct()
+        let conversations = if has_storage {
+            // Agent has external session storage (e.g. ~/.claude/projects)
+            self.session_manager.scan_external_sessions(storage_path.as_deref().unwrap_or(""), &agent_id)
         } else {
             // Non-Claude agents: use persisted sessions
             let sessions = self.session_manager.list_persisted_sessions(&agent_id);
@@ -883,8 +870,14 @@ impl AcpHandler {
             }
         };
 
-        // session_id IS the Claude session ID — just delete the JSONL file directly
-        let deleted = self.session_manager.delete_claude_jsonl_by_session_id(&session_id);
+        // session_id IS the agent's session ID — just delete the JSONL file directly
+        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let storage_path = match agent_id {
+            Some(aid) => self.agent_manager.get_agent_info(aid).await
+                .and_then(|i| i.storage_path),
+            None => None,
+        };
+        let deleted = self.session_manager.delete_jsonl_by_session_id(&session_id, storage_path.as_deref());
 
         tracing::info!("Delete conversation {}: {}", session_id, if deleted { "success" } else { "not found" });
 
@@ -908,8 +901,14 @@ impl AcpHandler {
 
         tracing::info!("[getConversationMessages] session_id={}, limit={}", session_id, limit);
 
-        // session_id IS the Claude session ID — read directly from JSONL
-        let messages = self.session_manager.read_claude_jsonl_messages_limited(&session_id, limit);
+        // Get storage_path from agent config
+        let agent_id = params.get("agentId").and_then(|v| v.as_str());
+        let storage_path = match agent_id {
+            Some(aid) => self.agent_manager.get_agent_info(aid).await
+                .and_then(|i| i.storage_path),
+            None => None,
+        };
+        let messages = self.session_manager.read_jsonl_messages_limited(&session_id, limit, storage_path.as_deref());
 
         tracing::info!("[getConversationMessages] Returning {} messages", messages.len());
 
@@ -1056,171 +1055,6 @@ impl AcpHandler {
             BindResult::InvalidCode => {
                 tracing::warn!("Invalid or expired pair code: {}", pair_code);
                 AcpResponse::error(request.id, 400, "Invalid or expired pair code")
-            }
-        }
-    }
-
-    /// Handle listDirectory request - browse server filesystem
-    async fn handle_list_directory(&self, request: AcpRequest) -> AcpResponse {
-        let params = match &request.params {
-            Some(p) => p.clone(),
-            None => serde_json::json!({}),
-        };
-
-        let path_str = params.get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("~");
-
-        let path = match Self::safe_resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => {
-                return AcpResponse::error(request.id, 400, &e);
-            }
-        };
-
-        if !path.exists() {
-            return AcpResponse::error(request.id, 404, &format!("Path not found: {}", path.display()));
-        }
-
-        if !path.is_dir() {
-            return AcpResponse::error(request.id, 400, &format!("Not a directory: {}", path.display()));
-        }
-
-        let mut entries = Vec::new();
-        match std::fs::read_dir(&path) {
-            Ok(dir_entries) => {
-                for entry in dir_entries.flatten() {
-                    let file_name = entry.file_name().to_string_lossy().to_string();
-                    // Skip entries that can't be read
-                    let metadata = match entry.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-
-                    let entry_type = if metadata.is_dir() {
-                        "directory"
-                    } else {
-                        "file"
-                    };
-
-                    let modified = metadata.modified().ok()
-                        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
-
-                    entries.push(serde_json::json!({
-                        "name": file_name,
-                        "type": entry_type,
-                        "size": if metadata.is_file() { Some(metadata.len()) } else { None },
-                        "modified": modified,
-                        "isHidden": file_name.starts_with('.')
-                    }));
-                }
-            }
-            Err(e) => {
-                return AcpResponse::error(request.id, 403, &format!("Cannot read directory: {}", e));
-            }
-        }
-
-        // Sort: directories first, then alphabetically
-        entries.sort_by(|a, b| {
-            let a_is_dir = a.get("type").and_then(|v| v.as_str()) == Some("directory");
-            let b_is_dir = b.get("type").and_then(|v| v.as_str()) == Some("directory");
-            match (a_is_dir, b_is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => {
-                    let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    a_name.to_lowercase().cmp(&b_name.to_lowercase())
-                }
-            }
-        });
-
-        AcpResponse::success(request.id, serde_json::json!({
-            "path": path.to_string_lossy(),
-            "entries": entries
-        }))
-    }
-
-    /// Handle readFile request - read a file from server filesystem
-    async fn handle_read_file(&self, request: AcpRequest) -> AcpResponse {
-        let params = match &request.params {
-            Some(p) => p,
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
-        };
-
-        let path_str = match params.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing path");
-            }
-        };
-
-        let path = match Self::safe_resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => {
-                return AcpResponse::error(request.id, 400, &e);
-            }
-        };
-
-        if !path.exists() {
-            return AcpResponse::error(request.id, 404, &format!("File not found: {}", path.display()));
-        }
-
-        if path.is_dir() {
-            return AcpResponse::error(request.id, 400, &format!("Path is a directory: {}", path.display()));
-        }
-
-        let metadata = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                return AcpResponse::error(request.id, 403, &format!("Cannot read file metadata: {}", e));
-            }
-        };
-
-        // Limit file size to 10MB
-        const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-        if metadata.len() > MAX_FILE_SIZE {
-            return AcpResponse::error(request.id, 413, &format!("File too large: {} bytes (max 10MB)", metadata.len()));
-        }
-
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                use base64::Engine;
-                let content = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-                // Guess MIME type from extension
-                let mime_type = path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|ext| match ext {
-                        "txt" | "md" | "toml" | "json" | "yaml" | "yml" | "xml" | "csv" | "log" | "rs" | "py" | "js" | "ts" | "kt" | "java" | "c" | "h" | "cpp" | "go" | "sh" | "bash" => format!("text/{}", ext),
-                        "html" | "htm" => "text/html".to_string(),
-                        "css" => "text/css".to_string(),
-                        "png" => "image/png".to_string(),
-                        "jpg" | "jpeg" => "image/jpeg".to_string(),
-                        "gif" => "image/gif".to_string(),
-                        "svg" => "image/svg+xml".to_string(),
-                        "pdf" => "application/pdf".to_string(),
-                        "zip" => "application/zip".to_string(),
-                        _ => "application/octet-stream".to_string(),
-                    })
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-
-                let file_name = path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                AcpResponse::success(request.id, serde_json::json!({
-                    "name": file_name,
-                    "size": bytes.len(),
-                    "content": content,
-                    "mimeType": mime_type
-                }))
-            }
-            Err(e) => {
-                AcpResponse::error(request.id, 403, &format!("Cannot read file: {}", e))
             }
         }
     }

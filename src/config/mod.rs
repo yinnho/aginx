@@ -257,6 +257,7 @@ pub struct ApiConfig {
 }
 
 fn default_api_url() -> String { "https://api.yinnho.cn".to_string() }
+fn default_agent_type() -> String { "process".to_string() }
 
 impl Default for ApiConfig {
     fn default() -> Self {
@@ -326,21 +327,6 @@ impl Default for AgentsConfig {
     }
 }
 
-/// Agent 类型
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentType {
-    /// Claude CLI (stream-json 协议)
-    Claude,
-    /// 外部进程 (stdin/stdout)
-    Process,
-}
-
-impl Default for AgentType {
-    fn default() -> Self {
-        Self::Process
-    }
-}
 
 /// Agent 配置项 (主配置文件中的条目)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,8 +336,8 @@ pub struct AgentEntry {
     /// Agent 名称
     pub name: String,
     /// Agent 类型
-    #[serde(default)]
-    pub agent_type: AgentType,
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
     /// 能力标签
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
@@ -379,6 +365,10 @@ pub struct AgentEntry {
     /// 例如: ["--session-id", "${SESSION_ID}"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_args: Vec<String>,
+
+    /// 通信协议: "acp" | "claude-stream"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 
     /// 会话配置
     #[serde(default)]

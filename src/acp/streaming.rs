@@ -22,7 +22,7 @@ pub enum AsyncStreamingResult {
     Completed {
         stop_reason: StopReason,
         content: String,
-        claude_session_id: Option<String>,
+        agent_session_id: Option<String>,
     },
     /// Error occurred
     Error(String),
@@ -44,11 +44,11 @@ impl StreamingSession {
     /// Run Claude CLI asynchronously with tokio::process::Command
     ///
     /// Returns a receiver that yields streaming events in real-time.
-    pub async fn run_claude_async(
+    pub async fn run_streaming_async(
         session_id: String,
         agent_info: AgentInfo,
         workdir: Option<String>,
-        claude_session_id: Option<String>,
+        agent_session_id: Option<String>,
         message: &str,
     ) -> Result<mpsc::Receiver<StreamingEvent>, String> {
         use std::process::Stdio;
@@ -56,7 +56,7 @@ impl StreamingSession {
         // Build args: base args + session resume args (no message, it's sent via stdin)
         let mut full_args: Vec<String> = agent_info.args.clone();
 
-        if let Some(ref sid) = claude_session_id {
+        if let Some(ref sid) = agent_session_id {
             for arg in &agent_info.session_args {
                 full_args.push(arg.replace("${SESSION_ID}", sid));
             }
@@ -125,7 +125,7 @@ impl StreamingSession {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut accumulated_content = String::new();
-            let mut claude_session_id: Option<String> = None;
+            let mut agent_session_id: Option<String> = None;
             let mut stop_reason = StopReason::EndTurn;
 
             while let Ok(Some(line)) = lines.next_line().await {
@@ -139,7 +139,7 @@ impl StreamingSession {
                     &session_id_clone,
                     &line,
                     &mut accumulated_content,
-                    &mut claude_session_id,
+                    &mut agent_session_id,
                     &mut stop_reason,
                 ) {
                     Ok(Some(notification)) => {
@@ -158,7 +158,7 @@ impl StreamingSession {
             let result = AsyncStreamingResult::Completed {
                 stop_reason,
                 content: accumulated_content,
-                claude_session_id,
+                agent_session_id,
             };
             let _ = tx_clone.send(StreamingEvent::Completed(result)).await;
         });
@@ -191,7 +191,7 @@ fn process_line(
     session_id: &str,
     line: &str,
     accumulated_content: &mut String,
-    claude_session_id: &mut Option<String>,
+    agent_session_id: &mut Option<String>,
     stop_reason: &mut StopReason,
 ) -> Result<Option<String>, String> {
     let event: AgentEvent = match serde_json::from_str(line) {
@@ -203,15 +203,15 @@ fn process_line(
         AgentEvent::System { session_id: sid, .. } => {
             if let Some(sid) = sid {
                 tracing::info!("Got Claude session_id from init: {}", sid);
-                *claude_session_id = Some(sid);
+                *agent_session_id = Some(sid);
             }
             Ok(None)
         }
 
         AgentEvent::Assistant { message, session_id: sid } => {
             if let Some(sid) = sid {
-                if claude_session_id.is_none() {
-                    *claude_session_id = Some(sid);
+                if agent_session_id.is_none() {
+                    *agent_session_id = Some(sid);
                 }
             }
             let mut last_notification: Option<String> = None;
@@ -302,7 +302,7 @@ fn process_line(
         AgentEvent::Result { result, stop_reason: reason, session_id: sid, is_error, .. } => {
             if let Some(sid) = sid {
                 tracing::info!("Got Claude session_id from result: {}", sid);
-                *claude_session_id = Some(sid);
+                *agent_session_id = Some(sid);
             }
 
             if let Some(text) = result {

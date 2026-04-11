@@ -1,0 +1,1 @@
+{"id":0,"jsonrpc":"2.0","result":{"protocolVersion":1,"serverCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true}},"serverInfo":{"name":"aginx","version":"0.1.0"}}}

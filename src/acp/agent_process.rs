@@ -37,7 +37,7 @@ pub struct AcpAgentProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     /// Claude CLI session ID (for --resume on subsequent prompts)
-    claude_session_id: String,
+    agent_session_id: String,
     /// Receiver for stdout events from background reader task
     event_rx: mpsc::Receiver<RawEvent>,
     /// Flag: background reader still active
@@ -98,7 +98,7 @@ impl AcpAgentProcess {
         let mut process = Self {
             child,
             stdin: BufWriter::new(stdin),
-            claude_session_id: String::new(),
+            agent_session_id: String::new(),
             event_rx,
             alive: true,
         };
@@ -124,7 +124,7 @@ impl AcpAgentProcess {
         // Drain init events from stdout to get session_id and discard dummy response
         process.drain_init_events().await?;
 
-        tracing::info!("Claude CLI spawned, session_id: {}", process.claude_session_id);
+        tracing::info!("Claude CLI spawned, session_id: {}", process.agent_session_id);
         Ok(process)
     }
 
@@ -138,7 +138,7 @@ impl AcpAgentProcess {
             match raw {
                 RawEvent::Line(line) => {
                     if let Some(sid) = extract_session_id(&line) {
-                        self.claude_session_id = sid.clone();
+                        self.agent_session_id = sid.clone();
                         found_session_id = true;
                         tracing::debug!("Got session_id: {}", sid);
                     }
@@ -203,7 +203,7 @@ impl AcpAgentProcess {
                     match classify_event(&line) {
                         EventKind::MessageChunk(text) => {
                             accumulated_content.push_str(&text);
-                            let notification = make_chunk_notification(&self.claude_session_id, &text);
+                            let notification = make_chunk_notification(&self.agent_session_id, &text);
                             if tx.send(StreamingEvent::Notification(notification)).await.is_err() {
                                 tracing::warn!("Client disconnected");
                                 return Ok(());
@@ -213,7 +213,7 @@ impl AcpAgentProcess {
                             let tool_call_id = format!("tc_{}", id);
                             let title = format_tool_title(&name, &Some(input.clone()));
                             let kind = infer_tool_kind(&name);
-                            let notification = make_tool_notification(&self.claude_session_id, &tool_call_id, &title, kind.as_ref());
+                            let notification = make_tool_notification(&self.agent_session_id, &tool_call_id, &title, kind.as_ref());
                             if tx.send(StreamingEvent::Notification(notification)).await.is_err() {
                                 tracing::warn!("Client disconnected");
                                 return Ok(());
@@ -223,7 +223,7 @@ impl AcpAgentProcess {
                             let tool_call_id = format!("tc_{}", id);
                             let status = if is_error { super::types::ToolCallStatus::Failed } else { super::types::ToolCallStatus::Completed };
                             let output_text = content.as_ref().and_then(|c| c.as_str());
-                            let notification = make_tool_update_notification(&self.claude_session_id, &tool_call_id, status, output_text);
+                            let notification = make_tool_update_notification(&self.agent_session_id, &tool_call_id, status, output_text);
                             if tx.send(StreamingEvent::Notification(notification)).await.is_err() {
                                 tracing::warn!("Client disconnected");
                                 return Ok(());
@@ -238,7 +238,7 @@ impl AcpAgentProcess {
                                             let tool_call_id = format!("tc_{}", id);
                                             let title = format_tool_title(&name, &Some(input.clone()));
                                             let kind = infer_tool_kind(&name);
-                                            let notification = make_tool_notification(&self.claude_session_id, &tool_call_id, &title, kind.as_ref());
+                                            let notification = make_tool_notification(&self.agent_session_id, &tool_call_id, &title, kind.as_ref());
                                             if tx.send(StreamingEvent::Notification(notification)).await.is_err() {
                                                 tracing::warn!("Client disconnected");
                                                 return Ok(());
@@ -248,7 +248,7 @@ impl AcpAgentProcess {
                                             let tool_call_id = format!("tc_{}", tool_use_id);
                                             let output_text = content.as_ref().and_then(|c| c.as_str());
                                             let notification = make_tool_update_notification(
-                                                &self.claude_session_id, &tool_call_id,
+                                                &self.agent_session_id, &tool_call_id,
                                                 super::types::ToolCallStatus::Completed, output_text
                                             );
                                             if tx.send(StreamingEvent::Notification(notification)).await.is_err() {
@@ -263,8 +263,8 @@ impl AcpAgentProcess {
                         }
                         EventKind::System(session_id) => {
                             if let Some(sid) = session_id {
-                                if self.claude_session_id.is_empty() {
-                                    self.claude_session_id = sid;
+                                if self.agent_session_id.is_empty() {
+                                    self.agent_session_id = sid;
                                 }
                             }
                         }
@@ -306,7 +306,7 @@ impl AcpAgentProcess {
         let result = super::streaming::AsyncStreamingResult::Completed {
             stop_reason,
             content: accumulated_content,
-            claude_session_id: Some(self.claude_session_id.clone()),
+            agent_session_id: Some(self.agent_session_id.clone()),
         };
         if tx.send(StreamingEvent::Completed(result)).await.is_err() {
             tracing::warn!("Client disconnected before completion");
@@ -321,8 +321,8 @@ impl AcpAgentProcess {
     }
 
     /// Get the Claude CLI session ID
-    pub fn claude_session_id(&self) -> &str {
-        &self.claude_session_id
+    pub fn agent_session_id(&self) -> &str {
+        &self.agent_session_id
     }
 }
 
