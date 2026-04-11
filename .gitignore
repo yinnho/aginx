@@ -2,3 +2,7 @@
 *.log
 *.swp
 .DS_Store
+
+# 开发文件
+CLAUDE.md
+.claude/
