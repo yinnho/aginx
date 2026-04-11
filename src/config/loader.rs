@@ -132,6 +132,6 @@ mod tests {
         let mut config = Config::default();
         config.relay.set_id("abc123".to_string());
         assert_eq!(config.relay.id, Some("abc123".to_string()));
-        assert_eq!(config.relay.url, Some("abc123.relay.aginx.net:8600".to_string()));
+        assert_eq!(config.relay.url, Some("abc123.relay.yinnho.cn:8443".to_string()));
     }
 }

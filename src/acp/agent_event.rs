@@ -5,7 +5,7 @@
 
 // Claude 专用事件类型
 pub(crate) use super::adapter::claude::events::{
-    AgentEvent, AssistantMessage, ContentBlock, StreamDelta, StreamInnerEvent,
+    AgentEvent, AssistantMessage, ContentBlock,
 };
 
 // 通用通知构建函数

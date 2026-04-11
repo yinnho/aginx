@@ -371,8 +371,8 @@ async fn run_acp_mode(stdio: bool, default_agent: Option<String>) -> anyhow::Res
 
     // 创建 SessionManager
     let session_config = SessionConfig {
-        max_concurrent: 10,
-        timeout_seconds: 1800,
+        max_concurrent: config.server.max_concurrent_sessions,
+        timeout_seconds: config.server.session_timeout_seconds,
     };
     let session_manager = Arc::new(SessionManager::new(session_config));
 

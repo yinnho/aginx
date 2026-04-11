@@ -32,7 +32,7 @@ pub enum ServerMode {
 
 /// 默认 Relay 域名
 pub const DEFAULT_RELAY_DOMAIN: &str = "relay.yinnho.cn";
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessMode {
     /// 公开模式 - 任何人可访问

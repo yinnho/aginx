@@ -27,7 +27,7 @@ fn run_acp_request(requests: &[&str]) -> Vec<String> {
     for req in requests {
         writeln!(stdin, "{}", req).expect("Failed to write request");
     }
-    drop(stdin); // Close stdin to signal EOF
+    let _ = stdin; // release stdin to signal EOF
 
     let output = child.wait_with_output().expect("Failed to wait for child");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -59,6 +59,7 @@ fn test_acp_initialize() {
 }
 
 #[test]
+#[ignore] // requires local claude agent configured
 fn test_acp_new_session() {
     let requests = vec![
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.15.0","clientCapabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,

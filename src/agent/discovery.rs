@@ -284,7 +284,7 @@ fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Opt
 
 /// 将 AgentConfig 转换为 AgentInfo（用于注册和自动加载）
 pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, global_access: &AccessMode) -> super::manager::AgentInfo {
-    let access = config.access.clone().unwrap_or_else(|| global_access.clone());
+    let access = config.access.unwrap_or(*global_access);
 
     let agent_type = config.agent_type.clone();
     let agent_type_for_protocol = agent_type.clone();

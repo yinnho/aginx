@@ -5,20 +5,22 @@
 
 mod types;
 mod handler;
-mod backend;
-mod acp_backend;
 mod notifications;
 mod streaming;
 pub mod agent_process;
 pub mod agent_event;
 pub mod adapter;
 
+#[cfg(feature = "acp-native")]
+mod backend;
+#[cfg(feature = "acp-native")]
+mod acp_backend;
+
 #[cfg(test)]
 mod tests;
 
 pub use types::*;
 pub use handler::*;
-pub use backend::AgentBackend;
 
 /// 连接认证状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

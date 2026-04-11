@@ -156,16 +156,9 @@ impl AcpHandler {
 
     /// Handle initialize request
     async fn handle_initialize(&self, request: AcpRequest) -> AcpResponse {
-        let params: InitializeParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
+        let params: InitializeParams = match request.parse_params() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         // Check authToken from _meta
@@ -193,14 +186,9 @@ impl AcpHandler {
 
     /// Handle newSession request
     async fn handle_new_session(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
-        let params: NewSessionParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => NewSessionParams::default()
+        let params: NewSessionParams = match request.parse_params_or_default() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         // Get agent ID from _meta or directly from params
@@ -262,16 +250,9 @@ impl AcpHandler {
 
     /// Handle loadSession request
     async fn handle_load_session(&self, request: AcpRequest) -> AcpResponse {
-        let params: LoadSessionParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
+        let params: LoadSessionParams = match request.parse_params() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         // For Claude agents: session_id IS the Claude session ID
@@ -324,16 +305,9 @@ impl AcpHandler {
         tx: mpsc::Sender<String>,
         auth: ConnectionAuth,
     ) -> AcpResponse {
-        let params: PromptParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
+        let params: PromptParams = match request.parse_params() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         // Check if session's agent is accessible
@@ -652,16 +626,9 @@ impl AcpHandler {
     async fn handle_cancel(&self, request: AcpRequest) -> AcpResponse {
         use super::types::CancelParams;
 
-        let params: CancelParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
+        let params: CancelParams = match request.parse_params() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         tracing::info!("ACP cancel: sessionId={}", params.sessionId);
@@ -688,7 +655,7 @@ impl AcpHandler {
     /// Handle listSessions request
     async fn handle_list_sessions(&self, request: AcpRequest) -> AcpResponse {
         // Get agent_id from params if provided
-        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let params = request.params_value();
         let agent_id = params.get("agentId")
             .and_then(|v| v.as_str());
 
@@ -761,14 +728,9 @@ impl AcpHandler {
 
     /// Handle new session with auth check
     async fn handle_new_session_with_auth(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
-        let params: NewSessionParams = match &request.params {
-            Some(p) => match serde_json::from_value(p.clone()) {
-                Ok(params) => params,
-                Err(e) => {
-                    return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e));
-                }
-            }
-            None => NewSessionParams::default()
+        let params: NewSessionParams = match request.parse_params_or_default() {
+            Ok(p) => p,
+            Err(resp) => return resp,
         };
 
         // Get agent ID
@@ -809,7 +771,7 @@ impl AcpHandler {
 
     /// Handle listConversations request - list persisted sessions for an agent
     async fn handle_list_conversations(&self, request: AcpRequest) -> AcpResponse {
-        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let params = request.params_value();
         let agent_id = match params.get("agentId").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => {
@@ -851,7 +813,7 @@ impl AcpHandler {
 
     /// Handle deleteConversation request
     async fn handle_delete_conversation(&self, request: AcpRequest) -> AcpResponse {
-        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let params = request.params_value();
         let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => {
@@ -877,7 +839,7 @@ impl AcpHandler {
 
     /// Handle getConversationMessages - read messages directly from Claude JSONL
     async fn handle_get_conversation_messages(&self, request: AcpRequest) -> AcpResponse {
-        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let params = request.params_value();
         let session_id = match params.get("sessionId").and_then(|v| v.as_str()) {
             Some(id) => id.to_string(),
             None => {
@@ -911,7 +873,7 @@ impl AcpHandler {
         use crate::agent::scan_directory;
 
         // Parse params
-        let params = request.params.clone().unwrap_or(serde_json::json!({}));
+        let params = request.params_value();
         let scan_path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => match Self::safe_resolve_path(p) {
                 Ok(resolved) => resolved,
@@ -962,12 +924,10 @@ impl AcpHandler {
         use crate::agent::{parse_aginx_toml, agent_config_to_info};
 
         // Parse params
-        let params = match &request.params {
-            Some(p) => p.clone(),
-            None => {
-                return AcpResponse::error(request.id, -32602, "Missing params");
-            }
-        };
+        let params = request.params_value();
+        if params.as_object().map_or(true, |m| m.is_empty()) {
+            return AcpResponse::error(request.id, -32602, "Missing params");
+        }
 
         let config_path = match params.get("configPath").and_then(|v| v.as_str()) {
             Some(p) => p,

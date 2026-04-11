@@ -26,6 +26,31 @@ pub struct AcpRequest {
     pub params: Option<serde_json::Value>,
 }
 
+impl AcpRequest {
+    /// Parse required params, returns error response on failure
+    pub fn parse_params<T: serde::de::DeserializeOwned>(&self) -> Result<T, AcpResponse> {
+        match &self.params {
+            Some(p) => serde_json::from_value(p.clone())
+                .map_err(|e| AcpResponse::error(self.id.clone(), -32602, &format!("Invalid params: {}", e))),
+            None => Err(AcpResponse::error(self.id.clone(), -32602, "Missing params")),
+        }
+    }
+
+    /// Parse optional params with a default fallback
+    pub fn parse_params_or_default<T: serde::de::DeserializeOwned + Default>(&self) -> Result<T, AcpResponse> {
+        match &self.params {
+            Some(p) => serde_json::from_value(p.clone())
+                .map_err(|e| AcpResponse::error(self.id.clone(), -32602, &format!("Invalid params: {}", e))),
+            None => Ok(T::default()),
+        }
+    }
+
+    /// Get params as raw JSON Value with a default empty object
+    pub fn params_value(&self) -> serde_json::Value {
+        self.params.clone().unwrap_or(serde_json::json!({}))
+    }
+}
+
 /// Request ID type
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]

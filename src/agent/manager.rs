@@ -67,14 +67,14 @@ impl From<AgentEntry> for AgentInfo {
 impl AgentManager {
     /// Create agent manager from config
     pub fn from_config(config: &Config) -> Self {
-        let global_access = config.server.access.clone();
+        let global_access = config.server.access;
         let mut agents: HashMap<String, AgentInfo> = config
             .agents
             .list
             .iter()
             .map(|ac| {
                 let mut info = AgentInfo::from(ac.clone());
-                info.access = global_access.clone();
+                info.access = global_access;
                 (ac.id.clone(), info)
             })
             .collect();

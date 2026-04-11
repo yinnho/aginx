@@ -148,7 +148,7 @@ impl RelayClient {
             agent_manager.clone(),
             session_manager.clone(),
             agents_dir,
-            config.server.access.clone(),
+            config.server.access,
         ));
 
         Self {
