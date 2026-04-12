@@ -184,6 +184,10 @@ pub struct RelayConfig {
     /// 重连间隔 (秒)
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
+
+    /// 是否向 aginx-api 上报 Agent 列表
+    #[serde(default)]
+    pub publish_agents: bool,
 }
 
 fn default_relay_domain() -> String { DEFAULT_RELAY_DOMAIN.to_string() }
@@ -203,6 +207,7 @@ impl Default for RelayConfig {
             url: None,
             heartbeat_interval: default_heartbeat_interval(),
             reconnect_interval: default_reconnect_interval(),
+            publish_agents: false,
         }
     }
 }
@@ -365,6 +370,10 @@ pub struct AgentEntry {
     /// 例如: ["--session-id", "${SESSION_ID}"]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_args: Vec<String>,
+
+    /// 进程超时（秒），仅 process 类型。默认 60 秒
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 
     /// 通信协议: "acp" | "claude-stream"
     #[serde(default, skip_serializing_if = "Option::is_none")]

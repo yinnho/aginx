@@ -60,7 +60,8 @@ impl AcpAgentProcess {
         cmd.args(args)
             .stdin(StdStdio::piped())
             .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped());
+            .stderr(StdStdio::piped())
+            .process_group(0); // 新进程组，Ctrl+C 时可整组杀掉
 
         for key in env_remove {
             cmd.env_remove(key);

@@ -51,6 +51,10 @@ pub struct AgentConfig {
     /// claude-stream: Claude CLI 专用 stream-json 协议，aginx adapter 翻译
     #[serde(default)]
     pub protocol: Option<String>,
+
+    /// 进程超时（秒），仅 process 类型。默认 60 秒
+    #[serde(default)]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -360,6 +364,7 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
                 "acp".to_string()
             }
         }),
+        timeout: config.timeout,
     }
 }
 

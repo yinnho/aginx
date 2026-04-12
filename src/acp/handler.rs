@@ -3,6 +3,7 @@
 //! Handles ACP protocol requests and routes them to appropriate handlers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -23,6 +24,16 @@ pub struct AcpHandler {
     agents_dir: std::path::PathBuf,
     /// Global default access mode (from config)
     global_access: crate::config::AccessMode,
+    /// JWT secret for aginx-to-aginx authentication
+    jwt_secret: Option<String>,
+    /// API URL for remote agent discovery
+    api_url: Option<String>,
+    /// JWT token for aginx-to-aginx authentication (from relay registration)
+    aginx_token: Option<String>,
+    /// Relay domain for remote/listAgents relay address construction
+    relay_domain: Option<String>,
+    /// Relay port
+    relay_port: u16,
 }
 
 impl AcpHandler {
@@ -33,6 +44,11 @@ impl AcpHandler {
             session_manager,
             agents_dir: crate::config::agents_dir(),
             global_access: crate::config::AccessMode::default(),
+            jwt_secret: None,
+            api_url: None,
+            aginx_token: None,
+            relay_domain: None,
+            relay_port: 8443,
         }
     }
 
@@ -43,7 +59,37 @@ impl AcpHandler {
             session_manager,
             agents_dir,
             global_access,
+            jwt_secret: None,
+            api_url: None,
+            aginx_token: None,
+            relay_domain: None,
+            relay_port: 8443,
         }
+    }
+
+    /// Set JWT secret for aginx-to-aginx authentication
+    pub fn with_jwt_secret(mut self, secret: Option<String>) -> Self {
+        self.jwt_secret = secret;
+        self
+    }
+
+    /// Set API URL for remote agent discovery
+    pub fn with_api_url(mut self, url: Option<String>) -> Self {
+        self.api_url = url;
+        self
+    }
+
+    /// Set aginx JWT token for aginx-to-aginx calls
+    pub fn with_aginx_token(mut self, token: Option<String>) -> Self {
+        self.aginx_token = token;
+        self
+    }
+
+    /// Set relay config for remote calls
+    pub fn with_relay_config(mut self, domain: String, port: u16) -> Self {
+        self.relay_domain = Some(domain);
+        self.relay_port = port;
+        self
     }
 
 
@@ -88,7 +134,15 @@ impl AcpHandler {
 
         // Methods always allowed regardless of auth
         match method.as_str() {
-            "initialize" => return (self.handle_initialize(request).await, false),
+            "initialize" => {
+                let resp = self.handle_initialize(request).await;
+                // Upgrade auth if initialize succeeded with valid token
+                let upgrade = resp.result.as_ref()
+                    .and_then(|r| r.get("authenticated"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                return (resp, upgrade);
+            }
             "bindDevice" => {
                 let resp = self.handle_bind_device(request).await;
                 // Only upgrade auth if binding actually succeeded (result.success == true)
@@ -101,35 +155,20 @@ impl AcpHandler {
             _ => {}
         }
 
-        // For other methods: check auth
+        // All other methods require authentication (closed trusted network)
+        if auth == ConnectionAuth::Pending {
+            return (AcpResponse::error(request.id, 401, "Authentication required"), false);
+        }
+
         match method.as_str() {
-            "listAgents" => (self.handle_list_agents(request, auth).await, false),
-            "session/new" => (self.handle_new_session_with_auth(request, auth).await, false),
-            "session/load" | "loadSession" => {
-                if auth == ConnectionAuth::Pending {
-                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
-                } else {
-                    (self.handle_load_session(request).await, false)
-                }
-            }
-            "session/cancel" => {
-                if auth == ConnectionAuth::Pending {
-                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
-                } else {
-                    (self.handle_cancel(request).await, false)
-                }
-            }
+            "listAgents" => (self.handle_list_agents(request).await, false),
+            "session/new" => (self.handle_new_session(request).await, false),
+            "session/load" | "loadSession" => (self.handle_load_session(request).await, false),
+            "session/cancel" => (self.handle_cancel(request).await, false),
             "session/prompt" => {
                 (AcpResponse::error(request.id, -32601, "Use streaming endpoint for session/prompt"), false)
             }
-            // All other extension methods require authentication
-            _ => {
-                if auth == ConnectionAuth::Pending {
-                    (AcpResponse::error(request.id, 401, "Authentication required"), false)
-                } else {
-                    (self.handle_request_internal(request).await, false)
-                }
-            }
+            _ => (self.handle_request_internal(request).await, false)
         }
     }
 
@@ -139,9 +178,10 @@ impl AcpHandler {
             "listConversations" => self.handle_list_conversations(request).await,
             "deleteConversation" => self.handle_delete_conversation(request).await,
             "getMessages" | "getConversationMessages" => self.handle_get_conversation_messages(request).await,
-            "listAgents" => self.handle_list_agents(request, ConnectionAuth::Authenticated).await,
             "discoverAgents" => self.handle_discover_agents(request).await,
             "registerAgent" => self.handle_register_agent(request).await,
+            "discoverRemote" => self.handle_discover_remote(request).await,
+            "remote/listAgents" => self.handle_remote_list_agents(request).await,
             "listSessions" => self.handle_list_sessions(request).await,
             _ => {
                 tracing::warn!("Unknown ACP method: {}", request.method);
@@ -161,17 +201,33 @@ impl AcpHandler {
             Err(resp) => return resp,
         };
 
-        // Check authToken from _meta
-        let authenticated = params._meta
+        // Check authToken from _meta — try binding token first, then JWT
+        let token = params._meta
             .as_ref()
             .and_then(|m| m.get("authToken"))
-            .and_then(|v| v.as_str())
-            .map(|token| {
-                let mgr = crate::binding::get_binding_manager();
-                let mgr = mgr.lock().unwrap();
-                mgr.verify_token(token).is_some()
-            })
-            .unwrap_or(false);
+            .and_then(|v| v.as_str());
+
+        let authenticated = if let Some(token) = token {
+            // Path 1: local device binding token
+            let mgr = crate::binding::get_binding_manager();
+            let mgr = mgr.lock().unwrap();
+            if mgr.verify_token(token).is_some() {
+                true
+            } else {
+                // Path 2: JWT token (aginx-to-aginx authentication)
+                if let Some(ref secret) = self.jwt_secret {
+                    crate::auth::verify_jwt(token, secret).map(|_id| true).unwrap_or_else(|e| {
+                        tracing::warn!("JWT verification failed: {}", e);
+                        false
+                    })
+                } else {
+                    tracing::warn!("JWT auth attempted but no jwt_secret configured");
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         if authenticated {
             tracing::info!("ACP initialize from {} v{} (authenticated)", params.clientInfo.name, params.clientInfo.version);
@@ -185,7 +241,7 @@ impl AcpHandler {
     }
 
     /// Handle newSession request
-    async fn handle_new_session(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
+    async fn handle_new_session(&self, request: AcpRequest) -> AcpResponse {
         let params: NewSessionParams = match request.parse_params_or_default() {
             Ok(p) => p,
             Err(resp) => return resp,
@@ -205,22 +261,15 @@ impl AcpHandler {
                     .map(String::from)
             });
 
-        // 如果没有指定 agentId，使用第一个可用的 agent（按 auth 过滤）
+        // 如果没有指定 agentId，使用第一个可用的 agent
         let agent_id = match agent_id {
             Some(id) => id,
             None => {
                 let agents = self.agent_manager.list_agents().await;
-                let filtered: Vec<_> = if auth == ConnectionAuth::Authenticated {
-                    agents
-                } else {
-                    agents.into_iter().filter(|a| {
-                        a.get("access").and_then(|v| v.as_str()) == Some("public")
-                    }).collect()
-                };
-                if filtered.is_empty() {
+                if agents.is_empty() {
                     return AcpResponse::error(request.id, -32602, "No agent configured");
                 }
-                filtered[0].get("id").and_then(|v| v.as_str())
+                agents[0].get("id").and_then(|v| v.as_str())
                     .map(String::from)
                     .unwrap_or_else(|| "unknown".to_string())
             }
@@ -310,13 +359,9 @@ impl AcpHandler {
             Err(resp) => return resp,
         };
 
-        // Check if session's agent is accessible
+        // Check if session's agent is accessible (closed trusted network)
         if auth == ConnectionAuth::Pending {
-            if let Some(agent_id) = self.get_session_agent_id(&params.sessionId).await {
-                if !self.is_agent_public(&agent_id).await {
-                    return AcpResponse::error(request.id, 401, "Authentication required for this agent");
-                }
-            }
+            return AcpResponse::error(request.id, 401, "Authentication required");
         }
 
         // Extract text from prompt blocks
@@ -377,7 +422,9 @@ impl AcpHandler {
                     cleanup_session_manager.remove_agent_process(&cleanup_session_id).await;
                     // send error response directly so client doesn't hang
                     let error_response = AcpResponse::error(error_request_id, -32603, &format!("Prompt error: {}", e));
-                    let _ = error_tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                    if let Err(e) = error_tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                        tracing::warn!("Failed to send prompt error: {}", e);
+                    }
                 }
             });
 
@@ -413,12 +460,16 @@ impl AcpHandler {
                                         "stopReason": stop_reason_str(&stop_reason),
                                         "response": content
                                     }));
-                                    let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
+                                    if let Err(e) = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send streaming response: {}", e);
+                                }
                                 }
                                 AsyncStreamingResult::Error(e) => {
                                     tracing::error!("Streaming error: {}", e);
                                     let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
-                                    let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                                    if let Err(e) = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                                        tracing::warn!("Failed to send streaming error: {}", e);
+                                    }
                                 }
                             }
                             break;
@@ -516,12 +567,16 @@ impl AcpHandler {
                                     "stopReason": stop_reason_str(&stop_reason),
                                     "response": content
                                 }));
-                                let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
+                                if let Err(e) = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send streaming response: {}", e);
+                                }
                             }
                             AsyncStreamingResult::Error(e) => {
                                 tracing::error!("Streaming error: {}", e);
                                 let error_response = AcpResponse::error(request_id, -32603, &format!("Streaming error: {}", e));
-                                let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                                if let Err(e) = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send streaming error: {}", e);
+                                }
                             }
                         }
                     }
@@ -544,12 +599,14 @@ impl AcpHandler {
                 let workdir = session_info.workdir.clone().or(agent_info.working_dir.clone());
                 let request_id = request.id.clone();
                 let session_id = params.sessionId.clone();
+                let timeout_secs = agent_info.timeout.unwrap_or(60);
 
                 tokio::spawn(async move {
                     let mut cmd = tokio::process::Command::new(&command);
                     cmd.args(&args)
                         .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped());
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
 
                     if let Some(dir) = &workdir {
                         cmd.current_dir(dir);
@@ -568,48 +625,116 @@ impl AcpHandler {
                                 drop(stdin); // Close stdin to signal EOF
                             }
 
-                            // Read stdout
-                            let mut full_output = String::new();
-                            if let Some(stdout) = child.stdout.take() {
-                                use tokio::io::AsyncBufReadExt;
-                                let reader = tokio::io::BufReader::new(stdout);
-                                let mut lines = reader.lines();
+                            // Capture stderr in background
+                            let stderr_handle = child.stderr.take().map(|stderr| {
+                                tokio::spawn(async move {
+                                    use tokio::io::AsyncBufReadExt;
+                                    let reader = tokio::io::BufReader::new(stderr);
+                                    let mut lines = reader.lines();
+                                    let mut stderr_output = String::new();
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        tracing::debug!("Process stderr: {}", line);
+                                        stderr_output.push_str(&line);
+                                        stderr_output.push('\n');
+                                    }
+                                    stderr_output
+                                })
+                            });
 
-                                while let Ok(Some(line)) = lines.next_line().await {
-                                    full_output.push_str(&line);
-                                    full_output.push('\n');
+                            // Read stdout with timeout
+                            let read_stdout = async {
+                                let mut full_output = String::new();
+                                if let Some(stdout) = child.stdout.take() {
+                                    use tokio::io::AsyncBufReadExt;
+                                    let reader = tokio::io::BufReader::new(stdout);
+                                    let mut lines = reader.lines();
 
-                                    // Send as chunk notification
-                                    let notification = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "sessionUpdate",
-                                        "params": {
-                                            "sessionId": session_id,
-                                            "update": {
-                                                "sessionUpdate": "agent_message_chunk",
-                                                "content": {"type": "text", "text": line}
+                                    while let Ok(Some(line)) = lines.next_line().await {
+                                        full_output.push_str(&line);
+                                        full_output.push('\n');
+
+                                        // Send as chunk notification
+                                        let notification = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "sessionUpdate",
+                                            "params": {
+                                                "sessionId": session_id,
+                                                "update": {
+                                                    "sessionUpdate": "agent_message_chunk",
+                                                    "content": {"type": "text", "text": line}
+                                                }
                                             }
+                                        });
+                                        if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
+                                            break;
                                         }
-                                    });
-                                    if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
-                                        break;
                                     }
                                 }
+                                full_output
+                            };
+
+                            let timed_out;
+                            let full_output = match tokio::time::timeout(
+                                Duration::from_secs(timeout_secs),
+                                read_stdout
+                            ).await {
+                                Ok(output) => {
+                                    timed_out = false;
+                                    output
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Process timed out after {}s, killing", timeout_secs);
+                                    let _ = child.kill().await;
+                                    timed_out = true;
+                                    String::new()
+                                }
+                            };
+
+                            // Wait for child to get exit code
+                            let exit_status = child.wait().await.ok();
+
+                            // Collect stderr
+                            let stderr_output = if let Some(h) = stderr_handle {
+                                h.await.unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+
+                            // Check for errors
+                            let exit_code = exit_status.as_ref().and_then(|s| s.code());
+                            if timed_out {
+                                let error_response = AcpResponse::error(request_id, -32603, &format!(
+                                    "Process timed out after {}s", timeout_secs
+                                ));
+                                if let Err(e) = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send timeout error: {}", e);
+                                }
+                            } else if exit_code.map_or(false, |c| c != 0) {
+                                let error_detail = if stderr_output.is_empty() {
+                                    format!("Process exited with code {}", exit_code.unwrap_or(-1))
+                                } else {
+                                    format!("Process exited with code {}: {}", exit_code.unwrap_or(-1), stderr_output.trim())
+                                };
+                                let error_response = AcpResponse::error(request_id, -32603, &error_detail);
+                                if let Err(e) = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send process error: {}", e);
+                                }
+                            } else {
+                                // Send final response
+                                let final_response = AcpResponse::success(request_id, serde_json::json!({
+                                    "stopReason": "end_turn",
+                                    "response": full_output.trim_end()
+                                }));
+                                if let Err(e) = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await {
+                                    tracing::warn!("Failed to send process response: {}", e);
+                                }
                             }
-
-                            // Always wait for child to prevent orphan processes
-                            let _ = child.wait().await;
-
-                            // Send final response
-                            let final_response = AcpResponse::success(request_id, serde_json::json!({
-                                "stopReason": "end_turn",
-                                "response": full_output.trim_end()
-                            }));
-                            let _ = tx.send(serde_json::to_string(&final_response).unwrap_or_default()).await;
                         }
                         Err(e) => {
                             let error_response = AcpResponse::error(request_id, -32603, &format!("Failed to start process: {}", e));
-                            let _ = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await;
+                            if let Err(e) = tx.send(serde_json::to_string(&error_response).unwrap_or_default()).await {
+                                tracing::warn!("Failed to send process error: {}", e);
+                            }
                         }
                     }
                 });
@@ -693,80 +818,13 @@ impl AcpHandler {
     }
 
     /// Handle listAgents request
-    async fn handle_list_agents(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
+    async fn handle_list_agents(&self, request: AcpRequest) -> AcpResponse {
         let agents = self.agent_manager.list_agents().await;
 
-        let filtered: Vec<serde_json::Value> = if auth == ConnectionAuth::Authenticated {
-            agents
-        } else {
-            // Pending: only show public agents
-            agents.into_iter().filter(|a| {
-                a.get("access").and_then(|v| v.as_str()) == Some("public")
-            }).collect()
-        };
-
         AcpResponse::success(request.id, serde_json::json!({
-            "agents": filtered,
+            "agents": agents,
             "nextCursor": null
         }))
-    }
-
-    /// Check if an agent is public
-    async fn is_agent_public(&self, agent_id: &str) -> bool {
-        let agent = self.agent_manager.get_agent_info(agent_id).await;
-        match agent {
-            Some(info) => matches!(info.access, crate::config::AccessMode::Public),
-            None => false,
-        }
-    }
-
-    /// Get the agent ID associated with a session
-    async fn get_session_agent_id(&self, session_id: &str) -> Option<String> {
-        self.session_manager.get_session_info(session_id).await
-            .map(|s| s.agent_id.clone())
-    }
-
-    /// Handle new session with auth check
-    async fn handle_new_session_with_auth(&self, request: AcpRequest, auth: ConnectionAuth) -> AcpResponse {
-        let params: NewSessionParams = match request.parse_params_or_default() {
-            Ok(p) => p,
-            Err(resp) => return resp,
-        };
-
-        // Get agent ID
-        let agent_id = params._meta
-            .as_ref()
-            .and_then(|m| m.get("agentId"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| {
-                request.params.as_ref()
-                    .and_then(|p| p.get("agentId"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            });
-
-        // Check agent access
-        match agent_id {
-            Some(ref aid) => {
-                if auth == ConnectionAuth::Pending && !self.is_agent_public(aid).await {
-                    return AcpResponse::error(request.id, 401, "Authentication required for this agent");
-                }
-            }
-            None => {
-                // No agent specified — Pending users can only use this if there's a public agent to fall back to
-                if auth == ConnectionAuth::Pending {
-                    let agents = self.agent_manager.list_agents().await;
-                    let has_public = agents.iter().any(|a| a.get("access").and_then(|v| v.as_str()) == Some("public"));
-                    if !has_public {
-                        return AcpResponse::error(request.id, 401, "Authentication required");
-                    }
-                }
-            }
-        }
-
-        // Delegate to existing handler — reconstruct request since we consumed params
-        self.handle_new_session(request, auth).await
     }
 
     /// Handle listConversations request - list persisted sessions for an agent
@@ -960,6 +1018,88 @@ impl AcpHandler {
             "agentId": agent_id,
             "success": true
         }))
+    }
+
+    /// Handle discoverRemote request — search aginx-api for remote agents
+    async fn handle_discover_remote(&self, request: AcpRequest) -> AcpResponse {
+        let api_url = match &self.api_url {
+            Some(url) => url.clone(),
+            None => return AcpResponse::error(request.id, -32603, "API URL not configured"),
+        };
+
+        let params = request.params_value();
+        let query = params.get("q").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let result = client.get(format!("{}/api/v1/agents/search", api_url))
+            .query(&[("q", query), ("limit", &limit.to_string())])
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return AcpResponse::error(request.id, -32603, &format!("API search failed ({}): {}", status, body));
+                }
+                match resp.json::<serde_json::Value>().await {
+                    Ok(data) => {
+                        let agents = data.get("data").and_then(|d| d.get("agents")).cloned();
+                        let total = data.get("data").and_then(|d| d.get("total")).cloned();
+                        AcpResponse::success(request.id, serde_json::json!({
+                            "agents": agents.unwrap_or(serde_json::json!([])),
+                            "total": total.unwrap_or(serde_json::json!(0)),
+                        }))
+                    }
+                    Err(e) => AcpResponse::error(request.id, -32603, &format!("Failed to parse API response: {}", e)),
+                }
+            }
+            Err(e) => AcpResponse::error(request.id, -32603, &format!("API request failed: {}", e)),
+        }
+    }
+
+    /// Handle remote/listAgents — list agents on a remote aginx via AcpClient
+    async fn handle_remote_list_agents(&self, request: AcpRequest) -> AcpResponse {
+        let token = match &self.aginx_token {
+            Some(t) => t.clone(),
+            None => return AcpResponse::error(request.id, -32603, "No aginx token configured for remote calls"),
+        };
+
+        let params = request.params_value();
+        let target = match params.get("target").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
+            None => return AcpResponse::error(request.id, -32602, "Missing 'target' (aginx address)"),
+        };
+
+        let use_tls = params.get("useTls").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        let result = if target.contains(".relay.") || target.contains(".relay.yinnho.cn") {
+            // Relay address: extract target ID, use configured relay domain/port
+            let target_id = target.split('.').next().unwrap_or(&target);
+            let (relay_domain, relay_port) = match &self.relay_domain {
+                Some(d) => (d.clone(), self.relay_port),
+                None => return AcpResponse::error(request.id, -32603, "Relay not configured"),
+            };
+            let relay_addr = format!("{}:{}", relay_domain, relay_port);
+            super::acp_client::AcpClient::connect_via_relay(&relay_addr, target_id, &token, use_tls).await
+        } else {
+            super::acp_client::AcpClient::connect(&target, &token).await
+        };
+
+        match result {
+            Ok(mut client) => match client.list_agents().await {
+                Ok(agents) => AcpResponse::success(request.id, serde_json::json!({
+                    "agents": agents,
+                })),
+                Err(e) => AcpResponse::error(request.id, -32603, &format!("Remote listAgents failed: {}", e)),
+            },
+            Err(e) => AcpResponse::error(request.id, -32603, &format!("Failed to connect to remote aginx: {}", e)),
+        }
     }
 
     /// Handle bindDevice request

@@ -9,6 +9,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
@@ -37,12 +38,18 @@ impl Handler {
         tracing::info!("Agents directory: {}", agents_dir.display());
 
         let agent_manager = Arc::new(agent_manager);
-        let acp_handler = Arc::new(AcpHandler::with_access(
-            agent_manager.clone(),
-            session_manager.clone(),
-            agents_dir,
-            config.server.access,
-        ));
+        let acp_handler = Arc::new(
+            AcpHandler::with_access(
+                agent_manager.clone(),
+                session_manager.clone(),
+                agents_dir,
+                config.server.access,
+            )
+            .with_jwt_secret(config.auth.jwt_secret.clone())
+            .with_api_url(Some(config.api.url.clone()))
+            .with_aginx_token(config.relay.token.clone())
+            .with_relay_config(config.relay.domain.clone(), config.relay.port)
+        );
 
         Self {
             acp_handler,
@@ -69,7 +76,13 @@ impl Handler {
         loop {
             line.clear();
 
-            let bytes_read = reader.read_line(&mut line).await?;
+            let bytes_read = tokio::time::timeout(
+                Duration::from_secs(300),
+                reader.read_line(&mut line)
+            ).await.unwrap_or_else(|_| {
+                tracing::info!("Connection idle timeout (300s) for {}", peer_addr);
+                Ok(0)
+            })?;
             if bytes_read == 0 {
                 tracing::debug!("ACP connection closed by {}", peer_addr);
                 break;

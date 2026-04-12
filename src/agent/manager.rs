@@ -40,6 +40,8 @@ pub struct AgentInfo {
     pub storage_path: Option<String>,
     /// 通信协议: "acp" | "claude-stream"
     pub protocol: String,
+    /// 进程超时（秒），process 类型专用
+    pub timeout: Option<u64>,
 }
 
 impl From<AgentEntry> for AgentInfo {
@@ -60,6 +62,7 @@ impl From<AgentEntry> for AgentInfo {
             access: AccessMode::default(),
             storage_path: None,
             protocol: "acp".to_string(),
+            timeout: config.timeout,
         }
     }
 }

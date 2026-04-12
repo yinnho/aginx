@@ -121,6 +121,14 @@ pub struct RelayClient {
     client_auth: Arc<Mutex<HashMap<String, crate::acp::ConnectionAuth>>>,
     /// 全局访问模式
     access: crate::config::AccessMode,
+    /// API URL for heartbeat and agent catalog
+    api_url: String,
+    /// Aginx JWT token (from registration, for heartbeat auth)
+    aginx_token: Option<String>,
+    /// Agent manager for listing agents to publish
+    agent_manager: Arc<AgentManager>,
+    /// Whether to publish agent list to aginx-api
+    publish_agents: bool,
 }
 
 impl RelayClient {
@@ -144,12 +152,18 @@ impl RelayClient {
 
         // 创建 ACP handler (统一协议处理)
         let agents_dir = config.agents.get_agents_dir();
-        let acp_handler = Arc::new(AcpHandler::with_access(
-            agent_manager.clone(),
-            session_manager.clone(),
-            agents_dir,
-            config.server.access,
-        ));
+        let acp_handler = Arc::new(
+            AcpHandler::with_access(
+                agent_manager.clone(),
+                session_manager.clone(),
+                agents_dir,
+                config.server.access,
+            )
+            .with_jwt_secret(config.auth.jwt_secret.clone())
+            .with_api_url(Some(config.api.url.clone()))
+            .with_aginx_token(config.relay.token.clone())
+            .with_relay_config(config.relay.domain.clone(), config.relay.port)
+        );
 
         Self {
             relay_url,
@@ -161,6 +175,10 @@ impl RelayClient {
             acp_handler,
             client_auth: Arc::new(Mutex::new(HashMap::new())),
             access: config.server.access.clone(),
+            api_url: config.api.url.clone(),
+            aginx_token: config.relay.token.clone(),
+            agent_manager,
+            publish_agents: config.relay.publish_agents,
         }
     }
 
@@ -275,7 +293,7 @@ impl RelayClient {
         Ok(())
     }
 
-    /// 消息处理循环 (启动心跳 + 处理消息)
+    /// 消息处理循环 (启动心跳 + Agent 上报 + 处理消息)
     async fn message_loop<R: AsyncBufReadExt + AsyncRead + Unpin>(
         &self,
         reader: &mut R,
@@ -301,6 +319,36 @@ impl RelayClient {
                 }
             }
         });
+
+        // 启动 Agent 目录上报任务
+        let publish_handle = if self.publish_agents {
+            if self.aginx_token.is_none() {
+                tracing::warn!("publish_agents is enabled but no aginx_token configured — skipping");
+                None
+            } else {
+                let api_url = self.api_url.clone();
+                let aginx_id = self.aginx_id.clone();
+                let aginx_token = self.aginx_token.clone();
+                let agent_manager = self.agent_manager.clone();
+                let interval_secs = self.heartbeat_interval;
+
+                Some(tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                    // Skip the first immediate tick
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        if let Err(e) = publish_agents_to_api(
+                            &api_url, &aginx_id, &aginx_token, &agent_manager,
+                        ).await {
+                            tracing::warn!("Agent catalog publish failed: {}", e);
+                        }
+                    }
+                }))
+            }
+        } else {
+            None
+        };
 
         // 消息处理循环
         loop {
@@ -365,6 +413,9 @@ impl RelayClient {
 
         // 停止心跳任务
         heartbeat_handle.abort();
+        if let Some(h) = publish_handle {
+            h.abort();
+        }
 
         Ok(())
     }
@@ -479,5 +530,55 @@ async fn send_acp_response(
     w.flush().await?;
 
     tracing::debug!("发送响应给客户端 [{}]", client_id);
+    Ok(())
+}
+
+/// Publish agent list to aginx-api
+async fn publish_agents_to_api(
+    api_url: &str,
+    _aginx_id: &str,
+    aginx_token: &Option<String>,
+    agent_manager: &Arc<AgentManager>,
+) -> anyhow::Result<()> {
+    let agents = agent_manager.list_agents().await;
+
+    if agents.is_empty() {
+        tracing::trace!("No agents to publish");
+        return Ok(());
+    }
+
+    // Build agent catalog entries matching aginx-api UpsertAgent schema
+    let agent_entries: Vec<serde_json::Value> = agents.iter().map(|a| {
+        serde_json::json!({
+            "id": a.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            "name": a.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+            "agent_type": a.get("agentType").and_then(|v| v.as_str())
+                .or_else(|| a.get("agent_type").and_then(|v| v.as_str()))
+                .unwrap_or("process"),
+            "description": a.get("description").and_then(|v| v.as_str()),
+            "version": a.get("version").and_then(|v| v.as_str()),
+            "capabilities": a.get("capabilities").unwrap_or(&serde_json::json!([])),
+        })
+    }).collect();
+
+    let client = reqwest::Client::new();
+    let mut req = client.post(format!("{}/api/v1/agents/upsert", api_url))
+        .json(&serde_json::json!({
+            "agents": agent_entries,
+        }));
+
+    // aginx-api uses JWT Bearer auth
+    if let Some(token) = aginx_token {
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("API agents/upsert failed ({}): {}", status, body));
+    }
+
+    tracing::debug!("Published {} agents to catalog", agent_entries.len());
     Ok(())
 }

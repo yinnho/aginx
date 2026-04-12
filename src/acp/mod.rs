@@ -10,6 +10,7 @@ mod streaming;
 pub mod agent_process;
 pub mod agent_event;
 pub mod adapter;
+pub mod acp_client;
 
 #[cfg(feature = "acp-native")]
 mod backend;

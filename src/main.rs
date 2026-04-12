@@ -12,6 +12,7 @@ mod agent;
 mod relay;
 mod binding;
 mod acp;
+mod auth;
 mod fingerprint;
 
 use std::path::PathBuf;
@@ -141,7 +142,12 @@ async fn main() -> anyhow::Result<()> {
             let config = Arc::new(config);
             print_startup_info(&config);
             let server = server::Server::new(config.clone(), agent_manager)?;
-            server.run().await?;
+            tokio::select! {
+                r = server.run() => r?,
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("收到 Ctrl+C，正在关闭...");
+                }
+            }
         }
         ServerMode::Relay => {
             tracing::info!("运行模式: 中继 (Relay)");
@@ -177,7 +183,12 @@ async fn main() -> anyhow::Result<()> {
 
             // 连接 relay
             let mut relay_client = relay::RelayClient::new(&config, agent_manager);
-            relay_client.connect().await?;
+            tokio::select! {
+                r = relay_client.connect() => r?,
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("收到 Ctrl+C，正在关闭...");
+                }
+            }
         }
     }
 

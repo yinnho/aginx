@@ -60,6 +60,9 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 hex = "0.4"
 
+# JWT authentication
+jsonwebtoken = "9"
+
 # Singleton
 once_cell = "1"
 which = "8.0.2"
