@@ -339,12 +339,42 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             let manager = binding::get_binding_manager();
             let mut mgr = manager.lock().unwrap();
 
-            if mgr.get_bound_device().is_some() {
-                mgr.unbind_all();
-                println!("设备已解绑");
-            } else {
+            if mgr.get_bound_device().is_none() {
                 println!("没有已绑定的设备");
+                return Ok(());
             }
+
+            // 1. 清除本地绑定
+            mgr.unbind_all();
+            drop(mgr); // 提前释放锁
+            println!("本地绑定已清除");
+
+            // 2. 尝试通知 aginx-api 注销
+            let config_result = config::load_config(&config::CliArgs::default());
+            if let Ok(config_result) = config_result {
+                let cfg = &config_result.config;
+                if let Some(ref token) = cfg.relay.token {
+                    if let Err(e) = deregister_from_api(&cfg.api.url, token).await {
+                        println!("警告: API 注销失败 ({})，本地绑定已清除", e);
+                    } else {
+                        println!("API 注销成功");
+                        // 清除配置中的 relay id 和 token，下次启动会重新注册
+                        if let Some(ref config_path) = config_result.config_path {
+                            let mut new_config = config_result.config;
+                            new_config.relay.id = None;
+                            new_config.relay.token = None;
+                            new_config.relay.url = None;
+                            if let Err(e) = config::save_config(&new_config, config_path) {
+                                println!("警告: 清除配置失败 ({})", e);
+                            } else {
+                                println!("Relay 配置已清除，下次启动将重新注册");
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("设备已解绑");
         }
         Commands::Fingerprint => {
             use crate::fingerprint::HardwareFingerprint;
@@ -422,5 +452,24 @@ async fn run_acp_mode(stdio: bool, default_agent: Option<String>) -> anyhow::Res
     // 清理
     cleanup_handle.abort();
 
+    Ok(())
+}
+
+/// 调用 aginx-api 注销实例
+async fn deregister_from_api(api_url: &str, token: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/v1/instances/deregister", api_url))
+        .bearer_auth(token)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("API 注销失败 ({}): {}", status, body));
+    }
+
+    tracing::info!("aginx-api 实例已注销");
     Ok(())
 }

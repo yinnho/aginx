@@ -293,9 +293,20 @@ impl BindingManager {
         }
     }
 
+    /// 检查 binding.json 文件是否已被外部删除，同步内存状态
+    fn sync_with_file(&mut self) {
+        if self.bound_device.is_some() && !self.device_path().exists() {
+            tracing::info!("检测到 binding.json 被外部删除，同步清除内存绑定状态");
+            self.bound_device = None;
+        }
+    }
+
     /// 验证配对码并绑定设备（独占模式）
     /// 如果已经有绑定的设备，返回 AlreadyBound
     pub fn bind_device(&mut self, code: &str, device_name: &str) -> BindResult {
+        // 同步文件状态（可能被 aginx unbind 删除）
+        self.sync_with_file();
+
         // 检查是否已被绑定
         if let Some(ref device) = self.bound_device {
             return BindResult::AlreadyBound {
@@ -371,8 +382,12 @@ impl BindingManager {
     }
 
     /// 验证 Token (constant-time comparison)
-    pub fn verify_token(&self, token: &str) -> Option<&DeviceInfo> {
-        self.bound_device.as_ref().filter(|d| constant_time_eq(&d.token, token))
+    /// 同时检查 binding.json 文件是否还存在（被外部 aginx unbind 删除时自动感知）
+    pub fn verify_token(&mut self, token: &str) -> Option<DeviceInfo> {
+        self.sync_with_file();
+        self.bound_device.as_ref()
+            .filter(|d| constant_time_eq(&d.token, token))
+            .cloned()
     }
 
     #[allow(dead_code)]

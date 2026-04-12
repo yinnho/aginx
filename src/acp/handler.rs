@@ -210,7 +210,7 @@ impl AcpHandler {
         let authenticated = if let Some(token) = token {
             // Path 1: local device binding token
             let mgr = crate::binding::get_binding_manager();
-            let mgr = mgr.lock().unwrap();
+            let mut mgr = mgr.lock().unwrap();
             if mgr.verify_token(token).is_some() {
                 true
             } else {
