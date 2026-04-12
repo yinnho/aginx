@@ -4,7 +4,6 @@
 //! 自动生成 aginx.toml 配置文件。
 
 use std::io::{self, Write};
-use std::path::Path;
 
 /// Agent 模板定义
 struct AgentTemplate {
