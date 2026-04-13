@@ -200,10 +200,21 @@ fn process_line(
     };
 
     match event {
-        AgentEvent::System { session_id: sid, .. } => {
-            if let Some(sid) = sid {
-                tracing::info!("Got Claude session_id from init: {}", sid);
-                *agent_session_id = Some(sid);
+        AgentEvent::System { session_id: sid, subtype } => {
+            match subtype.as_deref() {
+                Some("init") => {
+                    if let Some(sid) = sid {
+                        tracing::info!("Got Claude session_id from init: {}", sid);
+                        *agent_session_id = Some(sid);
+                    }
+                }
+                Some("api_retry") => {
+                    tracing::warn!("Claude API rate limited for session {:?}, aborting", sid);
+                    return Err("API rate limited (429), please try again later".to_string());
+                }
+                other => {
+                    tracing::info!("Claude system event: subtype={:?}, session={:?}", other, sid);
+                }
             }
             Ok(None)
         }
@@ -306,13 +317,13 @@ fn process_line(
             }
 
             if let Some(text) = result {
-                tracing::info!("[STREAM] Result event, text_len={}, accumulated_empty={}", text.len(), accumulated_content.is_empty());
+                tracing::info!("[STREAM] Result event, text_len={}, is_error={:?}, accumulated_empty={}", text.len(), is_error, accumulated_content.is_empty());
+                if is_error.unwrap_or(false) {
+                    return Err(format!("Claude error: {}", text));
+                }
                 if !text.is_empty() && accumulated_content.is_empty() {
                     accumulated_content.push_str(&text);
                     return Ok(Some(make_chunk_notification(session_id, &text)));
-                }
-                if is_error.unwrap_or(false) {
-                    return Err(format!("Claude error: {}", text));
                 }
             }
 

@@ -218,13 +218,6 @@ async fn handle_aginx(
             send_error(&writer, "ID must be alphanumeric").await;
             return Ok(());
         }
-        // 检查 ID 是否已被占用
-        let state_read = state.read().await;
-        if state_read.aginx_senders.contains_key(&id) {
-            drop(state_read);
-            send_error(&writer, &format!("ID '{}' is already in use", id)).await;
-            return Ok(());
-        }
         id
     } else if let Some(ref fp) = fingerprint {
         // 没有指定 ID，但有指纹，尝试根据指纹恢复 ID
@@ -232,12 +225,6 @@ async fn handle_aginx(
         if let Some(existing_id) = state_read.fingerprint_to_id.get(fp) {
             let existing_id = existing_id.clone();
             tracing::info!("根据指纹恢复 ID: {} -> {}", fp, existing_id);
-            // 检查该 ID 是否当前在线
-            if state_read.aginx_senders.contains_key(&existing_id) {
-                drop(state_read);
-                send_error(&writer, &format!("Device with this fingerprint is already online (ID: {})", existing_id)).await;
-                return Ok(());
-            }
             existing_id
         } else {
             // 没有找到映射，生成新 ID
@@ -255,12 +242,15 @@ async fn handle_aginx(
     // 创建接收通道
     let (tx, mut rx) = mpsc::channel::<ToAginx>(100);
 
-    // 注册到状态 (需要再次检查，因为之前释放了锁)
+    // 注册到状态：如果 ID 已存在，踢掉旧连接（允许重连）
     {
         let mut state = state.write().await;
         if state.aginx_senders.contains_key(&aginx_id) {
-            send_error(&writer, &format!("ID '{}' is already in use", aginx_id)).await;
-            return Ok(());
+            tracing::info!("Aginx [{}] 重连，踢掉旧连接", aginx_id);
+            // 关闭旧 sender，让旧的 recv 循环退出
+            if let Some(old_tx) = state.aginx_senders.remove(&aginx_id) {
+                drop(old_tx);
+            }
         }
         state.aginx_senders.insert(aginx_id.clone(), tx);
         state.aginx_clients.insert(aginx_id.clone(), Vec::new());

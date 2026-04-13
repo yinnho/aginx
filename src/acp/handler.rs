@@ -495,7 +495,7 @@ impl AcpHandler {
             // 根据协议选择处理路径
             if agent_info.protocol == "claude-stream" {
                 // Legacy 模式：每次启动新进程，使用 stream-json 输出格式
-                tracing::info!("[PROMPT] Starting legacy streaming for session {}", params.sessionId);
+                tracing::info!("[PROMPT] Starting legacy streaming for session {}, workdir={:?}", params.sessionId, session_info.workdir);
                 let mut event_rx = match super::streaming::StreamingSession::run_streaming_async(
                     params.sessionId.clone(),
                     agent_info,
