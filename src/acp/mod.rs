@@ -5,12 +5,13 @@
 
 mod types;
 mod handler;
-mod notifications;
-mod streaming;
-pub mod agent_process;
-pub mod agent_event;
+pub mod notifications;
+pub mod streaming_types;
 pub mod adapter;
 pub mod acp_client;
+pub mod timeline;
+pub mod permission;
+pub mod orchestrator;
 
 #[cfg(feature = "acp-native")]
 mod backend;

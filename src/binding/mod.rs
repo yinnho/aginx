@@ -82,8 +82,8 @@ struct PairCodeData {
 struct FailedAttemptsData {
     /// 失败次数
     count: u32,
-    /// 首次失败时间
-    first_failure: i64,
+    /// 最近一次失败时间
+    last_failure: i64,
 }
 
 /// 配对结果
@@ -243,7 +243,7 @@ impl BindingManager {
             let now = chrono::Utc::now().timestamp();
             // 如果在锁定时间内
             if data.count >= MAX_FAILED_ATTEMPTS {
-                let lockout_end = data.first_failure + FAILED_ATTEMPTS_LOCKOUT_SECS;
+                let lockout_end = data.last_failure + FAILED_ATTEMPTS_LOCKOUT_SECS;
                 if now < lockout_end {
                     tracing::warn!("配对功能已被临时锁定，剩余 {} 秒", lockout_end - now);
                     return true;
@@ -260,13 +260,11 @@ impl BindingManager {
         let now = chrono::Utc::now().timestamp();
         let mut data = self.load_failed_attempts().unwrap_or(FailedAttemptsData {
             count: 0,
-            first_failure: now,
+            last_failure: now,
         });
 
         data.count += 1;
-        if data.count == 1 {
-            data.first_failure = now;
-        }
+        data.last_failure = now;
 
         if let Err(e) = self.save_failed_attempts(&data) {
             tracing::warn!("保存失败尝试记录失败: {}", e);

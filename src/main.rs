@@ -107,6 +107,13 @@ enum Commands {
         #[arg(short = 'a', long)]
         agent: Option<String>,
     },
+
+    /// 运行 MCP Server (用于 Agent-to-Agent 通信)
+    McpServe {
+        /// 指定默认 Agent ID
+        #[arg(short = 'a', long)]
+        agent_id: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -395,6 +402,9 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
         Commands::Acp { stdio, agent } => {
             run_acp_mode(stdio, agent).await?;
         }
+        Commands::McpServe { agent_id } => {
+            run_mcp_serve(agent_id).await?;
+        }
     }
 
     Ok(())
@@ -471,5 +481,189 @@ async fn deregister_from_api(api_url: &str, token: &str) -> anyhow::Result<()> {
     }
 
     tracing::info!("aginx-api 实例已注销");
+    Ok(())
+}
+
+/// Run MCP server for agent-to-agent communication over stdio.
+async fn run_mcp_serve(_agent_id: Option<String>) -> anyhow::Result<()> {
+    use crate::agent::{SessionManager, SessionConfig};
+
+    let config = config::load_config(&config::CliArgs::default())?.config;
+    let agent_manager = Arc::new(AgentManager::from_config(&config));
+    let session_config = SessionConfig {
+        max_concurrent: config.server.max_concurrent_sessions,
+        timeout_seconds: config.server.session_timeout_seconds,
+    };
+    let session_manager = Arc::new(SessionManager::new(session_config));
+
+    let orchestrator = Arc::new(crate::acp::orchestrator::AgentOrchestrator::new(
+        agent_manager,
+        session_manager,
+    ));
+
+    // Simple MCP server: read JSON-RPC from stdin, write responses to stdout
+    tracing::info!("MCP server starting on stdio");
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+    let mut lines = stdin.lines();
+
+    // MCP initialize
+    while let Ok(Some(line)) = lines.next_line().await {
+        let msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let id = msg.get("id").cloned();
+
+        match method {
+            "initialize" => {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "aginx-mcp", "version": env!("CARGO_PKG_VERSION") }
+                    }
+                });
+                stdout.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            "tools/list" => {
+                let tools = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [
+                            {
+                                "name": "aginx_list_agents",
+                                "description": "List all available agents on this aginx instance",
+                                "inputSchema": { "type": "object", "properties": {} }
+                            },
+                            {
+                                "name": "aginx_create_sub_agent",
+                                "description": "Create a sub-agent session for agent-to-agent communication",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "agentId": { "type": "string", "description": "Target agent ID" },
+                                        "workdir": { "type": "string", "description": "Working directory for the sub-agent" }
+                                    },
+                                    "required": ["agentId"]
+                                }
+                            },
+                            {
+                                "name": "aginx_cancel_agent",
+                                "description": "Cancel a running sub-agent",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "subSessionId": { "type": "string", "description": "The sub-agent session ID" }
+                                    },
+                                    "required": ["subSessionId"]
+                                }
+                            },
+                            {
+                                "name": "aginx_list_sub_agents",
+                                "description": "List all sub-agents for the current parent session",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "parentSessionId": { "type": "string", "description": "The parent session ID" }
+                                    },
+                                    "required": ["parentSessionId"]
+                                }
+                            }
+                        ]
+                    }
+                });
+                stdout.write_all(serde_json::to_string(&tools).unwrap().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            "tools/call" => {
+                let tool_name = msg.get("params")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let args = msg.get("params")
+                    .and_then(|p| p.get("arguments"))
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+
+                let result = match tool_name {
+                    "aginx_list_agents" => {
+                        let agents = orchestrator.list_available_agents().await;
+                        serde_json::json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&agents).unwrap_or_default() }] })
+                    }
+                    "aginx_create_sub_agent" => {
+                        let agent_id = args.get("agentId").and_then(|v| v.as_str()).unwrap_or("");
+                        let workdir = args.get("workdir").and_then(|v| v.as_str());
+                        match orchestrator.create_sub_agent("mcp-parent", agent_id, workdir).await {
+                            Ok(session_id) => serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("Sub-agent created: {}", session_id) }]
+                            }),
+                            Err(e) => serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("Error: {}", e) }],
+                                "isError": true
+                            }),
+                        }
+                    }
+                    "aginx_cancel_agent" => {
+                        let sub_session_id = args.get("subSessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        match orchestrator.cancel_sub_agent(sub_session_id).await {
+                            Ok(()) => serde_json::json!({
+                                "content": [{ "type": "text", "text": "Sub-agent canceled" }]
+                            }),
+                            Err(e) => serde_json::json!({
+                                "content": [{ "type": "text", "text": format!("Error: {}", e) }],
+                                "isError": true
+                            }),
+                        }
+                    }
+                    "aginx_list_sub_agents" => {
+                        let parent = args.get("parentSessionId").and_then(|v| v.as_str()).unwrap_or("");
+                        let subs = orchestrator.list_sub_agents(parent).await;
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&subs).unwrap_or_default() }]
+                        })
+                    }
+                    _ => serde_json::json!({
+                        "content": [{ "type": "text", "text": format!("Unknown tool: {}", tool_name) }],
+                        "isError": true
+                    }),
+                };
+
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result
+                });
+                stdout.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            "notifications/initialized" => {
+                // No response needed for notifications
+                continue;
+            }
+            _ => {
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("Method not found: {}", method) }
+                });
+                stdout.write_all(serde_json::to_string(&resp).unwrap().as_bytes()).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+        }
+    }
+
     Ok(())
 }

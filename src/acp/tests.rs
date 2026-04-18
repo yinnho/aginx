@@ -26,7 +26,7 @@ mod tests {
             id: Some(Id::Number(1)),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({
-                "protocolVersion": "0.15.0",
+                "protocolVersion": 1,
                 "clientInfo": {
                     "name": "test",
                     "version": "1.0.0"
@@ -41,8 +41,8 @@ mod tests {
 
         let result = response.result.unwrap();
         assert_eq!(
-            result.get("protocolVersion").and_then(|v| v.as_str()),
-            Some("0.15.0")
+            result.get("protocolVersion").and_then(|v| v.as_u64()),
+            Some(1)
         );
     }
 
@@ -60,7 +60,7 @@ mod tests {
         let request = AcpRequest {
             jsonrpc: "2.0".to_string(),
             id: Some(Id::Number(1)),
-            method: "newSession".to_string(),
+            method: "session/new".to_string(),
             params: Some(serde_json::json!({
                 "cwd": "/tmp"
             })),

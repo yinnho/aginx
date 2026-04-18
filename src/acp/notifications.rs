@@ -1,9 +1,9 @@
 //! 通用 ACP 通知构建函数
 //!
-//! 用于构建 sessionUpdate 等 ACP 协议通知，不依赖任何特定 agent 的协议。
+//! 用于构建 session/update 等 ACP 协议通知，不依赖任何特定 agent 的协议。
 
 use super::types::{
-    AcpResponse, MessageContent, SessionUpdate, SessionUpdateParams,
+    AcpResponse, ContentBlock, SessionUpdate, SessionUpdateParams,
     StopReason, ToolCallContent, ToolCallStatus, ToolKind,
 };
 
@@ -26,19 +26,37 @@ pub async fn write_ndjson<W: tokio::io::AsyncWriteExt + Unpin>(
 // Notification builders
 // ---------------------------------------------------------------------------
 
-/// Create an `agent_message_chunk` sessionUpdate notification JSON string.
+/// Create an `agent_message_chunk` session/update notification JSON string.
 pub fn make_chunk_notification(session_id: &str, text: &str) -> String {
     let params = SessionUpdateParams {
         sessionId: session_id.to_string(),
         update: SessionUpdate::AgentMessageChunk {
-            content: MessageContent::Text { text: text.to_string() },
+            content: ContentBlock::Text { text: text.to_string(), annotations: None },
         },
     };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", params))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&AcpResponse::notification("session/update", params))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to serialize notification: {}", e);
+            String::new()
+        })
 }
 
-/// Create a `tool_call` sessionUpdate notification JSON string.
+/// Create an `agent_thought_chunk` session/update notification JSON string.
+pub fn make_thought_notification(session_id: &str, text: &str) -> String {
+    let params = SessionUpdateParams {
+        sessionId: session_id.to_string(),
+        update: SessionUpdate::AgentThoughtChunk {
+            content: ContentBlock::Text { text: text.to_string(), annotations: None },
+        },
+    };
+    serde_json::to_string(&AcpResponse::notification("session/update", params))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to serialize notification: {}", e);
+            String::new()
+        })
+}
+
+/// Create a `tool_call` session/update notification JSON string.
 pub fn make_tool_notification(
     session_id: &str,
     tool_call_id: &str,
@@ -50,16 +68,22 @@ pub fn make_tool_notification(
         update: SessionUpdate::ToolCall {
             toolCallId: tool_call_id.to_string(),
             title: title.to_string(),
-            status: ToolCallStatus::InProgress,
-            rawInput: None,
+            status: Some(ToolCallStatus::Pending),
             kind: kind.cloned(),
+            content: None,
+            locations: None,
+            rawInput: None,
+            rawOutput: None,
         },
     };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", params))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&AcpResponse::notification("session/update", params))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to serialize notification: {}", e);
+            String::new()
+        })
 }
 
-/// Create a `tool_call_update` sessionUpdate notification JSON string.
+/// Create a `tool_call_update` session/update notification JSON string.
 pub fn make_tool_update_notification(
     session_id: &str,
     tool_call_id: &str,
@@ -68,7 +92,7 @@ pub fn make_tool_update_notification(
 ) -> String {
     let content = output.map(|o| {
         vec![ToolCallContent::Content {
-            content: MessageContent::Text { text: o.to_string() },
+            content: ContentBlock::Text { text: o.to_string(), annotations: None },
         }]
     });
     let params = SessionUpdateParams {
@@ -76,12 +100,19 @@ pub fn make_tool_update_notification(
         update: SessionUpdate::ToolCallUpdate {
             toolCallId: tool_call_id.to_string(),
             status: Some(status),
-            rawOutput: output.map(|o| serde_json::json!(o)),
+            title: None,
+            kind: None,
             content,
+            locations: None,
+            rawInput: None,
+            rawOutput: output.map(|o| serde_json::json!(o)),
         },
     };
-    serde_json::to_string(&AcpResponse::notification("sessionUpdate", params))
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&AcpResponse::notification("session/update", params))
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to serialize notification: {}", e);
+            String::new()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -92,10 +123,10 @@ pub fn make_tool_update_notification(
 pub fn stop_reason_str(reason: &StopReason) -> &'static str {
     match reason {
         StopReason::EndTurn => "end_turn",
-        StopReason::Stop => "stop",
-        StopReason::Cancelled => "cancelled",
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::MaxTurnRequests => "max_turn_requests",
         StopReason::Refusal => "refusal",
-        StopReason::Error => "error",
+        StopReason::Cancelled => "cancelled",
     }
 }
 
@@ -153,12 +184,12 @@ pub fn infer_tool_kind(name: &str) -> Option<ToolKind> {
     match name {
         "Read" => Some(ToolKind::Read),
         "Edit" => Some(ToolKind::Edit),
-        "Write" => Some(ToolKind::Other),
+        "Write" => Some(ToolKind::Edit),
         "Delete" => Some(ToolKind::Delete),
         "Glob" | "Grep" => Some(ToolKind::Search),
         "Bash" => Some(ToolKind::Execute),
         "WebFetch" => Some(ToolKind::Fetch),
-        _ => Some(ToolKind::Other),
+        _ => None,
     }
 }
 

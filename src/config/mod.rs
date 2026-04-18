@@ -217,8 +217,6 @@ impl RelayConfig {
     pub fn get_connect_url(&self) -> String {
         if let Some(ref url) = self.url {
             url.clone()
-        } else if let Some(ref id) = self.id {
-            format!("{}.{}:{}", id, self.domain, self.port)
         } else {
             format!("{}:{}", self.domain, self.port)
         }
@@ -340,6 +338,9 @@ pub struct AgentEntry {
     pub id: String,
     /// Agent 名称
     pub name: String,
+    /// 目标 Agent ID (用于 ACP adapter 映射到子 Agent，如 OpenCarrier 内部 agent)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent_id: Option<String>,
     /// Agent 类型
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
@@ -382,6 +383,10 @@ pub struct AgentEntry {
     /// 会话配置
     #[serde(default)]
     pub session: SessionField,
+
+    /// 权限策略配置
+    #[serde(default)]
+    pub permissions: crate::acp::permission::PermissionPolicy,
 }
 
 /// 会话配置

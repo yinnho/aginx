@@ -3,6 +3,8 @@
 //! 连接到 relay 服务器，让内网的 aginx 可以对外提供服务
 //! 支持 TLS (通过 nginx stream 终止) 或纯 TCP
 
+pub mod e2ee;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -432,6 +434,7 @@ async fn handle_data_message(
     global_access: &crate::config::AccessMode,
 ) -> anyhow::Result<()> {
     // 解析 ACP 请求
+    tracing::info!("[RELAY] Raw data from client {}: {}", client_id, data);
     let request: AcpRequest = match serde_json::from_value(data) {
         Ok(req) => req,
         Err(e) => {
@@ -486,7 +489,14 @@ async fn handle_data_message(
                 }
             });
 
-            let _response = acp_handler.handle_prompt(request, tx, auth).await;
+            let response = acp_handler.handle_prompt(request, tx, auth).await;
+
+            // Send non-streaming responses (errors) back to client
+            if response.result.as_ref().and_then(|r| r.get("streaming")).is_none() {
+                if let Err(e) = send_acp_response(&writer, &client_id, &response).await {
+                    tracing::error!("Failed to send prompt error response: {}", e);
+                }
+            }
 
             let _ = notify_task.await;
         });

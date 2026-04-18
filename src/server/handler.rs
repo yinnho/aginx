@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::config::AccessMode;
 use crate::agent::{AgentManager, SessionManager};
 use crate::acp::{AcpHandler, AcpRequest, AcpResponse, ConnectionAuth};
-use crate::acp::agent_event::write_ndjson;
+use crate::acp::notifications::write_ndjson;
 
 /// Request handler
 pub struct Handler {

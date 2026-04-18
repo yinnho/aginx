@@ -84,7 +84,7 @@ impl AcpClient {
 
     /// List agents on the remote aginx
     pub async fn list_agents(&mut self) -> anyhow::Result<Vec<serde_json::Value>> {
-        let req = self.build_request("listAgents", serde_json::json!({}));
+        let req = self.build_request("_aginx/listAgents", serde_json::json!({}));
         self.send_request(&req).await?;
         let resp = self.read_response().await?;
         self.extract_array(resp, "agents")
@@ -94,7 +94,7 @@ impl AcpClient {
     pub async fn create_session(&mut self, agent_id: &str, workdir: Option<&str>) -> anyhow::Result<String> {
         let req = self.build_request("session/new", serde_json::json!({
             "cwd": workdir,
-            "_meta": {"agentId": agent_id}
+            "_meta": {"aginx/agentId": agent_id}
         }));
         self.send_request(&req).await?;
         let resp = self.read_response().await?;
@@ -105,7 +105,7 @@ impl AcpClient {
     pub async fn load_session(&mut self, session_id: &str, agent_id: Option<&str>) -> anyhow::Result<String> {
         let mut params = serde_json::json!({"sessionId": session_id});
         if let Some(aid) = agent_id {
-            params["agentId"] = serde_json::json!(aid);
+            params["_meta"] = serde_json::json!({"aginx/agentId": aid});
         }
         let req = self.build_request("session/load", params);
         self.send_request(&req).await?;
@@ -144,12 +144,7 @@ impl AcpClient {
 
             if !streaming {
                 // Non-streaming: send the result as a Done event
-                let content = initial.result.as_ref()
-                    .and_then(|r| r.get("response"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_default();
-                let _ = tx.send(PromptEvent::Done { content }).await;
+                let _ = tx.send(PromptEvent::Done).await;
                 return;
             }
 
@@ -173,12 +168,7 @@ impl AcpClient {
                             }
                             // Final response with result
                             if resp.result.is_some() {
-                                let content = resp.result.as_ref()
-                                    .and_then(|r| r.get("response"))
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from)
-                                    .unwrap_or_default();
-                                let _ = tx.send(PromptEvent::Done { content }).await;
+                                let _ = tx.send(PromptEvent::Done).await;
                                 break;
                             }
                         } else {
@@ -212,9 +202,9 @@ impl AcpClient {
             id: Some(Id::Number(1)),
             method: "initialize".to_string(),
             params: Some(serde_json::json!({
-                "protocolVersion": "0.15.0",
+                "protocolVersion": 1,
                 "clientInfo": {"name": "aginx", "version": env!("CARGO_PKG_VERSION")},
-                "_meta": {"authToken": jwt_token}
+                "_meta": {"aginx/authToken": jwt_token}
             })),
         };
         self.send_request(&init_req).await?;
@@ -291,10 +281,10 @@ impl AcpClient {
 /// Events from a streaming prompt response
 #[derive(Debug, Clone)]
 pub enum PromptEvent {
-    /// A notification (sessionUpdate, etc.)
+    /// A notification (session/update, etc.)
     Notification(String),
-    /// Final response with content
-    Done { content: String },
+    /// Final response
+    Done,
     /// Error occurred
     Error { message: String },
 }

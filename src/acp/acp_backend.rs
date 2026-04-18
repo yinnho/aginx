@@ -57,7 +57,7 @@ impl AcpProcess {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "0.15.0",
+                "protocolVersion": 1,
                 "clientInfo": {
                     "name": "aginx",
                     "version": "0.1.0"

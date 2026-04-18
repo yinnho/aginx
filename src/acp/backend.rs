@@ -28,7 +28,7 @@ pub trait AgentBackend: Send + Sync {
         workdir: Option<&str>,
     ) -> Result<()>;
 
-    /// 发送 prompt，通过 tx 发送 ACP sessionUpdate 通知（JSON 字符串）
+    /// 发送 prompt，通过 tx 发送 ACP session/update 通知（JSON 字符串）
     /// 完成时发送最终响应
     async fn prompt(
         &self,

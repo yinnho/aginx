@@ -12,6 +12,9 @@ pub struct AgentConfig {
     pub id: String,
     /// 显示名称
     pub name: String,
+    /// 目标 Agent ID (用于 ACP adapter 映射到子 Agent)
+    #[serde(default)]
+    pub target_agent_id: Option<String>,
     /// Agent 类型: claude, process, builtin
     pub agent_type: String,
     /// 版本
@@ -85,6 +88,23 @@ pub struct SessionConfig {
     /// 配置此项后，listConversations/getMessages/delete 会从该目录读取
     #[serde(default)]
     pub storage_path: Option<String>,
+
+    /// 存储格式: "claude-jsonl" (默认) | "gemini-json"
+    #[serde(default)]
+    pub storage_format: Option<String>,
+
+    /// 会话列表命令配置
+    /// 通过运行 agent CLI 命令获取 session 列表，而非扫描文件
+    #[serde(default)]
+    pub list: Option<SessionListConfig>,
+}
+
+/// 会话列表命令配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionListConfig {
+    /// 列举会话的额外参数（追加到 command 后面）
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -262,11 +282,24 @@ fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Opt
             (true, None)
         }
     } else {
-        // 没有检测配置，用 agent_type 作为命令名检测
+        // 没有检测配置，按优先级检测可用性：
+        // 1. agent_type 作为命令名 which 检测
+        // 2. command.path 文件存在或 which 检测
         let cmd = config.agent_type.as_str();
         if !cmd.is_empty() && cmd != "process" && cmd != "builtin" {
             if which::which(cmd).is_ok() {
                 (true, None)
+            } else if let Some(ref cmd_config) = config.command {
+                // agent_type 不在 PATH，但 command.path 可能是绝对路径
+                if let Some(ref path) = cmd_config.path {
+                    if Path::new(path).exists() || which::which(path).is_ok() {
+                        (true, None)
+                    } else {
+                        (false, Some(format!("Command not found: {} (agent_type '{}' not in PATH)", path, cmd)))
+                    }
+                } else {
+                    (false, Some(format!("{} not in PATH and no command.path set", cmd)))
+                }
             } else {
                 (false, Some(format!("{} command not found in PATH", cmd)))
             }
@@ -341,6 +374,7 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
     super::manager::AgentInfo {
         id: config.id,
         name: config.name,
+        target_agent_id: config.target_agent_id.clone(),
         agent_type,
         command,
         args,
@@ -356,6 +390,8 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
         access,
         storage_path: config.session.as_ref()
             .and_then(|s| s.storage_path.clone()),
+        storage_format: config.session.as_ref()
+            .and_then(|s| s.storage_format.clone()),
         protocol: config.protocol.unwrap_or_else(|| {
             // 向后兼容：未显式配置 protocol 时，claude agent 默认用 claude-stream
             if agent_type_for_protocol == "claude" {
@@ -365,6 +401,10 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
             }
         }),
         timeout: config.timeout,
+        session_list_args: config.session.as_ref()
+            .and_then(|s| s.list.as_ref())
+            .map(|l| l.args.clone())
+            .unwrap_or_default(),
     }
 }
 

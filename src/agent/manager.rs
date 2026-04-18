@@ -21,6 +21,8 @@ pub struct AgentManager {
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
+    /// 目标 Agent ID (用于 ACP adapter 映射到子 Agent)
+    pub target_agent_id: Option<String>,
     pub capabilities: Vec<String>,
     pub agent_type: String,
     pub command: String,
@@ -38,10 +40,14 @@ pub struct AgentInfo {
     pub access: AccessMode,
     /// 会话存储路径（Agent 自己的会话文件目录）
     pub storage_path: Option<String>,
+    /// 存储格式: "claude-jsonl" | "gemini-json"
+    pub storage_format: Option<String>,
     /// 通信协议: "acp" | "claude-stream"
     pub protocol: String,
     /// 进程超时（秒），process 类型专用
     pub timeout: Option<u64>,
+    /// 会话列表命令参数（通过 CLI 获取 session 列表）
+    pub session_list_args: Vec<String>,
 }
 
 impl From<AgentEntry> for AgentInfo {
@@ -49,6 +55,7 @@ impl From<AgentEntry> for AgentInfo {
         Self {
             id: config.id,
             name: config.name,
+            target_agent_id: config.target_agent_id,
             capabilities: config.capabilities,
             agent_type: config.agent_type,
             command: config.command,
@@ -61,8 +68,10 @@ impl From<AgentEntry> for AgentInfo {
             default_allowed_tools: Vec::new(),
             access: AccessMode::default(),
             storage_path: None,
+            storage_format: None,
             protocol: "acp".to_string(),
             timeout: config.timeout,
+            session_list_args: Vec::new(),
         }
     }
 }

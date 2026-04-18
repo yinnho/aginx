@@ -7,35 +7,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-use super::types::{StopReason, ToolCallStatus};
-use super::agent_event::{
+use crate::acp::streaming_types::{AsyncStreamingResult, StreamingEvent};
+use crate::acp::types::{StopReason, ToolCallStatus};
+use crate::acp::notifications::{
     format_tool_title, infer_tool_kind,
-    make_chunk_notification, make_tool_notification, make_tool_update_notification,
-    AgentEvent, ContentBlock,
+    make_chunk_notification, make_thought_notification, make_tool_notification, make_tool_update_notification,
 };
+use super::events::{AgentEvent, ContentBlock};
 use crate::agent::AgentInfo;
-
-/// Async streaming result (sent through channel when complete)
-#[derive(Debug, Clone)]
-pub enum AsyncStreamingResult {
-    /// Completed successfully
-    Completed {
-        stop_reason: StopReason,
-        content: String,
-        agent_session_id: Option<String>,
-    },
-    /// Error occurred
-    Error(String),
-}
-
-/// Streaming event (for async channel communication)
-#[derive(Debug, Clone)]
-pub enum StreamingEvent {
-    /// ACP sessionUpdate notification JSON
-    Notification(String),
-    /// Streaming completed
-    Completed(AsyncStreamingResult),
-}
 
 /// Streaming session (async only, no state held)
 pub struct StreamingSession;
@@ -142,13 +121,14 @@ impl StreamingSession {
                     &mut agent_session_id,
                     &mut stop_reason,
                 ) {
-                    Ok(Some(notification)) => {
-                        if tx_clone.send(StreamingEvent::Notification(notification)).await.is_err() {
-                            tracing::warn!("Client disconnected, stopping stdout task");
-                            break;
+                    Ok(notifications) => {
+                        for notification in notifications {
+                            if tx_clone.send(StreamingEvent::Notification(notification)).await.is_err() {
+                                tracing::warn!("Client disconnected, stopping stdout task");
+                                break;
+                            }
                         }
                     }
-                    Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("Error processing line: {}", e);
                     }
@@ -186,17 +166,17 @@ impl StreamingSession {
     }
 }
 
-/// Process a single JSON line and return notification if any
+/// Process a single JSON line and return notifications (may be zero or more)
 fn process_line(
     session_id: &str,
     line: &str,
     accumulated_content: &mut String,
     agent_session_id: &mut Option<String>,
     stop_reason: &mut StopReason,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<String>, String> {
     let event: AgentEvent = match serde_json::from_str(line) {
         Ok(e) => e,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(Vec::new()),
     };
 
     match event {
@@ -216,7 +196,7 @@ fn process_line(
                     tracing::info!("Claude system event: subtype={:?}, session={:?}", other, sid);
                 }
             }
-            Ok(None)
+            Ok(Vec::new())
         }
 
         AgentEvent::Assistant { message, session_id: sid } => {
@@ -225,50 +205,48 @@ fn process_line(
                     *agent_session_id = Some(sid);
                 }
             }
-            let mut last_notification: Option<String> = None;
+            let mut notifications = Vec::new();
             if let Some(msg) = message {
                 for block in msg.content {
-                    let notification = match block {
+                    match block {
                         ContentBlock::Text { text } => {
                             // Stream events already sent text via text_delta chunks.
                             // Skip to avoid duplication.
                             let _ = text;
-                            None
                         }
                         ContentBlock::Thinking { thinking } => {
                             tracing::debug!("Thinking: {} chars", thinking.len());
-                            None
+                            if !thinking.is_empty() {
+                                notifications.push(make_thought_notification(session_id, &thinking));
+                            }
                         }
                         ContentBlock::ToolUse { id, name, input } => {
                             let tool_call_id = format!("tc_{}", id);
                             let title = format_tool_title(&name, &Some(input.clone()));
                             let kind = infer_tool_kind(&name);
-                            Some(make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref()))
+                            notifications.push(make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref()));
                         }
                         ContentBlock::ToolResultBlock { tool_use_id, content } => {
                             let tool_call_id = format!("tc_{}", tool_use_id);
                             let output_text = content.as_ref().and_then(|c| c.as_str());
-                            Some(make_tool_update_notification(
+                            notifications.push(make_tool_update_notification(
                                 session_id,
                                 &tool_call_id,
                                 ToolCallStatus::Completed,
                                 output_text,
-                            ))
+                            ));
                         }
-                    };
-                    if notification.is_some() {
-                        last_notification = notification;
                     }
                 }
             }
-            Ok(last_notification)
+            Ok(notifications)
         }
 
         AgentEvent::ToolUse { id, name, input } => {
             let tool_call_id = format!("tc_{}", id);
             let title = format_tool_title(&name, &Some(input.clone()));
             let kind = infer_tool_kind(&name);
-            Ok(Some(make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref())))
+            Ok(vec![make_tool_notification(session_id, &tool_call_id, &title, kind.as_ref())])
         }
 
         AgentEvent::ToolResult { tool_use_id, content, is_error } => {
@@ -279,7 +257,7 @@ fn process_line(
                 ToolCallStatus::Completed
             };
             let output_text = content.as_ref().and_then(|c| c.as_str());
-            Ok(Some(make_tool_update_notification(session_id, &tool_call_id, status, output_text)))
+            Ok(vec![make_tool_update_notification(session_id, &tool_call_id, status, output_text)])
         }
 
         AgentEvent::StreamEvent { inner } => {
@@ -289,7 +267,7 @@ fn process_line(
                         tracing::info!("[STREAM] content_block_delta: type={}, text_len={}", delta.delta_type, delta.text.len());
                         if delta.delta_type == "text_delta" && !delta.text.is_empty() {
                             accumulated_content.push_str(&delta.text);
-                            return Ok(Some(make_chunk_notification(session_id, &delta.text)));
+                            return Ok(vec![make_chunk_notification(session_id, &delta.text)]);
                         }
                     }
                 }
@@ -298,7 +276,8 @@ fn process_line(
                         if let Some(ref sr) = delta.stop_reason {
                             *stop_reason = match sr.as_str() {
                                 "end_turn" => StopReason::EndTurn,
-                                "stop" => StopReason::Stop,
+                                "max_tokens" => StopReason::MaxTokens,
+                                "refusal" => StopReason::Refusal,
                                 "tool_use" => StopReason::EndTurn,
                                 _ => StopReason::EndTurn,
                             };
@@ -307,7 +286,7 @@ fn process_line(
                 }
                 _ => {}
             }
-            Ok(None)
+            Ok(Vec::new())
         }
 
         AgentEvent::Result { result, stop_reason: reason, session_id: sid, is_error, .. } => {
@@ -323,24 +302,24 @@ fn process_line(
                 }
                 if !text.is_empty() && accumulated_content.is_empty() {
                     accumulated_content.push_str(&text);
-                    return Ok(Some(make_chunk_notification(session_id, &text)));
+                    return Ok(vec![make_chunk_notification(session_id, &text)]);
                 }
             }
 
             *stop_reason = match reason.as_deref() {
                 Some("end_turn") => StopReason::EndTurn,
-                Some("stop") => StopReason::Stop,
+                Some("max_tokens") => StopReason::MaxTokens,
+                Some("refusal") => StopReason::Refusal,
                 Some("tool_use") => StopReason::EndTurn,
                 _ => StopReason::EndTurn,
             };
 
-            Ok(None)
+            Ok(Vec::new())
         }
 
         AgentEvent::Error { error, .. } => {
             tracing::error!("Claude CLI error: {:?}", error);
-            Ok(None)
+            Ok(Vec::new())
         }
     }
 }
-
