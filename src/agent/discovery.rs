@@ -1,176 +1,79 @@
-//! Agent discovery - 扫描目录查找 aginx.toml 配置文件
+//! Agent discovery - scan directories for aginx.toml config files
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::config::AccessMode;
 
-/// aginx.toml 配置文件结构
+/// aginx.toml config structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AgentConfig {
-    /// Agent ID（必需）
+    /// Agent ID (required)
     pub id: String,
-    /// 显示名称
+    /// Display name
     pub name: String,
-    /// 目标 Agent ID (用于 ACP adapter 映射到子 Agent)
-    #[serde(default)]
-    pub target_agent_id: Option<String>,
-    /// Agent 类型: claude, process, builtin
+    /// Agent type (e.g. "claude", "copilot", "process")
     pub agent_type: String,
-    /// 版本
-    #[serde(default)]
-    pub version: String,
-    /// 描述
+    /// Description
     #[serde(default)]
     pub description: String,
-
-    /// 访问模式: public | private，不设则继承全局默认
+    /// Version
+    #[serde(default)]
+    pub version: String,
+    /// Access mode: public | private (inherits global default if not set)
     #[serde(default)]
     pub access: Option<AccessMode>,
 
-    /// 命令配置
+    /// Command config
     #[serde(default)]
     pub command: Option<CommandConfig>,
 
-    /// 会话配置
+    /// Session config
     #[serde(default)]
     pub session: Option<SessionConfig>,
 
-    /// 检测配置
-    #[serde(default)]
-    pub detect: Option<DetectConfig>,
-
-    /// 能力声明
-    #[serde(default)]
-    pub capabilities: Option<CapabilitiesConfig>,
-
-
-    /// 权限配置
-    #[serde(default)]
-    pub permissions: Option<PermissionsConfig>,
-
-    /// Agent 通信协议: "acp" (默认) | "claude-stream"
-    /// acp: agent 原生说 ACP，aginx 透传
-    /// claude-stream: Claude CLI 专用 stream-json 协议，aginx adapter 翻译
-    #[serde(default)]
-    pub protocol: Option<String>,
-
-    /// 进程超时（秒），仅 process 类型。默认 60 秒
+    /// Process timeout in seconds (default: 120)
     #[serde(default)]
     pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommandConfig {
-    /// 命令路径（可选，默认自动发现）
+    /// Command path (defaults to agent_type if not set)
     pub path: Option<String>,
-    /// 命令参数
+    /// Command arguments
     #[serde(default)]
     pub args: Vec<String>,
-    /// 环境变量
+    /// Environment variables
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// 需要移除的环境变量
-    #[serde(default)]
-    pub env_remove: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionConfig {
-    /// 是否需要工作目录
-    #[serde(default)]
-    pub require_workdir: bool,
-
-    /// 会话恢复配置
-    pub resume: Option<SessionResumeConfig>,
-
-    /// 会话存储路径（Agent 自己的会话文件目录，如 ~/.claude/projects）
-    /// 配置此项后，listConversations/getMessages/delete 会从该目录读取
-    #[serde(default)]
-    pub storage_path: Option<String>,
-
-    /// 存储格式: "claude-jsonl" (默认) | "gemini-json"
-    #[serde(default)]
-    pub storage_format: Option<String>,
-
-    /// 会话列表命令配置
-    /// 通过运行 agent CLI 命令获取 session 列表，而非扫描文件
-    #[serde(default)]
-    pub list: Option<SessionListConfig>,
-}
-
-/// 会话列表命令配置
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionListConfig {
-    /// 列举会话的额外参数（追加到 command 后面）
-    #[serde(default)]
-    pub args: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionResumeConfig {
-    /// 从响应 JSON 中提取 session_id 的路径
-    pub session_id_path: String,
-    /// 恢复会话时的参数模板
+    /// Resume args template (e.g. ["--resume", "${SESSION_ID}"])
     #[serde(default)]
     pub resume_args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DetectConfig {
-    /// 检测命令
-    pub check_command: Option<String>,
-    /// 检测参数
-    #[serde(default)]
-    pub check_args: Vec<String>,
-    /// 版本解析正则
-    pub version_regex: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CapabilitiesConfig {
-    #[serde(default)]
-    pub chat: bool,
-    #[serde(default)]
-    pub code: bool,
-    #[serde(default)]
-    pub ask: bool,
-    #[serde(default)]
-    pub streaming: bool,
-    #[serde(default)]
-    pub permissions: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PermissionsConfig {
-    /// 默认允许的工具列表
-    #[serde(default)]
-    pub default_allowed: Vec<String>,
-}
-
-/// 发现的 Agent 信息
+/// Discovered agent info
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredAgent {
-    /// 配置文件路径
     pub config_path: PathBuf,
-    /// 项目根目录
     pub project_dir: PathBuf,
-    /// 解析后的配置
     pub config: AgentConfig,
-    /// 是否可用（检测命令是否成功）
     pub available: bool,
-    /// 错误信息
     pub error: Option<String>,
 }
 
-/// 扫描目录查找 aginx.toml 文件
+/// Scan directory for aginx.toml files
 pub fn scan_directory(base_path: &Path, max_depth: usize) -> Vec<DiscoveredAgent> {
     let mut discovered = Vec::new();
-    scan_directory_recursive(base_path, base_path, max_depth, &mut discovered);
+    scan_recursive(base_path, base_path, max_depth, &mut discovered);
     discovered
 }
 
-fn scan_directory_recursive(
+fn scan_recursive(
     base_path: &Path,
     current_path: &Path,
     remaining_depth: usize,
@@ -180,13 +83,11 @@ fn scan_directory_recursive(
         return;
     }
 
-    // 检查当前目录是否有 aginx.toml
     let config_path = current_path.join("aginx.toml");
     if config_path.exists() {
         match parse_aginx_toml(&config_path, current_path) {
             Ok(agent) => {
-                // 检查是否已经发现过同名的
-                if !discovered.iter().any(|a: &DiscoveredAgent| a.config.id == agent.config.id) {
+                if !discovered.iter().any(|a| a.config.id == agent.config.id) {
                     discovered.push(agent);
                 }
             }
@@ -194,28 +95,25 @@ fn scan_directory_recursive(
                 tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
             }
         }
-        // 找到 aginx.toml 后，不再递归这个目录的子目录
         return;
     }
 
-    // 递归扫描子目录
     if let Ok(entries) = std::fs::read_dir(current_path) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // 跳过隐藏目录和常见的非项目目录
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if name.starts_with('.') || name == "node_modules" || name == "target" || name == "vendor" {
                         continue;
                     }
                 }
-                scan_directory_recursive(base_path, &path, remaining_depth - 1, discovered);
+                scan_recursive(base_path, &path, remaining_depth - 1, discovered);
             }
         }
     }
 }
 
-/// 解析 aginx.toml 文件
+/// Parse aginx.toml file
 pub fn parse_aginx_toml(path: &Path, project_dir: &Path) -> Result<DiscoveredAgent, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read file: {}", e))?;
@@ -223,19 +121,14 @@ pub fn parse_aginx_toml(path: &Path, project_dir: &Path) -> Result<DiscoveredAge
     let config: AgentConfig = toml::from_str(&content)
         .map_err(|e| format!("Failed to parse TOML: {}", e))?;
 
-    // 验证必需字段
     if config.id.is_empty() {
         return Err("Missing required field: id".to_string());
     }
     if config.name.is_empty() {
         return Err("Missing required field: name".to_string());
     }
-    if config.agent_type.is_empty() {
-        return Err("Missing required field: agent_type".to_string());
-    }
 
-    // 检测是否可用
-    let (available, error) = check_agent_available(&config, project_dir);
+    let (available, error) = check_available(&config);
 
     Ok(DiscoveredAgent {
         config_path: path.to_path_buf(),
@@ -246,95 +139,40 @@ pub fn parse_aginx_toml(path: &Path, project_dir: &Path) -> Result<DiscoveredAge
     })
 }
 
-/// 检查 agent 是否可用
-fn check_agent_available(config: &AgentConfig, project_dir: &Path) -> (bool, Option<String>) {
-    // 如果有检测配置，运行检测命令
-    if let Some(ref detect) = config.detect {
-        if let Some(ref check_cmd) = detect.check_command {
-            let mut cmd = std::process::Command::new(check_cmd);
-            cmd.args(&detect.check_args);
-            cmd.current_dir(project_dir);
+/// Check if agent CLI is available
+fn check_available(config: &AgentConfig) -> (bool, Option<String>) {
+    let cmd = config.command.as_ref().and_then(|c| c.path.as_deref())
+        .unwrap_or_else(|| {
+            if config.agent_type.is_empty() || config.agent_type == "process" {
+                ""
+            } else {
+                config.agent_type.as_str()
+            }
+        });
 
-            match cmd.output() {
-                Ok(output) => {
-                    if output.status.success() {
-                        (true, None)
-                    } else {
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        (false, Some(format!("Check command failed: {}", stderr)))
-                    }
-                }
-                Err(e) => {
-                    // 命令不存在，但可能只是路径问题
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        // 检查是否在 PATH 中
-                        if which::which(check_cmd).is_ok() {
-                            (true, None)
-                        } else {
-                            (false, Some(format!("Command not found: {}", check_cmd)))
-                        }
-                    } else {
-                        (false, Some(format!("Failed to run check: {}", e)))
-                    }
-                }
-            }
-        } else {
-            (true, None)
-        }
+    if cmd.is_empty() {
+        return (false, Some("No command configured".to_string()));
+    }
+
+    if which::which(cmd).is_ok() || Path::new(cmd).exists() {
+        (true, None)
     } else {
-        // 没有检测配置，按优先级检测可用性：
-        // 1. agent_type 作为命令名 which 检测
-        // 2. command.path 文件存在或 which 检测
-        let cmd = config.agent_type.as_str();
-        if !cmd.is_empty() && cmd != "process" && cmd != "builtin" {
-            if which::which(cmd).is_ok() {
-                (true, None)
-            } else if let Some(ref cmd_config) = config.command {
-                // agent_type 不在 PATH，但 command.path 可能是绝对路径
-                if let Some(ref path) = cmd_config.path {
-                    if Path::new(path).exists() || which::which(path).is_ok() {
-                        (true, None)
-                    } else {
-                        (false, Some(format!("Command not found: {} (agent_type '{}' not in PATH)", path, cmd)))
-                    }
-                } else {
-                    (false, Some(format!("{} not in PATH and no command.path set", cmd)))
-                }
-            } else {
-                (false, Some(format!("{} command not found in PATH", cmd)))
-            }
-        } else if let Some(ref cmd_config) = config.command {
-            if let Some(ref path) = cmd_config.path {
-                if Path::new(path).exists() || which::which(path).is_ok() {
-                    (true, None)
-                } else {
-                    (false, Some(format!("Command not found: {}", path)))
-                }
-            } else {
-                (false, Some("Missing command.path".to_string()))
-            }
-        } else {
-            (false, Some("No command configured".to_string()))
-        }
+        (false, Some(format!("{} not found", cmd)))
     }
 }
 
-/// 将 AgentConfig 转换为 AgentInfo（用于注册和自动加载）
+/// Convert AgentConfig to runtime AgentInfo
 pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, global_access: &AccessMode) -> super::manager::AgentInfo {
     let access = config.access.unwrap_or(*global_access);
-
-    let agent_type = config.agent_type.clone();
-    let agent_type_for_protocol = agent_type.clone();
 
     let command = config.command
         .as_ref()
         .and_then(|c| c.path.clone())
         .unwrap_or_else(|| {
-            // 未配置 command.path 时，用 agent_type 作为命令名
-            if agent_type.is_empty() || agent_type == "process" {
+            if config.agent_type.is_empty() || config.agent_type == "process" {
                 String::new()
             } else {
-                agent_type.clone()
+                config.agent_type.clone()
             }
         });
 
@@ -348,63 +186,23 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
         .map(|c| c.env.clone())
         .unwrap_or_default();
 
-    let env_remove = config.command
+    let resume_args = config.session
         .as_ref()
-        .map(|c| c.env_remove.clone())
-        .unwrap_or_default();
-
-    let session_args = config.session
-        .as_ref()
-        .and_then(|s| s.resume.as_ref())
-        .map(|r| r.resume_args.clone())
-        .unwrap_or_default();
-
-    let mut capabilities = Vec::new();
-    if let Some(ref caps) = config.capabilities {
-        if caps.chat { capabilities.push("chat".to_string()); }
-        if caps.code { capabilities.push("code".to_string()); }
-        if caps.ask { capabilities.push("ask".to_string()); }
-        if caps.streaming { capabilities.push("streaming".to_string()); }
-        if caps.permissions { capabilities.push("permissions".to_string()); }
-    }
-    if capabilities.is_empty() {
-        capabilities = vec!["chat".to_string(), "code".to_string(), "ask".to_string()];
-    }
+        .map(|s| s.resume_args.clone())
+        .filter(|a| !a.is_empty());
 
     super::manager::AgentInfo {
         id: config.id,
         name: config.name,
-        target_agent_id: config.target_agent_id.clone(),
-        agent_type,
+        description: config.description,
+        agent_type: config.agent_type,
         command,
         args,
         env,
-        env_remove,
-        session_args,
-        working_dir: Some(project_dir.to_string_lossy().to_string()),
-        require_workdir: config.session.as_ref().map(|s| s.require_workdir).unwrap_or(false),
-        capabilities,
-        default_allowed_tools: config.permissions.as_ref()
-            .map(|p| p.default_allowed.clone())
-            .unwrap_or_default(),
-        access,
-        storage_path: config.session.as_ref()
-            .and_then(|s| s.storage_path.clone()),
-        storage_format: config.session.as_ref()
-            .and_then(|s| s.storage_format.clone()),
-        protocol: config.protocol.unwrap_or_else(|| {
-            // 向后兼容：未显式配置 protocol 时，claude agent 默认用 claude-stream
-            if agent_type_for_protocol == "claude" {
-                "claude-stream".to_string()
-            } else {
-                "acp".to_string()
-            }
-        }),
         timeout: config.timeout,
-        session_list_args: config.session.as_ref()
-            .and_then(|s| s.list.as_ref())
-            .map(|l| l.args.clone())
-            .unwrap_or_default(),
+        resume_args,
+        working_dir: Some(project_dir.to_string_lossy().to_string()),
+        access,
     }
 }
 
@@ -416,25 +214,22 @@ mod tests {
     fn test_parse_aginx_toml() {
         let toml_content = r#"
 id = "claude"
-name = "Claude Agent"
+name = "Claude"
 agent_type = "claude"
-version = "1.0.0"
 
 [command]
-args = ["--print", "--output-format", "json"]
+path = "claude"
+args = ["--print"]
 
 [session]
-require_workdir = true
-
-[session.resume]
-session_id_path = "session_id"
 resume_args = ["--resume", "${SESSION_ID}"]
 "#;
 
         let config: AgentConfig = toml::from_str(toml_content).unwrap();
         assert_eq!(config.id, "claude");
-        assert_eq!(config.name, "Claude Agent");
-        assert_eq!(config.agent_type, "claude");
-        assert!(config.session.unwrap().require_workdir);
+        assert_eq!(config.name, "Claude");
+        assert_eq!(config.command.unwrap().args, vec!["--print",]);
+        let session = config.session.unwrap();
+        assert_eq!(session.resume_args, vec!["--resume", "${SESSION_ID}"]);
     }
 }

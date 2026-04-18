@@ -1,84 +1,180 @@
-pub mod claude;
-pub mod process;
-pub mod acp_stdio;
-pub mod session_scan;
-pub mod state;
+//! Agent adapter — spawns CLI process per prompt
+//!
+//! The only adapter model: start process → stdin message → stdout chunks → result
 
-use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::AgentInfo;
-use crate::agent::SessionManager;
 
-/// Agent 适配器 — 纯路由转发 ACP 消息
-#[async_trait::async_trait]
-pub trait PromptAdapter: Send + Sync {
-    /// 发送任意 ACP 请求给 agent，返回 agent 的 JSON-RPC 响应。
-    /// 用于 session/new, session/cancel, session/list 等非流式方法。
-    async fn send_request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, String>;
-
-    /// 发送流式 ACP 请求（如 session/load），转发中间通知，返回最终响应。
-    async fn send_streaming_request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-        tx: Option<mpsc::Sender<String>>,
-    ) -> Result<serde_json::Value, String>;
-
-    /// 发送 session/prompt 并流式转发 session/update 通知。
-    async fn prompt(
-        &self,
-        session_id: &str,
-        message: &str,
-        request_id: Option<super::types::Id>,
-        tx: mpsc::Sender<String>,
-    ) -> Result<(), String>;
-
-    /// 列出该 agent 的会话
-    async fn list_sessions(&self) -> Result<Vec<serde_json::Value>, String> {
-        Ok(Vec::new())
-    }
-
-    /// 获取指定会话的消息历史
-    async fn get_messages(&self, _session_id: &str, _limit: usize) -> Result<Vec<serde_json::Value>, String> {
-        Ok(Vec::new())
-    }
-
-    /// 删除指定会话
-    async fn delete_session(&self, _session_id: &str) -> Result<bool, String> {
-        Ok(false)
-    }
-
-    /// 获取 adapter 当前连接状态
-    fn adapter_state(&self) -> state::AdapterState {
-        state::AdapterState::Ready
-    }
-
-    /// 获取 initialize 握手时缓存的能力信息
-    fn cached_capabilities(&self) -> Option<serde_json::Value> {
-        None
-    }
+/// Prompt adapter — spawns a CLI process, streams stdout back
+pub struct PromptAdapter {
+    command: String,
+    args_template: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    timeout_secs: u64,
+    resume_args: Option<Vec<String>>,
 }
 
-/// 根据 agent 配置创建对应的 adapter
-pub fn create_adapter(
-    agent_info: &AgentInfo,
-    session_manager: Arc<SessionManager>,
-) -> Arc<dyn PromptAdapter> {
-    match agent_info.protocol.as_str() {
-        "claude-stream" => {
-            Arc::new(claude::ClaudeAdapter::new_legacy(agent_info.clone(), session_manager))
+impl PromptAdapter {
+    pub fn new(agent_info: &AgentInfo) -> Self {
+        Self {
+            command: agent_info.command.clone(),
+            args_template: agent_info.args.clone(),
+            env: agent_info.env.clone(),
+            timeout_secs: agent_info.timeout.unwrap_or(120),
+            resume_args: agent_info.resume_args.clone(),
         }
-        "acp" => {
-            Arc::new(acp_stdio::AcpStdioAdapter::new(agent_info))
+    }
+
+    /// Run a prompt: spawn CLI process, write message to stdin, stream stdout chunks.
+    /// Returns (session_id, stop_reason) on success, or the process exits with error.
+    pub async fn prompt(
+        &self,
+        message: &str,
+        session_id: Option<&str>,
+        cwd: Option<&str>,
+        tx: mpsc::Sender<String>,
+    ) {
+        let command = self.command.clone();
+        let message = message.to_string();
+        let timeout_secs = self.timeout_secs;
+        let env = self.env.clone();
+        let cwd = cwd.map(|s| s.to_string());
+
+        // Build args: base args + resume args if session_id provided
+        let mut args: Vec<String> = self.args_template.iter()
+            .map(|arg| {
+                if let Some(sid) = session_id {
+                    arg.replace("${SESSION_ID}", sid)
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+
+        if let (Some(ref resume_args), Some(sid)) = (&self.resume_args, session_id) {
+            for arg in resume_args {
+                args.push(arg.replace("${SESSION_ID}", sid));
+            }
         }
-        _ => {
-            // 通用 stdin/stdout 进程模式
-            Arc::new(process::ProcessAdapter::new(agent_info))
-        }
+
+        tokio::spawn(async move {
+            let mut cmd = tokio::process::Command::new(&command);
+            cmd.args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            if let Some(ref dir) = cwd {
+                cmd.current_dir(dir);
+            }
+
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    // Write message to stdin
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stdin.write_all(message.as_bytes()).await;
+                        let _ = stdin.write_all(b"\n").await;
+                        drop(stdin);
+                    }
+
+                    // Capture stderr in background
+                    let stderr_handle = child.stderr.take().map(|stderr| {
+                        tokio::spawn(async move {
+                            use tokio::io::AsyncBufReadExt;
+                            let reader = tokio::io::BufReader::new(stderr);
+                            let mut lines = reader.lines();
+                            let mut output = String::new();
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                tracing::debug!("Agent stderr: {}", line);
+                                output.push_str(&line);
+                                output.push('\n');
+                            }
+                            output
+                        })
+                    });
+
+                    // Read stdout line by line, send as chunk notifications
+                    let read_stdout = async {
+                        if let Some(stdout) = child.stdout.take() {
+                            use tokio::io::AsyncBufReadExt;
+                            let reader = tokio::io::BufReader::new(stdout);
+                            let mut lines = reader.lines();
+
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                let notification = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "chunk",
+                                    "params": {"text": line}
+                                });
+                                if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    };
+
+                    let timed_out = match tokio::time::timeout(
+                        Duration::from_secs(timeout_secs),
+                        read_stdout,
+                    ).await {
+                        Ok(_) => false,
+                        Err(_) => {
+                            tracing::warn!("Agent process timed out after {}s", timeout_secs);
+                            let _ = child.kill().await;
+                            true
+                        }
+                    };
+
+                    let exit_status = child.wait().await.ok();
+                    let stderr_output = if let Some(h) = stderr_handle {
+                        h.await.unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    let code = exit_status.as_ref().and_then(|s| s.code()).unwrap_or(0);
+
+                    if timed_out {
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32603, "message": format!("Agent timed out after {}s", timeout_secs)}
+                        });
+                        let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                    } else if code != 0 {
+                        let detail = if stderr_output.is_empty() {
+                            format!("Agent exited with code {}", code)
+                        } else {
+                            format!("Agent exited {}: {}", code, stderr_output.trim())
+                        };
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32603, "message": detail}
+                        });
+                        let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                    } else {
+                        // Success: send done signal
+                        let done = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "result": {"stopReason": "endTurn"}
+                        });
+                        let _ = tx.send(serde_json::to_string(&done).unwrap()).await;
+                    }
+                }
+                Err(e) => {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32603, "message": format!("Failed to start agent: {}", e)}
+                    });
+                    let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                }
+            }
+        });
     }
 }
