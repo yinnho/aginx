@@ -202,10 +202,13 @@ aginx pair
 
 ### 访问模式
 
-| 模式 | 说明 |
-|------|------|
-| **Public** | 无需认证，所有连接全功能开放 |
-| **Private** | 连接分两种状态：未认证（Pending）只能调用 `initialize`/`bindDevice`/`listAgents`/`ping`；认证后（Authenticated）全功能开放 |
+| 模式 | 说明 | 认证方式 |
+|------|------|---------|
+| **Public** | 完全公开，任何人访问 | 无需认证 |
+| **Protected** | 团队/内部，同事或其他 agent 可访问 | JWT token 或配对码 |
+| **Private** | 私人设备，严格管控 | 配对码绑定 |
+
+**Protected vs Private**：两者权限控制相同（未认证只能安全方法），区别是使用场景。Protected 面向团队协作，以 JWT 认证为主；Private 面向个人使用，以配对码绑定为主。两种模式都支持另一种认证方式作为备用。
 
 ### Relay 认证
 

@@ -34,7 +34,11 @@ pub const DEFAULT_RELAY_DOMAIN: &str = "relay.yinnho.cn";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum AccessMode {
+    /// Fully open — no authentication required
     Public,
+    /// Team/internal — JWT or device binding (flexible)
+    Protected,
+    /// Personal — strict device pairing required
     #[default]
     Private,
 }
