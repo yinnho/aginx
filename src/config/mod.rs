@@ -69,6 +69,19 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Validate config values — returns Err for critical issues
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.server.port == 0 {
+            anyhow::bail!("server.port must be > 0");
+        }
+        if self.server.max_connections == 0 {
+            anyhow::bail!("server.max_connections must be > 0");
+        }
+        Ok(())
+    }
+}
+
 /// Server config
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -140,6 +153,9 @@ pub struct RelayConfig {
     pub reconnect_interval: u64,
     #[serde(default)]
     pub publish_agents: bool,
+    /// Shared secret for relay authentication (optional; if set, relay requires it)
+    #[serde(default)]
+    pub relay_secret: Option<String>,
 }
 
 fn default_relay_domain() -> String { DEFAULT_RELAY_DOMAIN.to_string() }
@@ -160,6 +176,7 @@ impl Default for RelayConfig {
             heartbeat_interval: default_heartbeat_interval(),
             reconnect_interval: default_reconnect_interval(),
             publish_agents: false,
+            relay_secret: None,
         }
     }
 }

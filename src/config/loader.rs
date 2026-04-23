@@ -59,6 +59,7 @@ pub fn load_config(args: &CliArgs) -> anyhow::Result<LoadResult> {
         config.server.mode = mode.clone();
     }
 
+    config.validate()?;
     Ok(LoadResult { config, config_path })
 }
 

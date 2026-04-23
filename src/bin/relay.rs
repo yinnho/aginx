@@ -38,6 +38,10 @@ struct Args {
     /// 启用调试日志
     #[arg(short = 'd', long)]
     debug: bool,
+
+    /// Shared secret for relay authentication (optional; if set, aginx and clients must provide it)
+    #[arg(long)]
+    secret: Option<String>,
 }
 
 /// 连接消息
@@ -131,14 +135,16 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(RwLock::new(RelayState::new()));
     let domain = Arc::new(args.domain);
+    let secret = Arc::new(args.secret);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let state = state.clone();
         let domain = domain.clone();
+        let secret = secret.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer_addr, state, domain).await {
+            if let Err(e) = handle_connection(stream, peer_addr, state, domain, secret).await {
                 tracing::error!("Connection error from {}: {}", peer_addr, e);
             }
         });
@@ -150,6 +156,7 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     state: Arc<RwLock<RelayState>>,
     domain: Arc<String>,
+    secret: Arc<Option<String>>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -177,6 +184,17 @@ async fn handle_connection(
 
     match msg_type {
         "register" => {
+            // Validate secret if configured
+            if let Some(ref expected) = *secret {
+                let provided = json.get("token").and_then(|v| v.as_str());
+                match provided {
+                    Some(t) if constant_time_eq(t, expected) => {}
+                    _ => {
+                        send_error(&writer, "Invalid or missing relay token").await;
+                        return Ok(());
+                    }
+                }
+            }
             // 提取用户指定的 ID (可选)
             let requested_id = json.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
             // 提取硬件指纹 (可选)
@@ -184,6 +202,17 @@ async fn handle_connection(
             handle_aginx(reader, writer, state, domain, peer_addr, requested_id, fingerprint).await
         }
         "connect" => {
+            // Validate secret if configured
+            if let Some(ref expected) = *secret {
+                let provided = json.get("token").and_then(|v| v.as_str());
+                match provided {
+                    Some(t) if constant_time_eq(t, expected) => {}
+                    _ => {
+                        send_error(&writer, "Invalid or missing relay token").await;
+                        return Ok(());
+                    }
+                }
+            }
             let target = json.get("target").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if target.is_empty() {
                 send_error(&writer, "Missing target").await;
@@ -442,6 +471,9 @@ async fn cleanup_aginx(state: &Arc<RwLock<RelayState>>, aginx_id: &str) {
             state.client_senders.remove(&client_id);
         }
     }
+
+    // 清理指纹映射
+    state.fingerprint_to_id.retain(|_, id| id != aginx_id);
 }
 
 async fn cleanup_client(state: &Arc<RwLock<RelayState>>, client_id: &str, aginx_id: &str) {
@@ -491,4 +523,16 @@ fn init_logging(debug: bool) {
         .with_target(false)
         .compact()
         .init();
+}
+
+/// Constant-time comparison to prevent timing attacks
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        result |= x ^ y;
+    }
+    result == 0
 }

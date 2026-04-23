@@ -14,25 +14,43 @@ use crate::acp::types::*;
 /// Handler for incoming requests
 pub struct Handler {
     agent_manager: Arc<AgentManager>,
+    access: crate::config::AccessMode,
 }
 
 impl Handler {
     pub fn new(agent_manager: AgentManager) -> Self {
         Self {
             agent_manager: Arc::new(agent_manager),
+            access: crate::config::AccessMode::default(),
         }
     }
 
-    pub fn with_access(_access: crate::config::AccessMode, agent_manager: AgentManager) -> Self {
-        Self::new(agent_manager)
+    pub fn with_access(access: crate::config::AccessMode, agent_manager: AgentManager) -> Self {
+        Self {
+            agent_manager: Arc::new(agent_manager),
+            access,
+        }
     }
 
-    pub fn with_jwt_secret(_secret: Option<String>, agent_manager: AgentManager) -> Self {
-        Self::new(agent_manager)
+    /// Check if the auth state allows the given method in the current access mode.
+    /// In Private mode, unauthenticated connections can only call safe methods.
+    fn is_allowed(&self, method: &str, auth: &crate::acp::ConnectionAuth) -> bool {
+        if matches!(self.access, crate::config::AccessMode::Public) {
+            return true;
+        }
+        if matches!(auth, crate::acp::ConnectionAuth::Authenticated) {
+            return true;
+        }
+        // Private + Pending: only allow safe methods
+        matches!(method, "listAgents" | "agents/list" | "ping" | "initialize" | "bindDevice")
     }
 
     /// Handle a non-streaming request
-    pub async fn handle_request(&self, request: AcpRequest, _auth: crate::acp::ConnectionAuth) -> AcpResponse {
+    pub async fn handle_request(&self, request: AcpRequest, auth: crate::acp::ConnectionAuth) -> AcpResponse {
+        if !self.is_allowed(&request.method, &auth) {
+            return AcpResponse::error(request.id, -32600, "Authentication required");
+        }
+
         match request.method.as_str() {
             "listAgents" | "agents/list" => {
                 let agents = self.agent_manager.list_agents().await;
@@ -52,8 +70,12 @@ impl Handler {
         &self,
         request: AcpRequest,
         tx: mpsc::Sender<String>,
-        _auth: crate::acp::ConnectionAuth,
+        auth: crate::acp::ConnectionAuth,
     ) -> AcpResponse {
+        if !self.is_allowed("prompt", &auth) {
+            return AcpResponse::error(request.id, -32600, "Authentication required");
+        }
+
         // Parse params
         let params: PromptParams = match request.params {
             Some(ref p) => match serde_json::from_value(p.clone()) {

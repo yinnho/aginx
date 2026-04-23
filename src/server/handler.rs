@@ -43,6 +43,7 @@ impl Handler {
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(tokio::sync::Mutex::new(BufWriter::new(writer)));
         let mut line = String::new();
+        const MAX_LINE_LENGTH: usize = 1024 * 1024; // 1MB
 
         loop {
             line.clear();
@@ -56,6 +57,11 @@ impl Handler {
             })?;
 
             if bytes_read == 0 {
+                break;
+            }
+
+            if line.len() > MAX_LINE_LENGTH {
+                tracing::warn!("Oversized line from {}, dropping connection", peer_addr);
                 break;
             }
 

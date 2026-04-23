@@ -18,6 +18,8 @@ use tokio::sync::Mutex;
 use x25519_dalek::{PublicKey, StaticSecret};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chacha20poly1305::aead::{Aead, KeyInit};
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 /// Daemon-side E2EE session manager.
 /// Holds the daemon's static keypair and per-client shared secrets.
@@ -61,7 +63,7 @@ impl E2eeSession {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, self.public_key.as_bytes())
     }
 
-    /// Handle an e2ee_hello from a client: derive shared secret.
+    /// Handle an e2ee_hello from a client: derive shared secret via HKDF.
     /// `client_public_b64` is the client's ephemeral public key, base64-encoded.
     pub async fn handle_hello(&self, client_id: &str, client_public_b64: &str) -> Result<(), String> {
         let client_public_bytes: [u8; 32] = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, client_public_b64)
@@ -72,9 +74,12 @@ impl E2eeSession {
         let client_public = PublicKey::from(client_public_bytes);
         let shared_secret = self.secret.diffie_hellman(&client_public);
 
-        // Derive a 32-byte key from the shared secret
-        let key_material = shared_secret.as_bytes();
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key_material));
+        // Derive a 32-byte key from the shared secret using HKDF-SHA256
+        let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+        let mut derived_key = [0u8; 32];
+        hkdf.expand(b"aginx-e2ee-v1", &mut derived_key)
+            .map_err(|_| "HKDF key derivation failed")?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&derived_key));
 
         self.peers.lock().await.insert(client_id.to_string(), PeerSession {
             cipher,
@@ -97,8 +102,9 @@ impl E2eeSession {
         let peer = peers.get(client_id)
             .ok_or_else(|| format!("No E2EE session for client {}", client_id))?;
 
-        let nonce_val = peer.tx_nonce.fetch_add(1, Ordering::Relaxed);
-        let nonce = nonce_to_bytes(nonce_val);
+        let nonce_val = peer.tx_nonce.fetch_add(1, Ordering::SeqCst);
+        let nonce = nonce_to_bytes(nonce_val)
+            .ok_or_else(|| "E2EE nonce counter exhausted".to_string())?;
 
         peer.cipher.encrypt(&nonce, plaintext)
             .map_err(|e| format!("Encryption failed: {}", e))
@@ -110,8 +116,9 @@ impl E2eeSession {
         let peer = peers.get(client_id)
             .ok_or_else(|| format!("No E2EE session for client {}", client_id))?;
 
-        let nonce_val = peer.rx_nonce.fetch_add(1, Ordering::Relaxed);
-        let nonce = nonce_to_bytes(nonce_val);
+        let nonce_val = peer.rx_nonce.fetch_add(1, Ordering::SeqCst);
+        let nonce = nonce_to_bytes(nonce_val)
+            .ok_or_else(|| "E2EE nonce counter exhausted".to_string())?;
 
         peer.cipher.decrypt(&nonce, ciphertext)
             .map_err(|e| format!("Decryption failed: {}", e))
@@ -124,8 +131,12 @@ impl E2eeSession {
 }
 
 /// Convert a u64 nonce counter to a 12-byte ChaCha20-Poly1305 nonce.
-fn nonce_to_bytes(counter: u64) -> Nonce {
+/// Returns None if the counter is exhausted (u64::MAX).
+fn nonce_to_bytes(counter: u64) -> Option<Nonce> {
+    if counter == u64::MAX {
+        return None;
+    }
     let mut nonce = [0u8; 12];
     nonce[4..12].copy_from_slice(&counter.to_le_bytes());
-    Nonce::clone(Nonce::from_slice(&nonce))
+    Some(Nonce::clone(Nonce::from_slice(&nonce)))
 }

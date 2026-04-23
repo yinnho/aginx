@@ -4,7 +4,7 @@
 //! 一个 aginx 只能被一个 App 绑定（独占模式）
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use once_cell::sync::Lazy;
@@ -14,6 +14,27 @@ const PAIR_CODE_TTL_SECS: i64 = 300;
 
 /// 配对码长度
 const PAIR_CODE_LENGTH: usize = 6;
+
+/// Write a file with restrictive permissions (0600 on Unix).
+fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(content.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
 
 /// 最大失败尝试次数
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -160,7 +181,7 @@ impl BindingManager {
     fn save_device(&self) -> anyhow::Result<()> {
         if let Some(ref device) = self.bound_device {
             let content = serde_json::to_string_pretty(device)?;
-            fs::write(self.device_path(), content)?;
+            write_secret_file(&self.device_path(), &content)?;
         } else {
             // 如果没有绑定设备，删除文件
             if let Err(e) = fs::remove_file(self.device_path()) {
@@ -180,7 +201,7 @@ impl BindingManager {
             created_at: chrono::Utc::now().timestamp(),
         };
         let content = serde_json::to_string(&data)?;
-        fs::write(self.pair_code_path(), content)?;
+        write_secret_file(&self.pair_code_path(), &content)?;
         Ok(())
     }
 
@@ -224,7 +245,7 @@ impl BindingManager {
     /// 保存失败尝试记录
     fn save_failed_attempts(&self, data: &FailedAttemptsData) -> anyhow::Result<()> {
         let content = serde_json::to_string(data)?;
-        fs::write(self.failed_attempts_path(), content)?;
+        write_secret_file(&self.failed_attempts_path(), &content)?;
         Ok(())
     }
 
@@ -402,9 +423,11 @@ impl BindingManager {
     /// 生成随机配对码（6位字母数字，区分大小写）
     fn generate_random_code(&self) -> String {
         use rand::Rng;
+        // Alphanumeric excluding visually ambiguous chars (0/O, 1/l/I)
+        const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
         let mut rng = rand::thread_rng();
         (0..PAIR_CODE_LENGTH)
-            .map(|_| rng.gen_range(0..10).to_string())
+            .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
             .collect()
     }
 }

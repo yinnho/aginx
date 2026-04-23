@@ -139,6 +139,26 @@ pub fn parse_aginx_toml(path: &Path, project_dir: &Path) -> Result<DiscoveredAge
     })
 }
 
+/// Validate command for safety — reject shell metacharacters and relative paths
+fn validate_command(cmd: &str) -> Result<(), String> {
+    let dangerous = ['|', '&', ';', '$', '`', '>', '<', '(', ')', '{', '}'];
+    if cmd.chars().any(|c| dangerous.contains(&c)) {
+        return Err(format!("Command contains disallowed characters: {}", cmd));
+    }
+    if cmd.starts_with('/') {
+        // Absolute path — must exist
+        if !Path::new(cmd).exists() {
+            return Err(format!("Command path does not exist: {}", cmd));
+        }
+    } else if !cmd.contains('/') {
+        // Bare command name (e.g. "claude") — validated by which
+    } else {
+        // Relative path like "./foo" — reject
+        return Err(format!("Relative command paths are not allowed: {}", cmd));
+    }
+    Ok(())
+}
+
 /// Check if agent CLI is available
 fn check_available(config: &AgentConfig) -> (bool, Option<String>) {
     let cmd = config.command.as_ref().and_then(|c| c.path.as_deref())
@@ -152,6 +172,10 @@ fn check_available(config: &AgentConfig) -> (bool, Option<String>) {
 
     if cmd.is_empty() {
         return (false, Some("No command configured".to_string()));
+    }
+
+    if let Err(e) = validate_command(cmd) {
+        return (false, Some(e));
     }
 
     if which::which(cmd).is_ok() || Path::new(cmd).exists() {

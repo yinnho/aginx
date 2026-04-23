@@ -63,6 +63,7 @@ uuid = { version = "1", features = ["v4"] }
 
 # Hardware fingerprint
 sha2 = "0.10"
+hkdf = "0.12"
 hex = "0.4"
 
 # JWT authentication

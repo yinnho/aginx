@@ -29,6 +29,7 @@ impl PromptAdapter {
 
     /// Run a prompt: spawn CLI process, write message to stdin, stream stdout chunks.
     /// Returns (session_id, stop_reason) on success, or the process exits with error.
+    /// When the `tx` receiver is dropped (client disconnect), the child process is killed.
     pub async fn prompt(
         &self,
         message: &str,
@@ -41,6 +42,7 @@ impl PromptAdapter {
         let timeout_secs = self.timeout_secs;
         let env = self.env.clone();
         let cwd = cwd.map(|s| s.to_string());
+        let session_id_owned = session_id.map(|s| s.to_string());
 
         // Build args: base args + resume args if session_id provided
         let mut args: Vec<String> = self.args_template.iter()
@@ -76,11 +78,29 @@ impl PromptAdapter {
 
             match cmd.spawn() {
                 Ok(mut child) => {
-                    // Write message to stdin
+                    // Write message to stdin — propagate errors
                     if let Some(mut stdin) = child.stdin.take() {
                         use tokio::io::AsyncWriteExt;
-                        let _ = stdin.write_all(message.as_bytes()).await;
-                        let _ = stdin.write_all(b"\n").await;
+                        if let Err(e) = stdin.write_all(message.as_bytes()).await {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            let err = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "error": {"code": -32603, "message": format!("Failed to write to agent stdin: {}", e)}
+                            });
+                            let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                            return;
+                        }
+                        if let Err(e) = stdin.write_all(b"\n").await {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            let err = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "error": {"code": -32603, "message": format!("Failed to write to agent stdin: {}", e)}
+                            });
+                            let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                            return;
+                        }
                         drop(stdin);
                     }
 
@@ -100,6 +120,9 @@ impl PromptAdapter {
                         })
                     });
 
+                    // Track if client disconnected (tx.send failed)
+                    let mut client_disconnected = false;
+
                     // Read stdout line by line, send as chunk notifications
                     let read_stdout = async {
                         if let Some(stdout) = child.stdout.take() {
@@ -108,12 +131,17 @@ impl PromptAdapter {
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
+                                let mut params = serde_json::json!({"text": line});
+                                if let Some(ref sid) = session_id_owned {
+                                    params["sessionId"] = serde_json::json!(sid);
+                                }
                                 let notification = serde_json::json!({
                                     "jsonrpc": "2.0",
                                     "method": "chunk",
-                                    "params": {"text": line}
+                                    "params": params
                                 });
                                 if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
+                                    client_disconnected = true;
                                     break;
                                 }
                             }
@@ -132,12 +160,23 @@ impl PromptAdapter {
                         }
                     };
 
+                    // If client disconnected, kill the process immediately
+                    if client_disconnected {
+                        tracing::info!("Client disconnected, killing agent process");
+                        let _ = child.kill().await;
+                    }
+
                     let exit_status = child.wait().await.ok();
                     let stderr_output = if let Some(h) = stderr_handle {
                         h.await.unwrap_or_default()
                     } else {
                         String::new()
                     };
+
+                    // Don't send response if client already disconnected
+                    if client_disconnected {
+                        return;
+                    }
 
                     let code = exit_status.as_ref().and_then(|s| s.code()).unwrap_or(0);
 
@@ -159,10 +198,14 @@ impl PromptAdapter {
                         });
                         let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
                     } else {
-                        // Success: send done signal
+                        // Success: send done signal with sessionId for client resume
+                        let mut result = serde_json::json!({"stopReason": "endTurn"});
+                        if let Some(ref sid) = session_id_owned {
+                            result["sessionId"] = serde_json::json!(sid);
+                        }
                         let done = serde_json::json!({
                             "jsonrpc": "2.0",
-                            "result": {"stopReason": "endTurn"}
+                            "result": result
                         });
                         let _ = tx.send(serde_json::to_string(&done).unwrap()).await;
                     }

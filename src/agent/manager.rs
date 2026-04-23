@@ -114,7 +114,7 @@ impl AgentManager {
     pub fn has_agents(&self) -> bool {
         match self.agents.try_read() {
             Ok(agents) => !agents.is_empty(),
-            Err(_) => true,
+            Err(_) => false,
         }
     }
 }

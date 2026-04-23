@@ -25,7 +25,7 @@ pub enum RelayMessage {
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "register")]
-    Register { id: String },
+    Register { id: String, token: Option<String> },
     #[serde(rename = "registered")]
     Registered { id: String, url: String },
     #[serde(rename = "disconnected")]
@@ -34,6 +34,10 @@ pub enum RelayMessage {
     Error { message: String },
     #[serde(rename = "data")]
     Data { client_id: String, data: serde_json::Value },
+    #[serde(rename = "connect")]
+    Connect { target: String, token: Option<String> },
+    #[serde(rename = "connected")]
+    Connected { client_id: String },
 }
 
 /// Registration result from API
@@ -94,6 +98,7 @@ pub struct RelayClient {
     aginx_token: Option<String>,
     agent_manager: Arc<AgentManager>,
     publish_agents: bool,
+    relay_secret: Option<String>,
 }
 
 impl RelayClient {
@@ -118,6 +123,7 @@ impl RelayClient {
             aginx_token: config.relay.token.clone(),
             agent_manager,
             publish_agents: config.relay.publish_agents,
+            relay_secret: config.relay.relay_secret.clone(),
         }
     }
 
@@ -178,7 +184,7 @@ impl RelayClient {
         reader: &mut R,
         writer: &Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>,
     ) -> anyhow::Result<()> {
-        let register = RelayMessage::Register { id: self.aginx_id.clone() };
+        let register = RelayMessage::Register { id: self.aginx_id.clone(), token: self.relay_secret.clone() };
         let register_json = serde_json::to_string(&register)?;
         {
             let mut w = writer.lock().await;
@@ -279,7 +285,7 @@ impl RelayClient {
                             RelayMessage::Data { client_id, data } => {
                                 tracing::debug!("Data from client [{}]", client_id);
                                 if let Err(e) = handle_data_message(
-                                    &writer, &client_id, data, &self.handler, &self.client_auth,
+                                    &writer, &client_id, data, &self.handler, &self.client_auth, &self.access,
                                 ).await {
                                     tracing::error!("Error handling message: {}", e);
                                 }
@@ -291,8 +297,12 @@ impl RelayClient {
                             RelayMessage::Error { message } => {
                                 tracing::error!("Relay error: {}", message);
                             }
-                            _ => {}
+                            _ => {
+                                tracing::warn!("Received unexpected relay message type");
+                            }
                         }
+                    } else {
+                        tracing::warn!("Failed to parse relay message: {}", line);
                     }
                 }
                 Err(e) => {
@@ -318,6 +328,7 @@ async fn handle_data_message(
     data: serde_json::Value,
     handler: &Arc<AcpHandler>,
     client_auth: &Arc<Mutex<HashMap<String, ConnectionAuth>>>,
+    access: &crate::config::AccessMode,
 ) -> anyhow::Result<()> {
     let request: AcpRequest = match serde_json::from_value(data) {
         Ok(req) => req,
@@ -334,7 +345,7 @@ async fn handle_data_message(
     let auth = {
         let mut states = client_auth.lock().await;
         *states.entry(client_id.to_string()).or_insert_with(|| {
-            if matches!(crate::config::AccessMode::default(), crate::config::AccessMode::Public) {
+            if matches!(access, crate::config::AccessMode::Public) {
                 ConnectionAuth::Authenticated
             } else {
                 ConnectionAuth::Pending
