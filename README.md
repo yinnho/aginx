@@ -210,6 +210,35 @@ aginx pair
 
 **Protected vs Private**：两者权限控制相同（未认证只能安全方法），区别是使用场景。Protected 面向团队协作，以 JWT 认证为主；Private 面向个人使用，以配对码绑定为主。两种模式都支持另一种认证方式作为备用。
 
+### 两级认证
+
+**绑定（Bind）** — 独占，全权限
+- `aginx pair` 生成配对码
+- 客户端 `bindDevice(pairCode, deviceName)` → 返回 token
+- 只能绑定一个设备（主人身份）
+- 拥有所有权限，包括系统方法
+
+**授权（Auth）** — 多客户端，受限权限
+- `aginx auth -n "同事的Mac" -a claude,translator -m listAgents,prompt` → 生成 JWT token
+- 客户端 `initialize` 直接带 JWT token → 认证通过
+- 可授权多个客户端，每个独立权限
+- 权限通过 JWT claims 控制：
+  - `agents`: 允许访问的 agent 列表（空 = 全部）
+  - `methods`: 允许调用的方法列表（空 = 全部）
+  - `sys`: 是否允许系统方法（listDirectory, readFile 等）
+  - `exp`: 过期时间
+
+```bash
+# 生成授权 token
+aginx auth -n "Team CI" -a deploy,test --system -e 30
+
+# 查看已授权客户端
+aginx auths
+
+# 撤销授权
+aginx revoke client-xxx
+```
+
 ### Relay 认证
 
 Relay 服务器可配置 shared secret，aginx 和客户端连接时必须携带正确 token（constant-time 比较防时序攻击）。
