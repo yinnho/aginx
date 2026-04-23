@@ -200,12 +200,12 @@ aginx pair
 - 5 次错误尝试后锁定 15 分钟
 - 绑定文件权限 `0600`
 
-### 连接认证
+### 访问模式
 
 | 模式 | 说明 |
 |------|------|
-| **Public** | 无需认证，所有方法开放 |
-| **Private** | 未认证只能 `initialize`/`bindDevice`/`listAgents`/`ping` |
+| **Public** | 无需认证，所有连接全功能开放 |
+| **Private** | 连接分两种状态：未认证（Pending）只能调用 `initialize`/`bindDevice`/`listAgents`/`ping`；认证后（Authenticated）全功能开放 |
 
 ### Relay 认证
 
@@ -223,19 +223,6 @@ agent://hostname[:port]
 
 # 中继
 agent://{id}.relay.aginx.net
-```
-
-## 部署
-
-```bash
-# 同步代码
-rsync -avz --exclude 'target' --exclude '.git' -e ssh ./ 86quan:/data/www/aginx/
-
-# 编译
-ssh 86quan "cd /data/www/aginx && cargo build --release"
-
-# 重启
-ssh 86quan "pkill -f aginx ; nohup /data/www/aginx/target/release/aginx > /data/www/aginx/aginx.log 2>&1 &"
 ```
 
 ## License
