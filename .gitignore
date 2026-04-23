@@ -3,6 +3,10 @@
 *.swp
 .DS_Store
 
+Cargo.lock
+install.sh
+scan-agents.sh
+
 # 开发文件
 CLAUDE.md
 .claude/
