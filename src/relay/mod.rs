@@ -384,7 +384,7 @@ async fn handle_data_message(
             let _ = notify_task.await;
         });
     } else {
-        let response = handler.handle_request(request, auth).await;
+        let (response, _new_auth) = handler.handle_request(request, auth).await;
         send_relay_response(writer, client_id, &response).await?;
     }
 

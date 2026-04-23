@@ -1,7 +1,7 @@
 //! Request handler for aginx TCP server
 //!
 //! Simple JSON-RPC 2.0 over ndjson.
-//! Methods: prompt (streaming), listAgents, ping
+//! Methods: prompt (streaming), listAgents, ping, initialize, bindDevice
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +25,7 @@ impl Handler {
     pub fn new(config: Arc<Config>, agent_manager: AgentManager) -> Self {
         let handler = Arc::new(
             AcpHandler::with_access(config.server.access, agent_manager)
+                .with_jwt_secret(config.auth.jwt_secret.clone())
         );
         Self { handler, config }
     }
@@ -33,7 +34,7 @@ impl Handler {
     pub async fn handle(self, stream: TcpStream, peer_addr: SocketAddr) -> anyhow::Result<()> {
         tracing::info!("Connection from {}", peer_addr);
 
-        let auth = if matches!(self.config.server.access, AccessMode::Public) {
+        let mut auth = if matches!(self.config.server.access, AccessMode::Public) {
             ConnectionAuth::Authenticated
         } else {
             ConnectionAuth::Pending
@@ -99,10 +100,10 @@ impl Handler {
                                 tracing::error!("Failed to write notification: {}", e);
                                 break;
                             }
-                            if let Err(e) = w.write_all(b"\n").await {
+                            if let Err(_) = w.write_all(b"\n").await {
                                 break;
                             }
-                            if let Err(e) = w.flush().await {
+                            if let Err(_) = w.flush().await {
                                 break;
                             }
                         }
@@ -120,7 +121,11 @@ impl Handler {
                 });
             } else {
                 // Non-streaming
-                let response = self.handler.handle_request(request, auth).await;
+                let (response, new_auth) = self.handler.handle_request(request, auth).await;
+                // Update auth state if handler returned a new one
+                if let Some(new_auth_state) = new_auth {
+                    auth = new_auth_state;
+                }
                 send_response(&writer, &response).await?;
             }
         }
