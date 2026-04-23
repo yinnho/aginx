@@ -13,7 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::config::{Config, AccessMode};
 use crate::agent::AgentManager;
-use crate::acp::{Handler as AcpHandler, AcpRequest, AcpResponse, ConnectionAuth};
+use crate::acp::{Handler as AcpHandler, AcpRequest, AcpResponse};
+use crate::auth::AuthLevel;
 
 /// Request handler
 pub struct Handler {
@@ -34,10 +35,10 @@ impl Handler {
     pub async fn handle(self, stream: TcpStream, peer_addr: SocketAddr) -> anyhow::Result<()> {
         tracing::info!("Connection from {}", peer_addr);
 
-        let mut auth = if matches!(self.config.server.access, AccessMode::Public) {
-            ConnectionAuth::Authenticated
+        let mut auth: Option<AuthLevel> = if matches!(self.config.server.access, AccessMode::Public) {
+            Some(AuthLevel::Bound) // Public mode acts as fully authenticated
         } else {
-            ConnectionAuth::Pending
+            None
         };
 
         let (reader, writer) = stream.into_split();
@@ -90,6 +91,7 @@ impl Handler {
                 let writer = writer.clone();
                 let (tx, rx) = mpsc::channel::<String>(32);
 
+                let auth_clone = auth.clone();
                 tokio::spawn(async move {
                     let writer_clone = writer.clone();
                     let notify_task = tokio::spawn(async move {
@@ -109,7 +111,7 @@ impl Handler {
                         }
                     });
 
-                    let response = handler.handle_prompt(request, tx, auth).await;
+                    let response = handler.handle_prompt(request, tx, auth_clone).await;
 
                     if response.result.as_ref().and_then(|r| r.get("streaming")).is_none() {
                         if let Err(e) = send_response(&writer, &response).await {
@@ -121,10 +123,10 @@ impl Handler {
                 });
             } else {
                 // Non-streaming
-                let (response, new_auth) = self.handler.handle_request(request, auth).await;
+                let (response, new_auth) = self.handler.handle_request(request, auth.clone()).await;
                 // Update auth state if handler returned a new one
                 if let Some(new_auth_state) = new_auth {
-                    auth = new_auth_state;
+                    auth = Some(new_auth_state);
                 }
                 send_response(&writer, &response).await?;
             }

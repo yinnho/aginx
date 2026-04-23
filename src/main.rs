@@ -84,6 +84,31 @@ enum Commands {
     Unbind,
     /// Show hardware fingerprint
     Fingerprint,
+    /// Generate authorization token for a client
+    Auth {
+        /// Client name
+        #[arg(short = 'n', long)]
+        name: String,
+        /// Allowed agents (comma-separated, empty = all)
+        #[arg(short = 'a', long)]
+        agents: Option<String>,
+        /// Allowed methods (comma-separated, empty = all)
+        #[arg(short = 'm', long)]
+        methods: Option<String>,
+        /// Allow system methods
+        #[arg(long)]
+        system: bool,
+        /// Expiration in days (default: 30)
+        #[arg(short = 'e', long, default_value = "30")]
+        expire_days: i64,
+    },
+    /// List authorized clients
+    Auths,
+    /// Revoke an authorized client
+    Revoke {
+        /// Client ID to revoke
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -311,6 +336,85 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             use crate::fingerprint::HardwareFingerprint;
             let fp = HardwareFingerprint::generate();
             println!("Fingerprint: {}", fp.fingerprint);
+        }
+        Commands::Auth { name, agents, methods, system, expire_days } => {
+            let config_result = config::load_config(&config::CliArgs::default())?;
+            let jwt_secret = config_result.config.auth.jwt_secret
+                .ok_or_else(|| anyhow::anyhow!("JWT secret not configured. Set auth.jwt_secret in config"))?;
+
+            let client_id = format!("client-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("unknown"));
+            let now = chrono::Utc::now().timestamp();
+            let exp = now + expire_days * 86400;
+
+            let allowed_agents: Vec<String> = agents.map(|s| s.split(',').map(|a| a.trim().to_string()).collect()).unwrap_or_default();
+            let allowed_methods: Vec<String> = methods.map(|s| s.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default();
+
+            let claims = crate::auth::AuthClientClaims {
+                sub: client_id.clone(),
+                name: name.clone(),
+                agents: allowed_agents.clone(),
+                methods: allowed_methods.clone(),
+                sys: system,
+                iat: now,
+                exp,
+            };
+
+            let token = crate::auth::generate_auth_client_jwt(&claims, &jwt_secret)
+                .map_err(|e| anyhow::anyhow!("JWT generation failed: {}", e))?;
+
+            // Store in auth manager
+            let auth_mgr = crate::auth::get_auth_manager();
+            let mut mgr = auth_mgr.lock().unwrap();
+            mgr.add_client(crate::auth::AuthorizedClient {
+                id: client_id.clone(),
+                name: name.clone(),
+                token: token.clone(),
+                created_at: now,
+                expires_at: Some(exp),
+                allowed_agents,
+                allowed_methods,
+                allow_system: system,
+            })?;
+            drop(mgr);
+
+            println!("========================================");
+            println!("Authorization token generated");
+            println!("Client ID: {}", client_id);
+            println!("Name: {}", name);
+            println!("Expires: {} days", expire_days);
+            println!("");
+            println!("Token:");
+            println!("{}", token);
+            println!("========================================");
+        }
+        Commands::Auths => {
+            let auth_mgr = crate::auth::get_auth_manager();
+            let mgr = auth_mgr.lock().unwrap();
+            let clients = mgr.list_clients();
+            let now = chrono::Utc::now().timestamp();
+
+            if clients.is_empty() {
+                println!("No authorized clients");
+                return Ok(());
+            }
+
+            println!("Authorized clients:");
+            for client in clients {
+                let status = match client.expires_at {
+                    Some(exp) if now >= exp => "EXPIRED",
+                    _ => "active",
+                };
+                println!("  {} | {} | {}", client.id, client.name, status);
+            }
+        }
+        Commands::Revoke { id } => {
+            let auth_mgr = crate::auth::get_auth_manager();
+            let mut mgr = auth_mgr.lock().unwrap();
+            if mgr.remove_client(&id) {
+                println!("Client {} revoked", id);
+            } else {
+                println!("Client {} not found", id);
+            }
         }
     }
 

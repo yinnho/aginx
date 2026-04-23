@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use crate::agent::AgentManager;
 use crate::acp::adapter::PromptAdapter;
 use crate::acp::types::*;
+use crate::auth::{AuthLevel, AuthorizedClient};
 
 /// Handler for incoming requests
 pub struct Handler {
@@ -40,81 +41,170 @@ impl Handler {
         self
     }
 
-    /// Check if the auth state allows the given method in the current access mode.
-    /// In Private/Protected mode, unauthenticated connections can only call safe methods.
-    fn is_allowed(&self, method: &str, auth: &crate::acp::ConnectionAuth) -> bool {
+    /// Check if the auth level allows the given method for the given agent.
+    /// Public mode: always allowed.
+    /// Bound: always allowed (full permissions).
+    /// Authorized: restricted by JWT claims.
+    /// Pending (no auth): only safe methods.
+    fn is_allowed(
+        &self,
+        method: &str,
+        agent_id: Option<&str>,
+        auth: &Option<AuthLevel>,
+    ) -> bool {
+        // Public mode: no restrictions
         if matches!(self.access, crate::config::AccessMode::Public) {
             return true;
         }
-        if matches!(auth, crate::acp::ConnectionAuth::Authenticated) {
-            return true;
+
+        // No auth: only safe methods
+        let level = match auth {
+            Some(l) => l,
+            None => {
+                return matches!(
+                    method,
+                    "listAgents" | "agents/list" | "ping" | "initialize" | "bindDevice"
+                );
+            }
+        };
+
+        match level {
+            AuthLevel::Bound => true,
+            AuthLevel::Authorized(client) => {
+                self.is_authorized_allowed(method, agent_id, client)
+            }
         }
-        // Non-Public + Pending: only allow safe methods
-        matches!(method, "listAgents" | "agents/list" | "ping" | "initialize" | "bindDevice")
     }
 
-    /// Verify an auth token (binding token or JWT).
-    /// Returns Ok(()) on success.
-    fn verify_auth_token(&self, token: &str) -> Result<(), String> {
-        // Try binding token first
-        let binding_arc = crate::binding::get_binding_manager();
-        let mut binding_mgr = binding_arc
-            .lock()
-            .map_err(|e| format!("Binding manager lock failed: {}", e))?;
-        if binding_mgr.verify_token(token).is_some() {
-            return Ok(());
+    /// Check if an authorized client is allowed to call a method.
+    fn is_authorized_allowed(
+        &self,
+        method: &str,
+        agent_id: Option<&str>,
+        client: &AuthorizedClient,
+    ) -> bool {
+        // Safe methods are always allowed
+        if matches!(
+            method,
+            "listAgents" | "agents/list" | "ping" | "initialize"
+        ) {
+            return true;
         }
-        drop(binding_mgr);
 
-        // Fall back to JWT
-        if let Some(ref secret) = self.jwt_secret {
-            if crate::auth::verify_jwt(token, secret).is_ok() {
-                return Ok(());
+        // Check method whitelist
+        if !client.allowed_methods.is_empty()
+            && !client.allowed_methods.contains(&method.to_string())
+        {
+            return false;
+        }
+
+        // Check system methods
+        let is_system = matches!(
+            method,
+            "listDirectory" | "readFile" | "bindDevice"
+        );
+        if is_system && !client.allow_system {
+            return false;
+        }
+
+        // Check agent whitelist for prompt
+        if method == "prompt" {
+            if let Some(id) = agent_id {
+                if !client.allowed_agents.is_empty()
+                    && !client.allowed_agents.contains(&id.to_string())
+                {
+                    return false;
+                }
             }
         }
 
-        Err("Invalid or expired token".to_string())
+        true
+    }
+
+    /// Verify an auth token.
+    /// Returns Some(AuthLevel) on success, None on failure.
+    fn verify_auth_token(&self, token: &str) -> Option<AuthLevel> {
+        // Try binding token first (full permissions)
+        let binding_arc = crate::binding::get_binding_manager();
+        let mut binding_mgr = binding_arc.lock().ok()?;
+        if binding_mgr.verify_token(token).is_some() {
+            return Some(AuthLevel::Bound);
+        }
+        drop(binding_mgr);
+
+        // Try authorized client token (restricted permissions)
+        let auth_arc = crate::auth::get_auth_manager();
+        let auth_mgr = auth_arc.lock().ok()?;
+        if let Some(client) = auth_mgr.find_by_token(token) {
+            // Check expiration
+            if let Some(exp) = client.expires_at {
+                let now = chrono::Utc::now().timestamp();
+                if now >= exp {
+                    return None;
+                }
+            }
+            return Some(AuthLevel::Authorized(client.clone()));
+        }
+        drop(auth_mgr);
+
+        // Fall back to JWT
+        if let Some(ref secret) = self.jwt_secret {
+            if let Ok(claims) = crate::auth::verify_auth_client_jwt(token, secret) {
+                let client = AuthorizedClient {
+                    id: claims.sub.clone(),
+                    name: claims.name,
+                    token: token.to_string(),
+                    created_at: claims.iat,
+                    expires_at: Some(claims.exp),
+                    allowed_agents: claims.agents,
+                    allowed_methods: claims.methods,
+                    allow_system: claims.sys,
+                };
+                return Some(AuthLevel::Authorized(client));
+            }
+        }
+
+        None
     }
 
     /// Handle a non-streaming request
     pub async fn handle_request(
         &self,
         request: AcpRequest,
-        auth: crate::acp::ConnectionAuth,
-    ) -> (AcpResponse, Option<crate::acp::ConnectionAuth>) {
-        if !self.is_allowed(&request.method, &auth) {
+        auth: Option<AuthLevel>,
+    ) -> (AcpResponse, Option<AuthLevel>) {
+        let agent_id = request.params.as_ref()
+            .and_then(|p| p.get("agent"))
+            .and_then(|v| v.as_str());
+
+        if !self.is_allowed(&request.method, agent_id, &auth) {
             return (
                 AcpResponse::error(request.id, -32600, "Authentication required"),
-                None,
+                auth,
             );
         }
 
         match request.method.as_str() {
             "initialize" => {
-                let mut authenticated = false;
+                let mut new_auth = auth.clone();
                 // Extract authToken from _meta if present
                 if let Some(ref params) = request.params {
                     if let Some(meta) = params.get("_meta") {
                         if let Some(token) = meta.get("authToken").and_then(|v| v.as_str()) {
-                            authenticated = self.verify_auth_token(token).is_ok();
+                            new_auth = self.verify_auth_token(token);
                         }
                     }
                 }
                 // Also check top-level token field for backward compatibility
-                if !authenticated {
+                if new_auth.is_none() {
                     if let Some(ref params) = request.params {
                         if let Some(token) = params.get("token").and_then(|v| v.as_str()) {
-                            authenticated = self.verify_auth_token(token).is_ok();
+                            new_auth = self.verify_auth_token(token);
                         }
                     }
                 }
 
-                let new_auth = if authenticated {
-                    crate::acp::ConnectionAuth::Authenticated
-                } else {
-                    crate::acp::ConnectionAuth::Pending
-                };
-
+                let authenticated = new_auth.is_some();
                 let response = AcpResponse::success(
                     request.id,
                     serde_json::json!({
@@ -126,28 +216,26 @@ impl Handler {
                         }
                     }),
                 );
-                (response, Some(new_auth))
+                (response, new_auth)
             }
             "bindDevice" => {
-                let result = self.handle_bind_device(request).await;
-                // bindDevice always returns the response; auth state change
-                // happens only on success, caller checks the returned auth
-                (result.0, result.1)
+                let (response, new_auth) = self.handle_bind_device(request, auth).await;
+                (response, new_auth)
             }
             "listAgents" | "agents/list" => {
                 let agents = self.agent_manager.list_agents().await;
                 (
                     AcpResponse::success(request.id, serde_json::json!({"agents": agents})),
-                    None,
+                    auth,
                 )
             }
             "ping" => (
                 AcpResponse::success(request.id, serde_json::json!({"pong": true})),
-                None,
+                auth,
             ),
             _ => (
                 AcpResponse::error(request.id, -32601, &format!("Method not found: {}", request.method)),
-                None,
+                auth,
             ),
         }
     }
@@ -156,7 +244,8 @@ impl Handler {
     async fn handle_bind_device(
         &self,
         request: AcpRequest,
-    ) -> (AcpResponse, Option<crate::acp::ConnectionAuth>) {
+        auth: Option<AuthLevel>,
+    ) -> (AcpResponse, Option<AuthLevel>) {
         #[derive(serde::Deserialize)]
         struct BindParams {
             pair_code: String,
@@ -169,14 +258,14 @@ impl Handler {
                 Err(e) => {
                     return (
                         AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e)),
-                        None,
+                        auth,
                     );
                 }
             },
             None => {
                 return (
                     AcpResponse::error(request.id, -32602, "Missing params"),
-                    None,
+                    auth,
                 );
             }
         };
@@ -187,7 +276,7 @@ impl Handler {
             Err(e) => {
                 return (
                     AcpResponse::error(request.id, -32603, &format!("Internal error: {}", e)),
-                    None,
+                    auth,
                 );
             }
         };
@@ -202,7 +291,7 @@ impl Handler {
                         "token": device.token,
                     }),
                 );
-                (response, Some(crate::acp::ConnectionAuth::Authenticated))
+                (response, Some(AuthLevel::Bound))
             }
             crate::binding::BindResult::AlreadyBound { device_name } => {
                 let response = AcpResponse::error(
@@ -210,11 +299,11 @@ impl Handler {
                     -32600,
                     &format!("Already bound to device: {}", device_name),
                 );
-                (response, None)
+                (response, auth)
             }
             crate::binding::BindResult::InvalidCode => {
                 let response = AcpResponse::error(request.id, -32600, "Invalid or expired pair code");
-                (response, None)
+                (response, auth)
             }
         }
     }
@@ -224,9 +313,13 @@ impl Handler {
         &self,
         request: AcpRequest,
         tx: mpsc::Sender<String>,
-        auth: crate::acp::ConnectionAuth,
+        auth: Option<AuthLevel>,
     ) -> AcpResponse {
-        if !self.is_allowed("prompt", &auth) {
+        let agent_id = request.params.as_ref()
+            .and_then(|p| p.get("agent"))
+            .and_then(|v| v.as_str());
+
+        if !self.is_allowed("prompt", agent_id, &auth) {
             return AcpResponse::error(request.id, -32600, "Authentication required");
         }
 

@@ -14,7 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::agent::AgentManager;
 use crate::config::Config;
-use crate::acp::{Handler as AcpHandler, AcpRequest, AcpResponse, ConnectionAuth};
+use crate::acp::{Handler as AcpHandler, AcpRequest, AcpResponse};
+use crate::auth::AuthLevel;
 
 /// Relay message types
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -92,7 +93,7 @@ pub struct RelayClient {
     heartbeat_interval: u64,
     reconnect_interval: u64,
     handler: Arc<AcpHandler>,
-    client_auth: Arc<Mutex<HashMap<String, ConnectionAuth>>>,
+    client_auth: Arc<Mutex<HashMap<String, Option<AuthLevel>>>>,
     access: crate::config::AccessMode,
     api_url: String,
     aginx_token: Option<String>,
@@ -327,7 +328,7 @@ async fn handle_data_message(
     client_id: &str,
     data: serde_json::Value,
     handler: &Arc<AcpHandler>,
-    client_auth: &Arc<Mutex<HashMap<String, ConnectionAuth>>>,
+    client_auth: &Arc<Mutex<HashMap<String, Option<AuthLevel>>>>,
     access: &crate::config::AccessMode,
 ) -> anyhow::Result<()> {
     let request: AcpRequest = match serde_json::from_value(data) {
@@ -344,13 +345,13 @@ async fn handle_data_message(
     // Get auth state
     let auth = {
         let mut states = client_auth.lock().await;
-        *states.entry(client_id.to_string()).or_insert_with(|| {
+        states.entry(client_id.to_string()).or_insert_with(|| {
             if matches!(access, crate::config::AccessMode::Public) {
-                ConnectionAuth::Authenticated
+                Some(AuthLevel::Bound)
             } else {
-                ConnectionAuth::Pending
+                None
             }
-        })
+        }).clone()
     };
 
     if method == "prompt" {
@@ -384,7 +385,12 @@ async fn handle_data_message(
             let _ = notify_task.await;
         });
     } else {
-        let (response, _new_auth) = handler.handle_request(request, auth).await;
+        let (response, new_auth) = handler.handle_request(request, auth).await;
+        // Save updated auth state
+        if let Some(new_auth_state) = new_auth {
+            let mut states = client_auth.lock().await;
+            states.insert(client_id.to_string(), Some(new_auth_state));
+        }
         send_relay_response(writer, client_id, &response).await?;
     }
 

@@ -16,7 +16,7 @@ const PAIR_CODE_TTL_SECS: i64 = 300;
 const PAIR_CODE_LENGTH: usize = 6;
 
 /// Write a file with restrictive permissions (0600 on Unix).
-fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
+pub fn write_secret_file(path: &Path, content: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -41,7 +41,7 @@ const MAX_FAILED_ATTEMPTS: u32 = 5;
 
 /// Constant-time string comparison to prevent timing attacks.
 /// Returns true if both strings are equal.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
     let mut result = if a_bytes.len() == b_bytes.len() { 0u8 } else { 0xFF };
