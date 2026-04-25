@@ -30,15 +30,19 @@ pub struct AuthClientClaims {
     pub iat: i64,
     /// Expiration (unix timestamp)
     pub exp: i64,
+    /// Audience
+    pub aud: String,
 }
 
 /// Verify a JWT token for aginx-to-aginx connections.
 /// Returns Ok(aginx_id) on success.
 pub fn verify_jwt(token: &str, jwt_secret: &str) -> Result<String, String> {
+    let mut validation = Validation::default();
+    validation.set_audience(&["aginx"]);
     let token_data = decode::<AginxClaims>(
         token,
         &DecodingKey::from_secret(jwt_secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )
     .map_err(|e| format!("Invalid JWT: {}", e))?;
 
@@ -48,10 +52,12 @@ pub fn verify_jwt(token: &str, jwt_secret: &str) -> Result<String, String> {
 /// Verify an authorized client JWT.
 /// Returns Ok(claims) on success.
 pub fn verify_auth_client_jwt(token: &str, jwt_secret: &str) -> Result<AuthClientClaims, String> {
+    let mut validation = Validation::default();
+    validation.set_audience(&["aginx-auth"]);
     let token_data = decode::<AuthClientClaims>(
         token,
         &DecodingKey::from_secret(jwt_secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )
     .map_err(|e| format!("Invalid auth JWT: {}", e))?;
 

@@ -141,7 +141,7 @@ pub fn parse_aginx_toml(path: &Path, project_dir: &Path) -> Result<DiscoveredAge
 
 /// Validate command for safety — reject shell metacharacters and relative paths
 fn validate_command(cmd: &str) -> Result<(), String> {
-    let dangerous = ['|', '&', ';', '$', '`', '>', '<', '(', ')', '{', '}'];
+    let dangerous = ['|', '&', ';', '$', '`', '>', '<', '(', ')', '{', '}', '\n', '\r'];
     if cmd.chars().any(|c| dangerous.contains(&c)) {
         return Err(format!("Command contains disallowed characters: {}", cmd));
     }
@@ -155,6 +155,17 @@ fn validate_command(cmd: &str) -> Result<(), String> {
     } else {
         // Relative path like "./foo" — reject
         return Err(format!("Relative command paths are not allowed: {}", cmd));
+    }
+    Ok(())
+}
+
+/// Validate args for safety — reject shell metacharacters
+fn validate_args(args: &[String]) -> Result<(), String> {
+    let dangerous = ['|', '&', ';', '$', '`', '>', '<', '(', ')', '{', '}', '\n', '\r'];
+    for arg in args {
+        if arg.chars().any(|c| dangerous.contains(&c)) {
+            return Err(format!("Arg contains disallowed characters: {}", arg));
+        }
     }
     Ok(())
 }
@@ -176,6 +187,13 @@ fn check_available(config: &AgentConfig) -> (bool, Option<String>) {
 
     if let Err(e) = validate_command(cmd) {
         return (false, Some(e));
+    }
+
+    // Validate args if present
+    if let Some(ref cmd_config) = config.command {
+        if let Err(e) = validate_args(&cmd_config.args) {
+            return (false, Some(e));
+        }
     }
 
     if which::which(cmd).is_ok() || Path::new(cmd).exists() {

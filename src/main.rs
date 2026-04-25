@@ -357,6 +357,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 sys: system,
                 iat: now,
                 exp,
+                aud: "aginx-auth".to_string(),
             };
 
             let token = crate::auth::generate_auth_client_jwt(&claims, &jwt_secret)

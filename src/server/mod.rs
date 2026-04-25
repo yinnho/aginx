@@ -1,6 +1,6 @@
 //! Server module for aginx
 
 mod tcp;
-mod handler;
+pub mod handler;
 
 pub use tcp::Server;

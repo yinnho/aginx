@@ -41,10 +41,23 @@ impl PromptAdapter {
         let message = message.to_string();
         let timeout_secs = self.timeout_secs;
         let env = self.env.clone();
-        let cwd = cwd.map(|s| s.to_string());
+        let cwd = cwd
+            .filter(|dir| !dir.is_empty())
+            .and_then(|dir| {
+                // Validate: must exist, be a directory, and be within home directory
+                let path = std::path::Path::new(dir);
+                let canonical = path.canonicalize().ok()?;
+                let home = dirs::home_dir()?;
+                let home_canonical = home.canonicalize().ok()?;
+                if canonical.starts_with(&home_canonical) {
+                    Some(canonical.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            });
         let session_id_owned = session_id.map(|s| s.to_string());
 
-        // Build args: base args + resume args if session_id provided
+        // Build args: sanitize sessionId to prevent command injection
         let mut args: Vec<String> = self.args_template.iter()
             .map(|arg| {
                 if let Some(sid) = session_id {

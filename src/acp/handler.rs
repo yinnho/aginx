@@ -224,8 +224,20 @@ impl Handler {
             }
             "listAgents" | "agents/list" => {
                 let agents = self.agent_manager.list_agents().await;
+                // Filter agents based on authorization
+                let filtered = match &auth {
+                    Some(AuthLevel::Authorized(client)) if !client.allowed_agents.is_empty() => {
+                        agents.into_iter()
+                            .filter(|a| a.get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|id| client.allowed_agents.contains(&id.to_string()))
+                                .unwrap_or(false))
+                            .collect()
+                    }
+                    _ => agents,
+                };
                 (
-                    AcpResponse::success(request.id, serde_json::json!({"agents": agents})),
+                    AcpResponse::success(request.id, serde_json::json!({"agents": filtered})),
                     auth,
                 )
             }
@@ -273,9 +285,9 @@ impl Handler {
         let binding_arc = crate::binding::get_binding_manager();
         let mut binding_mgr = match binding_arc.lock() {
             Ok(mgr) => mgr,
-            Err(e) => {
+            Err(_) => {
                 return (
-                    AcpResponse::error(request.id, -32603, &format!("Internal error: {}", e)),
+                    AcpResponse::error(request.id, -32603, "Internal server error"),
                     auth,
                 );
             }
@@ -293,11 +305,11 @@ impl Handler {
                 );
                 (response, Some(AuthLevel::Bound))
             }
-            crate::binding::BindResult::AlreadyBound { device_name } => {
+            crate::binding::BindResult::AlreadyBound { device_name: _ } => {
                 let response = AcpResponse::error(
                     request.id,
                     -32600,
-                    &format!("Already bound to device: {}", device_name),
+                    "Device already bound",
                 );
                 (response, auth)
             }
@@ -341,6 +353,12 @@ impl Handler {
         // Create adapter and run prompt
         let adapter = PromptAdapter::new(&agent_info);
         let session_id = params.sessionId.clone().or_else(|| Some(crate::agent::new_session_id()));
+        // Validate sessionId: only allow alphanumeric, hyphens, underscores
+        if let Some(ref sid) = session_id {
+            if !sid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                return AcpResponse::error(request.id, -32602, "Invalid sessionId: only alphanumeric, hyphens, underscores allowed");
+            }
+        }
         let session_id_ref = session_id.as_deref();
 
         adapter.prompt(&params.message, session_id_ref, params.cwd.as_deref(), tx).await;

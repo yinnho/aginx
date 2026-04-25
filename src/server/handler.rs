@@ -12,7 +12,21 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crate::config::{Config, AccessMode};
-use crate::agent::AgentManager;
+
+/// Read a line with size limit. Returns Ok(bytes_read).
+/// If line exceeds max_bytes, returns Ok(0) to signal disconnection.
+pub async fn read_line_with_limit<R: AsyncBufReadExt + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+    max_bytes: usize,
+) -> std::io::Result<usize> {
+    let bytes_read = reader.read_line(line).await?;
+    if bytes_read > 0 && line.len() > max_bytes {
+        tracing::warn!("Oversized line ({} bytes), dropping connection", line.len());
+        return Ok(0);
+    }
+    Ok(bytes_read)
+}use crate::agent::AgentManager;
 use crate::acp::{Handler as AcpHandler, AcpRequest, AcpResponse};
 use crate::auth::AuthLevel;
 
@@ -72,7 +86,7 @@ impl Handler {
                 continue;
             }
 
-            tracing::debug!("Received from {}: {}", peer_addr, line);
+            tracing::debug!("Received from {}: {} bytes", peer_addr, line.len());
 
             let request: AcpRequest = match serde_json::from_str(line) {
                 Ok(req) => req,

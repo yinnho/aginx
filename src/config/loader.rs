@@ -95,14 +95,14 @@ pub fn get_default_config_path() -> PathBuf {
     PathBuf::from(shellexpand::tilde("~/.aginx/config.toml").to_string())
 }
 
-/// Save config to file
+/// Save config to file with restrictive permissions
 pub fn save_config(config: &Config, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let content = toml::to_string_pretty(config)?;
-    std::fs::write(path, content)?;
+    crate::binding::write_secret_file(path, &content)?;
 
     tracing::info!("Config saved to: {:?}", path);
     Ok(())

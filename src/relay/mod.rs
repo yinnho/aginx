@@ -108,7 +108,10 @@ impl RelayClient {
         let use_tls = config.relay.use_tls;
         let aginx_id = config.relay.id.clone().unwrap_or_else(|| "unknown".to_string());
         let agent_manager = Arc::new(agent_manager);
-        let handler = Arc::new(AcpHandler::with_access(config.server.access, (*agent_manager).clone()));
+        let handler = Arc::new(
+            AcpHandler::with_access(config.server.access, (*agent_manager).clone())
+                .with_jwt_secret(config.auth.jwt_secret.clone())
+        );
 
         Self {
             relay_url,
@@ -192,7 +195,7 @@ impl RelayClient {
             w.write_all(format!("{}\n", register_json).as_bytes()).await?;
             w.flush().await?;
         }
-        tracing::debug!("Sent registration: {}", register_json);
+        tracing::debug!("Sent registration (credentials redacted)");
 
         let mut response_line = String::new();
         reader.read_line(&mut response_line).await?;
@@ -267,9 +270,10 @@ impl RelayClient {
         };
 
         // Message loop
+        const MAX_RELAY_LINE: usize = 1024 * 1024; // 1MB
         loop {
             let mut line = String::new();
-            match reader.read_line(&mut line).await {
+            match crate::server::handler::read_line_with_limit(reader, &mut line, MAX_RELAY_LINE).await {
                 Ok(0) => {
                     tracing::info!("Relay connection closed");
                     break;
