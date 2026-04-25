@@ -57,13 +57,13 @@ impl Handler {
             return true;
         }
 
-        // No auth: only safe methods
+        // No auth: only initialize and bindDevice
         let level = match auth {
             Some(l) => l,
             None => {
                 return matches!(
                     method,
-                    "listAgents" | "agents/list" | "ping" | "initialize" | "bindDevice"
+                    "initialize" | "bindDevice"
                 );
             }
         };
