@@ -29,7 +29,7 @@ pub enum ServerMode {
 }
 
 /// Default relay domain
-pub const DEFAULT_RELAY_DOMAIN: &str = "relay.yinnho.cn";
+pub const DEFAULT_RELAY_DOMAIN: &str = "relay.aginx.net";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -186,12 +186,12 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
+    /// Dial address for the relay connection. Always the bare relay host —
+    /// the relay routes by the `register` message's id, so the id-prefixed
+    /// `<id>.<domain>` name in `url` is a logical address only and never
+    /// needs to resolve in DNS.
     pub fn get_connect_url(&self) -> String {
-        if let Some(ref url) = self.url {
-            url.clone()
-        } else {
-            format!("{}:{}", self.domain, self.port)
-        }
+        format!("{}:{}", self.domain, self.port)
     }
 
     pub fn has_id(&self) -> bool {
