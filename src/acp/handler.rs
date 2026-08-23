@@ -343,6 +343,12 @@ impl Handler {
             },
             None => return AcpResponse::error(request.id, -32602, "Missing params"),
         };
+        tracing::info!(
+            agent = %params.agent,
+            has_ticket = params.sessionTicket.is_some(),
+            borrower = ?params.borrower,
+            "prompt dispatch"
+        );
 
         // Find agent
         let agent_info = match self.agent_manager.get_agent_info(&params.agent).await {
@@ -393,6 +399,7 @@ impl Handler {
                     tx,
                 )
                 .await;
+            tracing::info!("borrowed passthrough returned");
             return AcpResponse::success(request.id, serde_json::json!({
                 "streaming": true,
                 "sessionId": session_id,
