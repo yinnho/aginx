@@ -259,6 +259,7 @@ impl Handler {
         auth: Option<AuthLevel>,
     ) -> (AcpResponse, Option<AuthLevel>) {
         #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct BindParams {
             pair_code: String,
             device_name: String,

@@ -6,6 +6,8 @@
 mod types;
 mod handler;
 pub mod adapter;
+#[cfg(test)]
+mod golden;
 
 pub use types::*;
 pub use handler::*;

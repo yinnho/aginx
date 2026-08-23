@@ -239,6 +239,7 @@ impl PromptAdapter {
     /// agent_message_chunk 翻译成 `chunk` 通知转发，最终 result 原样带回
     /// `sessionTicket`/`files`。借用轮本身无状态（会话真源在票据里），所以
     /// 每次 spawn 一次性进程即可，无需持久进程管理。
+    #[allow(clippy::too_many_arguments)]
     pub async fn prompt_borrowed(
         &self,
         message: &str,
@@ -254,7 +255,7 @@ impl PromptAdapter {
         let command = self.command.clone();
         let args = self.args_template.clone();
         let env = self.env.clone();
-        let timeout_secs = self.timeout_secs.max(600).min(3600);
+        let timeout_secs = self.timeout_secs.clamp(600, 3600);
         let cwd = cwd
             .filter(|dir| !dir.is_empty())
             .and_then(|dir| {
@@ -425,8 +426,15 @@ impl PromptAdapter {
                 drop(stdin);
                 let _ = child.kill().await;
                 let _ = child.wait().await;                let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+                // stopReason 词汇归一：agent 侧说 ACP（end_turn），外部协议说
+                // endTurn（与 prompt() 成功路径一致）——网关是翻译边界。
+                let stop = match result.get("stopReason").and_then(|v| v.as_str()) {
+                    Some("end_turn") => "endTurn".to_string(),
+                    Some(other) => other.to_string(),
+                    None => "endTurn".to_string(),
+                };
                 let mut out = serde_json::json!({
-                    "stopReason": result.get("stopReason").cloned().unwrap_or(serde_json::json!("endTurn")),
+                    "stopReason": stop,
                     "streaming": true,
                     "sessionId": sid,
                 });
