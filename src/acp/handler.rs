@@ -361,6 +361,26 @@ impl Handler {
         }
         let session_id_ref = session_id.as_deref();
 
+        // 借用轮直通：prompt 带 sessionTicket → 一次性 ACP 会话（票据进/出 +
+        // 素材进 + 产物 files 回），主人服务器零持久化。最终 result 经 tx 发出
+        // （含 sessionTicket/files），不再走下方固定 success 响应。
+        if let Some(session_ticket) = params.sessionTicket.clone() {
+            let _ = adapter
+                .prompt_borrowed(
+                    &params.message,
+                    session_ticket,
+                    params.materials.clone(),
+                    params.activeFlow.clone(),
+                    params.cwd.as_deref(),
+                    tx,
+                )
+                .await;
+            return AcpResponse::success(request.id, serde_json::json!({
+                "streaming": true,
+                "sessionId": session_id,
+            }));
+        }
+
         adapter.prompt(&params.message, session_id_ref, params.cwd.as_deref(), tx).await;
 
         AcpResponse::success(request.id, serde_json::json!({

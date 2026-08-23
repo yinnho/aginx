@@ -73,6 +73,15 @@ pub struct PromptParams {
     /// Optional working directory
     #[serde(default)]
     pub cwd: Option<String>,
+    /// 借用轮：会话票据（进/出，主人服务器无状态）。带此字段走 ACP 直通。
+    #[serde(default)]
+    pub sessionTicket: Option<serde_json::Value>,
+    /// 借用轮素材：[{name, contentBase64}]，仅本轮有效
+    #[serde(default)]
+    pub materials: Option<serde_json::Value>,
+    /// 借用轮显式 flow（按名加载，不做 LLM classify）
+    #[serde(default)]
+    pub activeFlow: Option<String>,
 }
 
 /// List agents params

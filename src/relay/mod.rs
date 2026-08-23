@@ -270,7 +270,7 @@ impl RelayClient {
         };
 
         // Message loop
-        const MAX_RELAY_LINE: usize = 1024 * 1024; // 1MB
+        const MAX_RELAY_LINE: usize = 128 * 1024 * 1024; // 128MB — 借用轮 ticket/materials/files 走单行 JSON
         loop {
             let mut line = String::new();
             match crate::server::handler::read_line_with_limit(reader, &mut line, MAX_RELAY_LINE).await {

@@ -233,4 +233,231 @@ impl PromptAdapter {
             }
         });
     }
+
+    /// 借用轮直通：prompt 带 `sessionTicket` → 对 agent 进程跑一次完整 ACP 会话
+    /// （spawn → initialize → session/new → session/prompt 带 ticket/materials），
+    /// agent_message_chunk 翻译成 `chunk` 通知转发，最终 result 原样带回
+    /// `sessionTicket`/`files`。借用轮本身无状态（会话真源在票据里），所以
+    /// 每次 spawn 一次性进程即可，无需持久进程管理。
+    pub async fn prompt_borrowed(
+        &self,
+        message: &str,
+        session_ticket: serde_json::Value,
+        materials: Option<serde_json::Value>,
+        active_flow: Option<String>,
+        cwd: Option<&str>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<(), String> {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let command = self.command.clone();
+        let args = self.args_template.clone();
+        let env = self.env.clone();
+        let timeout_secs = self.timeout_secs.max(600).min(3600);
+        let cwd = cwd
+            .filter(|dir| !dir.is_empty())
+            .and_then(|dir| {
+                // Same validation as prompt(): must be a directory under home.
+                let path = std::path::Path::new(dir);
+                let canonical = path.canonicalize().ok()?;
+                let home = dirs::home_dir()?.canonicalize().ok()?;
+                canonical.starts_with(&home).then(|| canonical.to_string_lossy().to_string())
+            });
+        let message = message.to_string();
+        let active_flow = active_flow.unwrap_or_default();
+
+        tokio::spawn(async move {
+            let run = async {
+                let mut cmd = tokio::process::Command::new(&command);
+                cmd.args(&args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                if let Some(ref dir) = cwd {
+                    cmd.current_dir(dir);
+                }
+                for (k, v) in &env {
+                    cmd.env(k, v);
+                }
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| format!("Failed to start agent: {e}"))?;
+                let mut stdin =
+                    child.stdin.take().ok_or("agent stdin unavailable")?;
+                let stdout =
+                    child.stdout.take().ok_or("agent stdout unavailable")?;
+                // Drain stderr so the bridge never blocks on a full pipe (tracing goes there).
+                let stderr = child.stderr.take();
+                let stderr_task = stderr.map(|s| {
+                    tokio::spawn(async move {
+                        let mut reader = tokio::io::BufReader::new(s);
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    })
+                });
+
+                let mut reader = tokio::io::BufReader::new(stdout);
+
+                // request → wait for the response line with matching id (skip notifications).
+                macro_rules! rpc {
+                    ($id:expr, $method:expr, $params:expr) => {{
+                        let req = serde_json::json!({
+                            "jsonrpc": "2.0", "id": $id, "method": $method, "params": $params,
+                        });
+                        stdin
+                            .write_all(serde_json::to_string(&req).unwrap().as_bytes())
+                            .await
+                            .map_err(|e| format!("agent stdin write failed: {e}"))?;
+                        stdin.write_all(b"\n").await.ok();
+                        stdin.flush().await.ok();
+                        loop {
+                            let mut line = String::new();
+                            let n = reader.read_line(&mut line).await
+                                .map_err(|e| format!("agent stdout read failed: {e}"))?;
+                            if n == 0 {
+                                return Err("agent closed stdout".to_string());
+                            }
+                            let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            if v.get("id").is_some() && v.get("method").is_none() {
+                                break v;
+                            }
+                        }
+                    }};
+                }
+
+                let init = rpc!(1, "initialize", serde_json::json!({"protocolVersion": 1}));
+                if let Some(err) = init.get("error") {
+                    return Err(format!("agent initialize failed: {err}"));
+                }
+
+                let new_sess =
+                    rpc!(2, "session/new", serde_json::json!({}));
+                let sid = new_sess
+                    .pointer("/result/sessionId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("session/new failed: {new_sess}"))?
+                    .to_string();
+
+                // session/prompt — notifications from here are turn content.
+                let mut params = serde_json::json!({
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": message}],
+                    "sessionTicket": session_ticket,
+                });
+                if let Some(m) = materials {
+                    params["materials"] = m;
+                }
+                if !active_flow.is_empty() {
+                    params["activeFlow"] = serde_json::json!(active_flow);
+                }
+                let req = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": params,
+                });
+                stdin
+                    .write_all(serde_json::to_string(&req).unwrap().as_bytes())
+                    .await
+                    .map_err(|e| format!("agent stdin write failed: {e}"))?;
+                stdin.write_all(b"\n").await.ok();
+                stdin.flush().await.ok();
+                // NOTE: do NOT drop stdin here — the bridge's reader thread treats
+                // stdin EOF as shutdown and exits before the prompt response is
+                // written. Keep it open; the child is killed after we read the
+                // final response (or on timeout).
+
+                let mut final_resp: Option<serde_json::Value> = None;
+                loop {
+                    let mut line = String::new();
+                    let n = reader
+                        .read_line(&mut line)
+                        .await
+                        .map_err(|e| format!("agent stdout read failed: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    if v.get("method").and_then(|m| m.as_str()) == Some("session/update") {
+                        // Translate to the gateway's chunk notification shape.
+                        let text = v
+                            .pointer("/params/update/content/text")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        if !text.is_empty() {
+                            let note = serde_json::json!({
+                                "jsonrpc": "2.0", "method": "chunk",
+                                "params": {"text": text, "sessionId": sid},
+                            });
+                            if tx.send(serde_json::to_string(&note).unwrap_or_default()).await.is_err()
+                            {
+                                return Err("client disconnected".to_string());
+                            }
+                        }
+                    } else if v.get("id") == Some(&serde_json::json!(3)) {
+                        final_resp = Some(v);
+                        break;
+                    }
+                }
+
+                let resp = final_resp.ok_or("agent closed stdout before prompt response")?;
+                if let Some(err) = resp.get("error") {
+                    return Err(format!(
+                        "borrowed turn failed: {}",
+                        err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown")
+                    ));
+                }
+                // Done reading — close stdin and reap the child so it doesn't linger.
+                drop(stdin);
+                let _ = child.kill().await;
+                let _ = child.wait().await;                let result = resp.get("result").cloned().unwrap_or(serde_json::json!({}));
+                let mut out = serde_json::json!({
+                    "stopReason": result.get("stopReason").cloned().unwrap_or(serde_json::json!("endTurn")),
+                    "streaming": true,
+                    "sessionId": sid,
+                });
+                if let Some(t) = result.get("sessionTicket") {
+                    out["sessionTicket"] = t.clone();
+                }
+                if let Some(f) = result.get("files") {
+                    out["files"] = f.clone();
+                }
+                if let Some(t) = stderr_task {
+                    let _ = t.await;
+                }
+                Ok(out)
+            };
+
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), run).await {
+                Ok(Ok(result)) => {
+                    let done = serde_json::json!({"jsonrpc": "2.0", "result": result});
+                    let _ = tx.send(serde_json::to_string(&done).unwrap_or_default()).await;
+                }
+                Ok(Err(e)) => {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32603, "message": e},
+                    });
+                    let _ = tx.send(serde_json::to_string(&err).unwrap_or_default()).await;
+                }
+                Err(_) => {
+                    let err = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32603, "message": format!("borrowed turn timed out after {}s", timeout_secs)},
+                    });
+                    let _ = tx.send(serde_json::to_string(&err).unwrap_or_default()).await;
+                }
+            }
+        });
+        Ok(())
+    }
 }

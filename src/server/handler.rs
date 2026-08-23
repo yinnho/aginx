@@ -59,7 +59,7 @@ impl Handler {
         let mut reader = BufReader::new(reader);
         let writer = Arc::new(tokio::sync::Mutex::new(BufWriter::new(writer)));
         let mut line = String::new();
-        const MAX_LINE_LENGTH: usize = 1024 * 1024; // 1MB
+        const MAX_LINE_LENGTH: usize = 128 * 1024 * 1024; // 128MB — 借用轮 ticket/materials/files 走单行 JSON
 
         loop {
             line.clear();
