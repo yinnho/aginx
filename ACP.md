@@ -219,10 +219,17 @@ DB，向后兼容路径）。
 - 产物从 `borrow/<uuid>/output/` 收集回流，预算单文件 16MiB / 总 64MiB
   （超限跳过计数告警，不失败）。
 
-### 4.3 桥侧准入（carrier `[borrow]` 配置）
+### 4.3 桥侧准入与配额（carrier `[borrow]` 配置）
 
 `enabled` 总开关 → `allow_borrowers` 名单（空=不限）→ `max_turns_per_hour`
-滑窗（0=不限）。台账 JSONL 只记 `{ts, borrower, agent}` 元数据。
+滑窗（0=不限，**且 0 时连台账写入也跳过**——「不限量但留审计」无配置组合）。
+计数单位 = 借用轮（带 ticket 的 `session/prompt` 一次），按 borrower×agent
+维度；`borrower` 缺省记 `"local"`（免名单门、照常计数）。三闸拒绝与
+materials 体量超限统一报内层 -32002。台账 JSONL 只记
+`{ts, borrower, agent}` 元数据。
+
+完整配额语义（三闸分层/身份解析/体量预算不对称/信任模型/运营语义）立法在
+`../ARCHITECTURE.md` §5.5——本节只留 wire 契约。
 
 ---
 
@@ -247,7 +254,7 @@ DB，向后兼容路径）。
 | -32602 | prompt 块类型不支持 / sessionTicket 无效 / materials 无效 |
 | -32000 | kernel boot 失败 |
 | -32001 | unknown sessionId |
-| -32002 | agent 轮失败 / 借用轮失败 |
+| -32002 | agent 轮失败 / 借用轮失败（含准入、配额、materials 体量拒绝——见 §4.3） |
 
 ---
 
