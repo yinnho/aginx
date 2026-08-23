@@ -365,12 +365,22 @@ impl Handler {
         // 素材进 + 产物 files 回），主人服务器零持久化。最终 result 经 tx 发出
         // （含 sessionTicket/files），不再走下方固定 success 响应。
         if let Some(session_ticket) = params.sessionTicket.clone() {
-            // 鉴权身份透传给桥做准入/配额：Authorized 用其 id，Bound 设备用
-            // "device:<id>"；无鉴权（public 模式）不带——桥侧按本地直连处理。
+            // 鉴权身份透传给桥做准入/配额。优先级：
+            // - Authorized：用 client.id（真实身份，不可冒充）
+            // - Bound：主人本人设备，不透传（桥按 local 处理，不受名单门限）
+            // - public 模式的"伪 Bound"（无鉴权连接被置为 Bound）：采信客户端
+            //   显式 borrower——public 本就无门，friends 名单门交给桥侧 [borrow]
+            //   配置；private/protected 不会出现此分支。
             let borrower = match &auth {
-                Some(AuthLevel::Bound) => None,
                 Some(AuthLevel::Authorized(client)) => Some(client.id.clone()),
-                None => None,
+                Some(AuthLevel::Bound) => {
+                    if matches!(self.access, crate::config::AccessMode::Public) {
+                        params.borrower.clone()
+                    } else {
+                        None
+                    }
+                }
+                None => params.borrower.clone(),
             };
             let _ = adapter
                 .prompt_borrowed(

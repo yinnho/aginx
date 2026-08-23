@@ -82,6 +82,10 @@ pub struct PromptParams {
     /// 借用轮显式 flow（按名加载，不做 LLM classify）
     #[serde(default)]
     pub activeFlow: Option<String>,
+    /// 借用者身份。优先级：鉴权身份 > 客户端显式传入——显式值只在无鉴权
+    /// （public 模式）时被采纳，防冒名。
+    #[serde(default)]
+    pub borrower: Option<String>,
 }
 
 /// List agents params
