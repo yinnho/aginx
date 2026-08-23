@@ -7,4 +7,5 @@ pub mod setup;
 
 pub use discovery::{scan_directory, parse_aginx_toml, agent_config_to_info};
 pub use manager::{AgentInfo, AgentManager};
-pub use session::{SessionConfig, SessionManager, new_session_id};
+#[cfg(test)]
+pub use session::{SessionConfig, SessionManager};

@@ -359,7 +359,10 @@ impl Handler {
 
         // Create adapter and run prompt
         let adapter = PromptAdapter::new(&agent_info);
-        let session_id = params.sessionId.clone().or_else(|| Some(crate::agent::new_session_id()));
+        // sessionId 只采信 client 显式传入——不再自动生成：
+        // 生成的 uuid 会被 PromptAdapter 拼进 resume_args（如 `--resume <uuid>`），
+        // headless CLI（claude/copilot）不认识该 id，首轮即 "No conversation found" 必炸。
+        let session_id = params.sessionId.clone();
         // Validate sessionId: only allow alphanumeric, hyphens, underscores
         if let Some(ref sid) = session_id {
             if !sid.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
