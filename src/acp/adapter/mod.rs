@@ -245,6 +245,7 @@ impl PromptAdapter {
         session_ticket: serde_json::Value,
         materials: Option<serde_json::Value>,
         active_flow: Option<String>,
+        borrower: Option<String>,
         cwd: Option<&str>,
         tx: mpsc::Sender<String>,
     ) -> Result<(), String> {
@@ -265,6 +266,7 @@ impl PromptAdapter {
             });
         let message = message.to_string();
         let active_flow = active_flow.unwrap_or_default();
+        let borrower = borrower.unwrap_or_default();
 
         tokio::spawn(async move {
             let run = async {
@@ -358,6 +360,9 @@ impl PromptAdapter {
                 }
                 if !active_flow.is_empty() {
                     params["activeFlow"] = serde_json::json!(active_flow);
+                }
+                if !borrower.is_empty() {
+                    params["borrower"] = serde_json::json!(borrower);
                 }
                 let req = serde_json::json!({
                     "jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": params,

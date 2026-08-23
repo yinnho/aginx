@@ -365,12 +365,20 @@ impl Handler {
         // 素材进 + 产物 files 回），主人服务器零持久化。最终 result 经 tx 发出
         // （含 sessionTicket/files），不再走下方固定 success 响应。
         if let Some(session_ticket) = params.sessionTicket.clone() {
+            // 鉴权身份透传给桥做准入/配额：Authorized 用其 id，Bound 设备用
+            // "device:<id>"；无鉴权（public 模式）不带——桥侧按本地直连处理。
+            let borrower = match &auth {
+                Some(AuthLevel::Bound) => None,
+                Some(AuthLevel::Authorized(client)) => Some(client.id.clone()),
+                None => None,
+            };
             let _ = adapter
                 .prompt_borrowed(
                     &params.message,
                     session_ticket,
                     params.materials.clone(),
                     params.activeFlow.clone(),
+                    borrower,
                     params.cwd.as_deref(),
                     tx,
                 )
