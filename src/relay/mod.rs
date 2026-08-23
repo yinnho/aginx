@@ -42,48 +42,6 @@ pub enum RelayMessage {
 }
 
 /// Registration result from API
-#[derive(Debug, Clone)]
-pub struct Registration {
-    pub id: String,
-    pub token: String,
-}
-
-/// Register with aginx-api
-pub async fn register_id(api_url: &str) -> anyhow::Result<Registration> {
-    tracing::info!("Registering with {}...", api_url);
-
-    let fingerprint = crate::fingerprint::HardwareFingerprint::generate();
-    tracing::info!("Hardware fingerprint: {}", fingerprint.as_str());
-
-    let client = reqwest::Client::builder().build()?;
-    let resp = client
-        .post(format!("{}/api/v1/instances/register", api_url))
-        .json(&serde_json::json!({"fingerprint_hash": fingerprint.as_str()}))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("API registration failed ({}): {}", status, body));
-    }
-
-    let result: serde_json::Value = resp.json().await?;
-    let data = result.get("data")
-        .ok_or_else(|| anyhow::anyhow!("API response missing data field"))?;
-
-    let id = data.get("id").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("API response missing id"))?
-        .to_string();
-
-    let token = data.get("token").and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("API response missing token"))?
-        .to_string();
-
-    tracing::info!("Registration successful! ID: {}", id);
-    Ok(Registration { id, token })
-}
-
 /// Relay client
 pub struct RelayClient {
     relay_url: String,
@@ -95,10 +53,6 @@ pub struct RelayClient {
     handler: Arc<AcpHandler>,
     client_auth: Arc<Mutex<HashMap<String, Option<AuthLevel>>>>,
     access: crate::config::AccessMode,
-    api_url: String,
-    aginx_token: Option<String>,
-    agent_manager: Arc<AgentManager>,
-    publish_agents: bool,
     relay_secret: Option<String>,
 }
 
@@ -123,10 +77,6 @@ impl RelayClient {
             handler,
             client_auth: Arc::new(Mutex::new(HashMap::new())),
             access: config.server.access.clone(),
-            api_url: config.api.url.clone(),
-            aginx_token: config.relay.token.clone(),
-            agent_manager,
-            publish_agents: config.relay.publish_agents,
             relay_secret: config.relay.relay_secret.clone(),
         }
     }
@@ -242,33 +192,6 @@ impl RelayClient {
             }
         });
 
-        // Agent publish
-        let publish_handle = if self.publish_agents {
-            if self.aginx_token.is_none() {
-                tracing::warn!("publish_agents enabled but no token");
-                None
-            } else {
-                let api_url = self.api_url.clone();
-                let aginx_id = self.aginx_id.clone();
-                let aginx_token = self.aginx_token.clone();
-                let agent_manager = self.agent_manager.clone();
-                let interval_secs = self.heartbeat_interval;
-
-                Some(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-                    interval.tick().await;
-                    loop {
-                        interval.tick().await;
-                        if let Err(e) = publish_agents_to_api(&api_url, &aginx_id, &aginx_token, &agent_manager).await {
-                            tracing::warn!("Agent publish failed: {}", e);
-                        }
-                    }
-                }))
-            }
-        } else {
-            None
-        };
-
         // Message loop
         const MAX_RELAY_LINE: usize = 128 * 1024 * 1024; // 128MB — 借用轮 ticket/materials/files 走单行 JSON
         loop {
@@ -318,9 +241,6 @@ impl RelayClient {
         }
 
         heartbeat_handle.abort();
-        if let Some(h) = publish_handle {
-            h.abort();
-        }
 
         Ok(())
     }
@@ -421,35 +341,5 @@ async fn send_relay_response(
     let mut w = writer.lock().await;
     w.write_all(format!("{}\n", resp_text).as_bytes()).await?;
     w.flush().await?;
-    Ok(())
-}
-
-/// Publish agent list to aginx-api
-async fn publish_agents_to_api(
-    api_url: &str,
-    _aginx_id: &str,
-    aginx_token: &Option<String>,
-    agent_manager: &Arc<AgentManager>,
-) -> anyhow::Result<()> {
-    let agents = agent_manager.list_agents().await;
-    if agents.is_empty() {
-        return Ok(());
-    }
-
-    let client = reqwest::Client::new();
-    let mut req = client.post(format!("{}/api/v1/agents/upsert", api_url))
-        .json(&serde_json::json!({"agents": agents}));
-
-    if let Some(token) = aginx_token {
-        req = req.bearer_auth(token);
-    }
-
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("API agents/upsert failed ({}): {}", status, body));
-    }
-
     Ok(())
 }

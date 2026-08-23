@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use crate::config::{Config, ServerMode, save_config, get_default_config_path};
+use crate::config::{Config, ServerMode};
 use crate::agent::AgentManager;
 
 #[derive(Parser, Debug)]
@@ -123,8 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config
     let result = load_config(&args)?;
-    let config_path = result.config_path.unwrap_or_else(get_default_config_path);
-    let mut config = result.config;
+    let config = result.config;
 
     // Create AgentManager
     let mut agent_manager = AgentManager::from_config(&config);
@@ -157,16 +156,10 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Mode: Relay");
 
             if !config.relay.has_id() {
-                tracing::info!("First run, registering with API...");
-                let registration = relay::register_id(&config.api.url).await?;
-                config.relay.set_id(registration.id.clone());
-                config.relay.token = Some(registration.token);
-
-                if let Err(e) = save_config(&config, &config_path) {
-                    tracing::error!("Failed to save config: {}", e);
-                } else {
-                    tracing::info!("Config saved to: {:?}", config_path);
-                }
+                anyhow::bail!(
+                    "relay.id 未配置：请在配置文件 [relay] 段手动填写 id 与 token \
+                     （aginx-api 自助注册服务已废弃移除）"
+                );
             }
 
             let config = Arc::new(config);
@@ -315,22 +308,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             mgr.unbind_all();
             drop(mgr);
             println!("Device unbound");
-
-            let config_result = config::load_config(&config::CliArgs::default());
-            if let Ok(config_result) = config_result {
-                let cfg = &config_result.config;
-                if let Some(ref token) = cfg.relay.token {
-                    if let Err(e) = deregister_from_api(&cfg.api.url, token).await {
-                        println!("Warning: API deregister failed ({})", e);
-                    } else if let Some(ref config_path) = config_result.config_path {
-                        let mut new_config = config_result.config;
-                        new_config.relay.id = None;
-                        new_config.relay.token = None;
-                        new_config.relay.url = None;
-                        let _ = config::save_config(&new_config, config_path);
-                    }
-                }
-            }
+            // aginx-api 注册/注销服务已废弃：relay.id 现为手填身份，解绑设备不再触碰它
         }
         Commands::Fingerprint => {
             use crate::fingerprint::HardwareFingerprint;
@@ -417,23 +395,6 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
                 println!("Client {} not found", id);
             }
         }
-    }
-
-    Ok(())
-}
-
-async fn deregister_from_api(api_url: &str, token: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/v1/instances/deregister", api_url))
-        .bearer_auth(token)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("API deregister failed ({}): {}", status, body));
     }
 
     Ok(())

@@ -49,8 +49,6 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
-    pub api: ApiConfig,
-    #[serde(default)]
     pub relay: RelayConfig,
     #[serde(default)]
     pub direct: DirectConfig,
@@ -64,7 +62,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
-            api: ApiConfig::default(),
             relay: RelayConfig::default(),
             direct: DirectConfig::default(),
             auth: AuthConfig::default(),
@@ -155,8 +152,6 @@ pub struct RelayConfig {
     pub heartbeat_interval: u64,
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
-    #[serde(default)]
-    pub publish_agents: bool,
     /// Shared secret for relay authentication (optional; if set, relay requires it)
     #[serde(default)]
     pub relay_secret: Option<String>,
@@ -179,7 +174,6 @@ impl Default for RelayConfig {
             url: None,
             heartbeat_interval: default_heartbeat_interval(),
             reconnect_interval: default_reconnect_interval(),
-            publish_agents: false,
             relay_secret: None,
         }
     }
@@ -197,11 +191,6 @@ impl RelayConfig {
     pub fn has_id(&self) -> bool {
         self.id.is_some()
     }
-
-    pub fn set_id(&mut self, id: String) {
-        self.id = Some(id.clone());
-        self.url = Some(format!("{}.{}:{}", id, self.domain, self.port));
-    }
 }
 
 /// Direct mode config
@@ -214,21 +203,6 @@ pub struct DirectConfig {
 impl Default for DirectConfig {
     fn default() -> Self {
         Self { public_url: None }
-    }
-}
-
-/// API config
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiConfig {
-    #[serde(default = "default_api_url")]
-    pub url: String,
-}
-
-fn default_api_url() -> String { "https://api.yinnho.cn".to_string() }
-
-impl Default for ApiConfig {
-    fn default() -> Self {
-        Self { url: default_api_url() }
     }
 }
 

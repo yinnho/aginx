@@ -127,12 +127,4 @@ mod tests {
         let parsed: Config = toml::from_str(&toml).unwrap();
         assert_eq!(config.server.port, parsed.server.port);
     }
-
-    #[test]
-    fn test_relay_config_set_id() {
-        let mut config = Config::default();
-        config.relay.set_id("abc123".to_string());
-        assert_eq!(config.relay.id, Some("abc123".to_string()));
-        assert_eq!(config.relay.url, Some("abc123.relay.aginx.net:8443".to_string()));
-    }
 }
