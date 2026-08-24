@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use crate::config::AccessMode;
 
 /// aginx.toml config structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -27,10 +26,6 @@ pub struct AgentConfig {
     /// 无 [command] 时按 agent_type 从同名 agent 继承 CLI 细节（type=模板）。
     #[serde(default)]
     pub folder: Option<String>,
-    /// Access mode: public | private (inherits global default if not set)
-    #[serde(default)]
-    pub access: Option<AccessMode>,
-
     /// Command config
     #[serde(default)]
     pub command: Option<CommandConfig>,
@@ -76,12 +71,11 @@ pub struct DiscoveredAgent {
 /// Scan directory for aginx.toml files
 pub fn scan_directory(base_path: &Path, max_depth: usize) -> Vec<DiscoveredAgent> {
     let mut discovered = Vec::new();
-    scan_recursive(base_path, base_path, max_depth, &mut discovered);
+    scan_recursive(base_path, max_depth, &mut discovered);
     discovered
 }
 
 fn scan_recursive(
-    base_path: &Path,
     current_path: &Path,
     remaining_depth: usize,
     discovered: &mut Vec<DiscoveredAgent>,
@@ -114,7 +108,7 @@ fn scan_recursive(
                         continue;
                     }
                 }
-                scan_recursive(base_path, &path, remaining_depth - 1, discovered);
+                scan_recursive(&path, remaining_depth - 1, discovered);
             }
         }
     }
@@ -211,9 +205,7 @@ fn check_available(config: &AgentConfig) -> (bool, Option<String>) {
 }
 
 /// Convert AgentConfig to runtime AgentInfo
-pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, global_access: &AccessMode) -> super::manager::AgentInfo {
-    let access = config.access.unwrap_or(*global_access);
-
+pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path) -> super::manager::AgentInfo {
     let command = config.command
         .as_ref()
         .and_then(|c| c.path.clone())
@@ -257,7 +249,6 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
             .as_deref()
             .and_then(expand_tilde)
             .or_else(|| Some(project_dir.to_string_lossy().to_string())),
-        access,
     }
 }
 

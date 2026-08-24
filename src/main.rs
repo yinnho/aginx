@@ -361,7 +361,7 @@ async fn handle_command(cmd: Commands) -> anyhow::Result<()> {
             println!("Client ID: {}", client_id);
             println!("Name: {}", name);
             println!("Expires: {} days", expire_days);
-            println!("");
+            println!();
             println!("Token:");
             println!("{}", token);
             println!("========================================");

@@ -167,7 +167,7 @@ impl BindingManager {
     }
 
     /// 加载已绑定设备
-    fn load_device(data_dir: &PathBuf) -> anyhow::Result<Option<DeviceInfo>> {
+    fn load_device(data_dir: &Path) -> anyhow::Result<Option<DeviceInfo>> {
         let path = data_dir.join("binding.json");
         if !path.exists() {
             return Ok(None);

@@ -39,7 +39,7 @@ async fn main() {
 }
 
 async fn test_with_claude(prompt: &str) {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread;
@@ -48,7 +48,7 @@ async fn test_with_claude(prompt: &str) {
 
     // Start aginx
     let mut child = match Command::new(aginx_path)
-        .args(&["acp", "--stdio"])
+        .args(["acp", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -69,20 +69,16 @@ async fn test_with_claude(prompt: &str) {
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                tx.send(line).ok();
-            }
+        for line in reader.lines().map_while(Result::ok) {
+            tx.send(line).ok();
         }
     });
 
     // Start stderr reader (for logs)
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                eprintln!("[aginx] {}", line);
-            }
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("[aginx] {}", line);
         }
     });
 
@@ -248,7 +244,7 @@ fn send_request(stdin: &mut std::process::ChildStdin, id: i64, method: &str, par
         "method": method,
         "params": params
     });
-    writeln!(stdin, "{}", req.to_string()).ok();
+    writeln!(stdin, "{}", req).ok();
     stdin.flush().ok();
 }
 

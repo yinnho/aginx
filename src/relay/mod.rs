@@ -2,8 +2,6 @@
 //!
 //! Connects to relay server, registers, and forwards prompt requests to local agents.
 
-pub mod e2ee;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,7 +74,7 @@ impl RelayClient {
             reconnect_interval: config.relay.reconnect_interval,
             handler,
             client_auth: Arc::new(Mutex::new(HashMap::new())),
-            access: config.server.access.clone(),
+            access: config.server.access,
             relay_secret: config.relay.relay_secret.clone(),
         }
     }
@@ -213,7 +211,7 @@ impl RelayClient {
                             RelayMessage::Data { client_id, data } => {
                                 tracing::debug!("Data from client [{}]", client_id);
                                 if let Err(e) = handle_data_message(
-                                    &writer, &client_id, data, &self.handler, &self.client_auth, &self.access,
+                                    writer, &client_id, data, &self.handler, &self.client_auth, &self.access,
                                 ).await {
                                     tracing::error!("Error handling message: {}", e);
                                 }
@@ -286,7 +284,6 @@ async fn handle_data_message(
 
         tokio::spawn(async move {
             let writer_clone = writer.clone();
-            let client_id_clone = client_id.clone();
             let notify_task = tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(notification) = rx.recv().await {

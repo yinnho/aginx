@@ -286,7 +286,9 @@ impl AuthManager {
             }
         }
         let pending_before = self.pending.len();
-        self.pending.retain(|r| now - r.created_at < PENDING_TTL_SECS && r.token.is_none());
+        // 与启动时同一条 TTL 规则：批而未取的挂单（token 已铸）不因被批准
+        // 而被清--访客还有剩余 TTL 窗口来取票，只按 created_at 过期
+        self.pending.retain(|r| now - r.created_at < PENDING_TTL_SECS);
         if self.pending.len() != pending_before {
             self.save_pending();
         }
@@ -333,6 +335,39 @@ mod tests {
         m.add_request("访客", None);
         assert_eq!(m.take_request_token("req-nonexistent"), None);
         assert_eq!(m.list_requests().len(), 1);
+    }
+
+    /// clean_expired（挂在 listRequests/checkAccess 轮询上）：批而未取的
+    /// 挂单不得被清（访客还有 TTL 窗口来取票）；过期挂单与过期凭证要被清。
+    #[test]
+    fn clean_expired_keeps_approved_awaiting_fetch() {
+        let mut m = mgr_in_tmp("clean");
+        let fresh = m.add_request("访客A", None);
+        m.set_request_token(&fresh.request_id, "ac-ticket"); // 已批待领取
+        let stale = m.add_request("访客B", None);
+        // 手工把 stale 做旧（超过 PENDING_TTL_SECS）
+        m.pending.last_mut().unwrap().created_at -= PENDING_TTL_SECS + 10;
+        let removed = m.clean_expired();
+        assert_eq!(removed, 0);
+        assert_eq!(m.pending.len(), 1, "陈旧挂单清掉、批而未取的必须存活");
+        assert_eq!(m.pending[0].request_id, fresh.request_id);
+        assert_ne!(m.pending[0].request_id, stale.request_id);
+        // 存活的挂单仍能正常取票
+        assert_eq!(m.take_request_token(&fresh.request_id), Some("ac-ticket".into()));
+    }
+
+    /// 过期凭证（expires_at 已过）被 clean_expired 清掉。
+    #[test]
+    fn clean_expired_removes_expired_clients() {
+        let mut m = mgr_in_tmp("clean-cli");
+        let now = chrono::Utc::now().timestamp();
+        m.add_client(AuthorizedClient {
+            id: "c1".into(), name: "旧访客".into(), token: "t1".into(),
+            created_at: now - 100, expires_at: Some(now - 1),
+            allowed_agents: vec![], allowed_methods: vec![], allow_system: false,
+        }).unwrap();
+        assert_eq!(m.clean_expired(), 1);
+        assert!(m.list_clients().is_empty());
     }
 
     /// 视图层 approved 标志跟随票据铸造翻转，token 永不外泄。

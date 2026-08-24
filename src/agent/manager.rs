@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::config::{AccessMode, Config};
+use crate::config::Config;
 
 /// Agent Manager
 #[derive(Clone)]
@@ -33,13 +33,11 @@ pub struct AgentInfo {
     /// stdout dialect declaration (ACP.md §2.8), e.g. "claude-stream-json"
     pub output: Option<String>,
     pub working_dir: Option<String>,
-    pub access: AccessMode,
 }
 
 impl AgentManager {
     /// Create agent manager from config
     pub fn from_config(config: &Config) -> Self {
-        let global_access = config.server.access;
         let mut agents: HashMap<String, AgentInfo> = HashMap::new();
 
         // Load from config.agents.list
@@ -56,7 +54,6 @@ impl AgentManager {
                 resume_args: None,
                 output: ac.output.clone(),
                 working_dir: ac.working_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
-                access: global_access,
             };
             agents.insert(ac.id.clone(), info);
         }
@@ -94,7 +91,6 @@ impl AgentManager {
                     let info = super::discovery::agent_config_to_info(
                         config,
                         &agent.project_dir,
-                        &global_access,
                     );
                     tracing::info!("Auto-loaded agent: {} ({})", info.id, info.name);
                     agents.insert(info.id.clone(), info);
@@ -128,13 +124,6 @@ impl AgentManager {
     pub async fn get_agent_info(&self, agent_id: &str) -> Option<AgentInfo> {
         let agents = self.agents.read().await;
         agents.get(agent_id).cloned()
-    }
-
-    /// Register a new agent at runtime
-    pub async fn register_agent(&self, info: AgentInfo) {
-        let mut agents = self.agents.write().await;
-        tracing::info!("Registered agent: {} ({})", info.id, info.name);
-        agents.insert(info.id.clone(), info);
     }
 
     /// Check if any agent is loaded

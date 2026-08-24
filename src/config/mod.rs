@@ -49,7 +49,7 @@ pub enum AccessMode {
 }
 
 /// Main config
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -61,18 +61,6 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            relay: RelayConfig::default(),
-            direct: DirectConfig::default(),
-            auth: AuthConfig::default(),
-            agents: AgentsConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -204,49 +192,25 @@ impl RelayConfig {
 }
 
 /// Direct mode config
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectConfig {
     #[serde(default)]
     pub public_url: Option<String>,
 }
 
-impl Default for DirectConfig {
-    fn default() -> Self {
-        Self { public_url: None }
-    }
-}
-
 /// Auth config
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthConfig {
     pub jwt_secret: Option<String>,
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self { jwt_secret: None }
-    }
-}
-
 /// Agents config
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentsConfig {
     #[serde(default)]
     pub list: Vec<AgentEntry>,
     #[serde(default)]
     pub dir: Option<PathBuf>,
-}
-
-impl AgentsConfig {
-    pub fn get_agents_dir(&self) -> PathBuf {
-        self.dir.clone().unwrap_or_else(agents_dir)
-    }
-}
-
-impl Default for AgentsConfig {
-    fn default() -> Self {
-        Self { list: vec![], dir: None }
-    }
 }
 
 fn default_agent_type() -> String { "process".to_string() }

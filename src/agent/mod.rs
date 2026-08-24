@@ -3,10 +3,6 @@
 mod discovery;
 pub mod ledger;
 mod manager;
-mod session;
 pub mod setup;
 
-pub use discovery::{scan_directory, parse_aginx_toml, agent_config_to_info};
 pub use manager::{AgentInfo, AgentManager};
-#[cfg(test)]
-pub use session::{SessionConfig, SessionManager};

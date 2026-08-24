@@ -1,12 +1,9 @@
 //! Unit and basic integration tests for simplified aginx protocol
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 #[test]
 fn test_unknown_method_returns_error() {
     // Test the handler logic directly via the stdio protocol
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"unknownMethod","params":{}}"#;
     let expected_code = -32601; // Method not found
 
     // Parse and verify the error response structure

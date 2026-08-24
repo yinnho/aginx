@@ -19,17 +19,13 @@ use std::time::Duration;
 
 #[derive(Debug, serde::Deserialize)]
 struct AcpResponse {
-    jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     id: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(rename = "error")]
-    error_value: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     params: Option<serde_json::Value>,
 }
 
@@ -40,7 +36,7 @@ fn main() {
 
     // 启动 aginx ACP 进程
     let mut child = Command::new("./target/release/aginx")
-        .args(&["acp", "--stdio"])
+        .args(["acp", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -54,10 +50,8 @@ fn main() {
     // 启动 stderr 读取线程（用于查看日志）
     thread::spawn(move || {
         let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                eprintln!("[AGINX LOG] {}", line);
-            }
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("[AGINX LOG] {}", line);
         }
     });
 
@@ -65,11 +59,9 @@ fn main() {
     let (tx, rx) = mpsc::channel::<String>();
     thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if !line.trim().is_empty() {
-                    tx.send(line).expect("发送失败");
-                }
+        for line in reader.lines().map_while(Result::ok) {
+            if !line.trim().is_empty() {
+                tx.send(line).expect("发送失败");
             }
         }
     });
@@ -145,7 +137,6 @@ fn main() {
 
     // 等待接收通知和响应
     let mut permission_received = false;
-    let mut permission_request_id = String::new();
     let start = std::time::Instant::now();
 
     while start.elapsed() < Duration::from_secs(30) {
@@ -159,8 +150,7 @@ fn main() {
                         permission_received = true;
                         if let Some(params) = resp.params {
                             if let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) {
-                                permission_request_id = req_id.to_string();
-                                println!("✓ 收到权限请求: {}", permission_request_id);
+                                println!("✓ 收到权限请求: {}", req_id);
 
                                 // 显示工具信息
                                 if let Some(tool_call) = params.get("toolCall") {
@@ -269,8 +259,9 @@ fn main() {
     assert!(completed, "等待最终响应超时");
     println!("\n✓ 测试完成!");
 
-    // 清理
+    // 清理（kill 后必须 wait 收尸，否则留僵尸进程）
     let _ = child.kill();
+    let _ = child.wait();
 
     println!("\n========================================");
     println!("所有测试通过!");

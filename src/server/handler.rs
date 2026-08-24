@@ -116,10 +116,10 @@ impl Handler {
                                 tracing::error!("Failed to write notification: {}", e);
                                 break;
                             }
-                            if let Err(_) = w.write_all(b"\n").await {
+                            if w.write_all(b"\n").await.is_err() {
                                 break;
                             }
-                            if let Err(_) = w.flush().await {
+                            if w.flush().await.is_err() {
                                 break;
                             }
                         }

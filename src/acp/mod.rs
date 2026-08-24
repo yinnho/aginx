@@ -11,10 +11,3 @@ mod golden;
 
 pub use types::*;
 pub use handler::*;
-
-/// Connection auth state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionAuth {
-    Pending,
-    Authenticated,
-}

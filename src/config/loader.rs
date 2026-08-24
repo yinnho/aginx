@@ -14,10 +14,9 @@ pub struct CliArgs {
     pub public_url: Option<String>,
 }
 
-/// Load result with config path
+/// Load result
 pub struct LoadResult {
     pub config: Config,
-    pub config_path: Option<PathBuf>,
 }
 
 /// Load configuration
@@ -60,7 +59,7 @@ pub fn load_config(args: &CliArgs) -> anyhow::Result<LoadResult> {
     }
 
     config.validate()?;
-    Ok(LoadResult { config, config_path })
+    Ok(LoadResult { config })
 }
 
 /// Load config from file
@@ -88,24 +87,6 @@ fn find_default_config() -> Option<PathBuf> {
     }
 
     None
-}
-
-/// Get default config file path (for saving)
-pub fn get_default_config_path() -> PathBuf {
-    PathBuf::from(shellexpand::tilde("~/.aginx/config.toml").to_string())
-}
-
-/// Save config to file with restrictive permissions
-pub fn save_config(config: &Config, path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let content = toml::to_string_pretty(config)?;
-    crate::binding::write_secret_file(path, &content)?;
-
-    tracing::info!("Config saved to: {:?}", path);
-    Ok(())
 }
 
 #[cfg(test)]

@@ -124,7 +124,7 @@ pub fn run_setup() -> anyhow::Result<()> {
         0 // 默认选第一个
     } else {
         match input.parse::<usize>() {
-            Ok(n) if n == 0 => return Ok(()), // 跳过
+            Ok(0) => return Ok(()), // 跳过
             Ok(n) => n - 1,                   // 转为 0-indexed
             Err(_) => {
                 println!("无效输入，跳过配置");

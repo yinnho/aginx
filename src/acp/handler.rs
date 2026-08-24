@@ -31,15 +31,6 @@ const ADMIN_METHODS: &[&str] = &[
 ];
 
 impl Handler {
-    pub fn new(agent_manager: AgentManager) -> Self {
-        Self {
-            agent_manager: Arc::new(agent_manager),
-            access: crate::config::AccessMode::default(),
-            auto_approve: false,
-            jwt_secret: None,
-        }
-    }
-
     pub fn with_access(
         access: crate::config::AccessMode,
         auto_approve: bool,
@@ -255,7 +246,9 @@ impl Handler {
             }
             "listRequests" => self.owner_gate(request, &auth, |req| {
                 let mgr = crate::auth::get_auth_manager();
-                let m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                // 主人面板 5s 一轮，顺带做过期凭证/陈旧挂单清理
+                m.clean_expired();
                 AcpResponse::success(
                     req.id,
                     serde_json::json!({ "requests": m.list_request_views() }),
@@ -415,11 +408,11 @@ impl Handler {
                 );
                 (response, Some(AuthLevel::Bound))
             }
-            crate::binding::BindResult::AlreadyBound { device_name: _ } => {
+            crate::binding::BindResult::AlreadyBound { device_name } => {
                 let response = AcpResponse::error(
                     request.id,
                     -32600,
-                    "Device already bound",
+                    &format!("Device already bound (by '{}')", device_name),
                 );
                 (response, auth)
             }
@@ -513,6 +506,8 @@ impl Handler {
 
         let mgr = crate::auth::get_auth_manager();
         let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+        // 访客 3s 一轮的轮询也顺带做过期清理（无主人面板挂着的网关只能等重启才清）
+        m.clean_expired();
         // take_request_token: approved→一次性取票销单；其余状态不销
         if let Some(token) = m.take_request_token(&p.request_id) {
             tracing::info!(request = %p.request_id, "access token handed to visitor");

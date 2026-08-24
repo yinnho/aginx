@@ -48,7 +48,7 @@ fn test_aginx_integration() {
 
     // Start aginx ACP mode
     let mut child = match Command::new(aginx_path)
-        .args(&["acp", "--stdio"])
+        .args(["acp", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -71,9 +71,8 @@ fn test_aginx_integration() {
     let session_req = r#"{"jsonrpc":"2.0","id":2,"method":"newSession","params":{"cwd":"/tmp","_meta":{"agentId":"claude"}}}"#;
     writeln!(stdin, "{}", session_req).expect("Failed to write");
 
-    // Flush and close stdin
+    // Flush（stdin 随作用域结束关闭）
     stdin.flush().expect("Failed to flush");
-    drop(stdin);
 
     // Read output
     let output = child.wait_with_output().expect("Failed to read output");
@@ -99,8 +98,10 @@ fn test_aginx_integration() {
     println!("  Exit code: {}", output.status.code().unwrap_or(-1));
 }
 
+// 解码-only：字段存在本身即校验（event 形状合法），不逐字段消费
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "type")]
+#[allow(dead_code)]
 enum ClaudeEvent {
     #[serde(rename = "text")]
     Text { text: String },

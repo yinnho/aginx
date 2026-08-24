@@ -58,7 +58,9 @@ pub struct RpcError {
 // ============================================================================
 
 /// Prompt request params
+/// (sessionId/sessionTicket/activeFlow 保持 wire 原 camelCase 形状，ACP.md §2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(non_snake_case)]
 pub struct PromptParams {
     /// Agent ID to route to
     pub agent: String,
@@ -88,35 +90,9 @@ pub struct PromptParams {
     pub borrower: Option<String>,
 }
 
-/// List agents params
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ListAgentsParams {}
-
 // ============================================================================
 // Response Types
 // ============================================================================
-
-/// Prompt final result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptResult {
-    pub stopReason: String,
-    pub sessionId: String,
-}
-
-/// Chunk notification params (streaming text)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChunkParams {
-    pub text: String,
-}
-
-/// Agent info for listAgents
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentInfo {
-    pub id: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
 
 // ============================================================================
 // Response Helpers
@@ -153,18 +129,6 @@ impl Response {
         }
     }
 
-    pub fn notification(method: &str, params: impl Serialize) -> Self {
-        let params_value = serde_json::to_value(&params).unwrap_or(serde_json::Value::Null);
-        Self {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: Some(method.to_string()),
-            params: Some(params_value),
-            result: None,
-            error: None,
-        }
-    }
-
     pub fn to_ndjson(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
@@ -173,4 +137,3 @@ impl Response {
 // Legacy type aliases for compatibility with server/relay code
 pub type AcpRequest = Request;
 pub type AcpResponse = Response;
-pub type AcpError = RpcError;

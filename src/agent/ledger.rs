@@ -144,7 +144,7 @@ mod tests {
     fn test_ledger() -> (SessionLedger, PathBuf) {
         // into_path()：TempDir 转永久路径（tempdir 句柄 drop 会即删目录，
         // persist 就写进坟场了）
-        let dir = tempfile::tempdir().unwrap().into_path();
+        let dir = tempfile::tempdir().unwrap().keep();
         let path = dir.join("sessions.json");
         (
             SessionLedger {

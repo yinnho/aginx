@@ -10,11 +10,7 @@ use sha2::{Digest, Sha256};
 /// 设备硬件指纹
 #[derive(Debug, Clone)]
 pub struct HardwareFingerprint {
-    /// 原始数据
-    pub mac_address: Option<String>,
-    pub disk_serial: Option<String>,
-    pub motherboard_uuid: Option<String>,
-    /// 生成的指纹 hash
+    /// 生成的指纹 hash（SHA256，原始硬件数据只参与计算不留存）
     pub fingerprint: String,
 }
 
@@ -50,17 +46,7 @@ impl HardwareFingerprint {
             hex::encode(result)
         };
 
-        Self {
-            mac_address,
-            disk_serial,
-            motherboard_uuid,
-            fingerprint,
-        }
-    }
-
-    /// 获取指纹字符串（用于发送到远程）
-    pub fn as_str(&self) -> &str {
-        &self.fingerprint
+        Self { fingerprint }
     }
 }
 
@@ -415,9 +401,6 @@ mod tests {
     #[test]
     fn test_generate_fingerprint() {
         let fp = HardwareFingerprint::generate();
-        println!("MAC: {:?}", fp.mac_address);
-        println!("Disk: {:?}", fp.disk_serial);
-        println!("UUID: {:?}", fp.motherboard_uuid);
         println!("Fingerprint: {}", fp.fingerprint);
 
         // 指纹应该是 64 字符的十六进制字符串（SHA256）
