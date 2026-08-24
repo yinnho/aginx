@@ -186,7 +186,7 @@ borrower`（friends 名单门交给���侧 `[borrow]` 配置裁决）＞ `�
 |---|---|---|---|
 | `requestAccess` | 未鉴权放行 | `{clientName, agent?}`（agent = 客服码后缀分身名） | `auto_approve` 开：`{status:"approved", clientId, token, allowedAgents}`；否则 `{status:"pending", requestId}` |
 | `checkAccess` | 未鉴权放行 | `{requestId}` | 已批：`{status:"approved", token}`（**一次性取票销单**）；未处理：`{status:"pending"}`；单不在（被拒/已取/过期）：`{status:"notFound"}` |
-| `listRequests` | 仅 Bound | `{}` | `{requests:[{requestId, clientName, agent?, createdAt}]}`（token 永不出网关） |
+| `listRequests` | 仅 Bound | `{}` | `{requests:[{requestId, clientName, agent?, createdAt, approved}]}`（token 永不出网关；`approved=true` 已批、待访客 checkAccess 一次性取票） |
 | `approveRequest` | 仅 Bound | `{requestId, allowedAgents?, expireDays?}` | `{client:{id, name, allowedAgents, expiresAt}}`；scope 默认 = 申请时的 agent 后缀，缺省全 agent；expireDays 缺省永久 |
 | `rejectRequest` | 仅 Bound | `{requestId}` | `{removed: bool}` |
 | `listClients` | 仅 Bound | `{}` | `{clients:[{id, name, createdAt, expiresAt?, allowedAgents, allowSystem}]}`（不含 token） |
@@ -464,7 +464,7 @@ materials 体量超限统一报内层 -32002。台账 JSONL 只记
 
 <!-- golden: consent_list_requests_result -->
 ```json
-{"requests": [{"requestId": "req-1a2b3c4d", "clientName": "小明", "agent": "travel-planner", "createdAt": 1755955200}]}
+{"requests": [{"requestId": "req-1a2b3c4d", "clientName": "小明", "agent": "travel-planner", "createdAt": 1755955200, "approved": false}]}
 ```
 
 <!-- golden: consent_list_clients_result -->

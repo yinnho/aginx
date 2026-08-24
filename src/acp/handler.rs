@@ -258,7 +258,7 @@ impl Handler {
                 let m = mgr.lock().unwrap_or_else(|e| e.into_inner());
                 AcpResponse::success(
                     req.id,
-                    serde_json::json!({ "requests": m.list_requests() }),
+                    serde_json::json!({ "requests": m.list_request_views() }),
                 )
             }),
             "approveRequest" => {

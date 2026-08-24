@@ -47,6 +47,18 @@ pub struct AccessRequest {
     pub token: Option<String>,
 }
 
+/// listRequests wire view: token 永不出网关；`approved` = 票已铸、
+/// 等访客 checkAccess 一次性取走（主人面板凭它区分"待审/已批待领取"）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRequestView {
+    pub request_id: String,
+    pub client_name: String,
+    pub agent: Option<String>,
+    pub created_at: i64,
+    pub approved: bool,
+}
+
 /// Pending requests older than this are stale (visitor gave up polling)
 const PENDING_TTL_SECS: i64 = 86400;
 /// Upper bound on the pending queue (oldest dropped beyond this)
@@ -200,6 +212,20 @@ impl AuthManager {
             .collect()
     }
 
+    /// Wire views for listRequests (adds the approved-without-token flag).
+    pub fn list_request_views(&self) -> Vec<PendingRequestView> {
+        self.pending
+            .iter()
+            .map(|r| PendingRequestView {
+                request_id: r.request_id.clone(),
+                client_name: r.client_name.clone(),
+                agent: r.agent.clone(),
+                created_at: r.created_at,
+                approved: r.token.is_some(),
+            })
+            .collect()
+    }
+
     /// Record the approved token on a pending request (visitor fetch slot).
     pub fn set_request_token(&mut self, request_id: &str, token: &str) {
         if let Some(r) = self.pending.iter_mut().find(|r| r.request_id == request_id) {
@@ -209,11 +235,18 @@ impl AuthManager {
     }
 
     /// One-time token handoff: returns the token and removes the request.
+    /// 销单只在真有票时发生——未批准的请求必须留在队列里等主人
+    /// （访客轮询先于批准是常态，首轮轮询就销单会让同意流永远走不通）。
     pub fn take_request_token(&mut self, request_id: &str) -> Option<String> {
-        let idx = self.pending.iter().position(|r| r.request_id == request_id)?;
-        let req = self.pending.remove(idx);
+        let token = self
+            .pending
+            .iter()
+            .find(|r| r.request_id == request_id)?
+            .token
+            .clone()?;
+        self.pending.retain(|r| r.request_id != request_id);
         self.save_pending();
-        req.token
+        Some(token)
     }
 
     /// Drop a pending request (owner rejected / cleanup). Returns true if it existed.
@@ -258,5 +291,61 @@ impl AuthManager {
             self.save_pending();
         }
         removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr_in_tmp(tag: &str) -> AuthManager {
+        let dir = std::env::temp_dir().join(format!("aginx-auth-test-{}-{}", tag, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        AuthManager {
+            data_dir: dir,
+            clients: HashMap::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// 访客轮询先于主人批准是常态：未批准的 take 必须返回 None 且**不销单**
+    /// （否则首轮轮询就销单，主人 listRequests 永远是空，同意流死锁）。
+    #[test]
+    fn take_request_token_keeps_unapproved_pending() {
+        let mut m = mgr_in_tmp("keep");
+        let req = m.add_request("访客", Some("clone-creator"));
+        // 轮询三次（未批准）
+        for _ in 0..3 {
+            assert_eq!(m.take_request_token(&req.request_id), None);
+        }
+        assert_eq!(m.list_requests().len(), 1, "未批准的请求必须留在队列");
+        // 批准后再轮询：拿到票且销单
+        m.set_request_token(&req.request_id, "ac-ticket");
+        assert_eq!(m.take_request_token(&req.request_id), Some("ac-ticket".into()));
+        assert!(m.list_requests().is_empty(), "取票后销单");
+        assert_eq!(m.take_request_token(&req.request_id), None, "一次性：再取无票");
+    }
+
+    /// 不存在的请求 → None（不 panic 不残留）。
+    #[test]
+    fn take_request_token_unknown_id_is_none() {
+        let mut m = mgr_in_tmp("unknown");
+        m.add_request("访客", None);
+        assert_eq!(m.take_request_token("req-nonexistent"), None);
+        assert_eq!(m.list_requests().len(), 1);
+    }
+
+    /// 视图层 approved 标志跟随票据铸造翻转，token 永不外泄。
+    #[test]
+    fn list_request_views_approved_flag() {
+        let mut m = mgr_in_tmp("views");
+        let req = m.add_request("访客", None);
+        assert!(!m.list_request_views()[0].approved, "未批准 → approved=false");
+        m.set_request_token(&req.request_id, "ac-ticket");
+        assert!(m.list_request_views()[0].approved, "已批待领取 → approved=true");
+        // 序列化形状：camelCase 键 + 无 token 字段（金样本同形）
+        let j = serde_json::to_value(m.list_request_views()).unwrap();
+        assert!(j[0].get("requestId").is_some() && j[0].get("approved").is_some());
+        assert!(j[0].get("token").is_none());
     }
 }
