@@ -260,4 +260,7 @@ pub struct AgentEntry {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// stdout dialect declaration (ACP.md §2.8): "raw" | "claude-stream-json"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }

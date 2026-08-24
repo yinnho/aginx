@@ -102,6 +102,16 @@ JSON-RPC 2.0 over ndjson（经第 0 层管道或 Direct TCP）。单行上限 **
 `listAgents`（别名 `agents/list`）→ `{agents: [{id, name, description?}]}`
 （Authorized 按 agent 白名单过滤）。`ping` → `{pong: true}`。
 
+### 2.4.1 sessions/list（会话列表）
+
+`{agent}` → `{sessions: [{sessionId, title, lastTs, turns}]}`（按 lastTs 倒序）。
+**事实源 = 网关台账**：prompt 成功轮以翻译器收割的 agent 真会话 id（§2.5）记
+`{注册名, sessionId, title=首句截断, lastTs, turns=经手轮数}`，只记网关经手的
+轮，不读 agent 私有存储（claude 会话库等一律不碰——会话属 agent 侧，网关只记
+自己经手的账）。`sessionId` 即下轮 prompt 的续接 id。raw 方言（无翻译器收割）
+自然为空表——不报错。未知 `agent` → `-32602`。读方法，鉴权归 safe 档（同
+listAgents）。
+
 ### 2.5 prompt
 
 **核心方法**。参数（`agent` 与 `message` 必填）：
@@ -124,7 +134,13 @@ JSON-RPC 2.0 over ndjson（经第 0 层管道或 Direct TCP）。单行上限 **
    `streaming` 键即吞掉不发。客户端不该期待任何带 id 的中间响应。
 2. **最终响应无 id**，经通知通道下发：`{jsonrpc, result: {stopReason, …}}`。
 
-普通轮最终结果：`{stopReason: "endTurn", sessionId?}`。
+普通轮最终结果：`{stopReason: "endTurn", sessionId?, costUsd?, durationMs?, numTurns?}`。
+
+**`sessionId` 语义（2026-08-24 起）：网关收割的 agent 真会话 id**——CLI
+路径经 output 翻译器（§2.8）从 agent 输出收割；无翻译器方言时回显客户端
+传入值。客户端把它原样回喂下轮 `prompt.sessionId` 即续接。`costUsd` /
+`durationMs` / `numTurns` 是翻译器可选附带的成本/时长/轮数（数值，缺省
+省略）。
 借道轮最终结果：`{stopReason, streaming: true, sessionId, sessionTicket, files}`
 （见 §6 金样本）。
 
@@ -136,6 +152,20 @@ JSON-RPC 2.0 over ndjson（经第 0 层管道或 Direct TCP）。单行上限 **
 `{"jsonrpc":"2.0","method":"chunk","params":{"text":…,"sessionId?":…}}`，
 无 id。**这是外部协议唯一的流式通知**（网关把 agent 侧 session/update 翻译
 成它）。逐块到达，客户端拼接即最终文本。
+
+chunk 的 text 是**翻译后的纯文本**：接入包声明 `output`（§2.8）的 CLI
+agent，网关按声明把 CLI stdout 行翻译成纯文本（如 claude-stream-json 只发
+assistant 文本块）；未声明/`raw` 保持原行直通。
+
+### 2.8 接入包输出声明（output）
+
+`aginx.toml` 顶层 `output` 字段声明该 CLI 的 stdout 方言，网关据此挂翻译
+器——**方言知识属于接入包，不属于网关核心**（网关代码零 CLI 字样）：
+
+| 值 | 方言 | 行为 |
+|---|---|---|
+| `raw`（缺省） | 裸文本行 | 行直通 chunk；result.sessionId 回显客户端传入 |
+| `claude-stream-json` | claude `--output-format stream-json --verbose` | assistant 行 text 块 → chunk 纯文本；`type=result` 行收割真 session_id + costUsd/durationMs/numTurns（记入台账 §2.4.1）；`is_error:true` → error 帧 |
 
 ### 2.7 借用者身份透传优先级（网关→桥）
 
@@ -340,6 +370,21 @@ materials 体量超限统一报内层 -32002。台账 JSONL 只记
 {"jsonrpc": "2.0", "result": {"stopReason": "endTurn", "sessionId": "sess_1a2b3c"}}
 ```
 
+<!-- golden: external_final_result_translated -->
+```json
+{"jsonrpc": "2.0", "result": {"stopReason": "endTurn", "sessionId": "b8f713a4-ea3b-4d6c-920b-87dc2a0403f0", "costUsd": 0.015, "durationMs": 8400, "numTurns": 1}}
+```
+
+<!-- golden: external_sessions_list_request -->
+```json
+{"jsonrpc": "2.0", "id": 7, "method": "sessions/list", "params": {"agent": "claude"}}
+```
+
+<!-- golden: external_sessions_list_result -->
+```json
+{"sessions": [{"sessionId": "b8f713a4-ea3b-4d6c-920b-87dc2a0403f0", "title": "看一下以前的会话", "lastTs": "2026-08-24T00:03:23Z", "turns": 2}]}
+```
+
 <!-- golden: external_final_result_borrowed -->
 ```json
 {"jsonrpc": "2.0", "result": {"stopReason": "endTurn", "streaming": true, "sessionId": "sess_1a2b3c", "sessionTicket": {"version": 1, "label": "borrow:travel-planner", "messages": [{"role": "user", "content": "我叫小明"}, {"role": "assistant", "content": "你好小明"}, {"role": "user", "content": "读素材里的暗号并写进产物"}, {"role": "assistant", "content": "暗号 9527 已写进 advice.md"}], "turnSummaries": [], "contextWindowTokens": 32000}, "files": [{"name": "advice.md", "contentBase64": "IyDpobbkvowKClvpq5jotLkK"}]}}
@@ -402,6 +447,8 @@ materials 体量超限统一报内层 -32002。台账 JSONL 只记
 - 旧版 ACP.md 的 `session/prompt`（ContentBlock[]）/ `session/load` /
   `session/list` / 权限请求 / 终端方法：**外部协议从未用过**。外部层是扁平
   `prompt`+`message`（§2.5）；ContentBlock 只存在于第 2 层网关→桥方向。
+  （2026-08-24 注：新立法的外部方法 `sessions/list`（§2.4.1）与旧内部
+  `session/list` 是不同方法——按接入包 output 声明探测 agent 侧会话库。）
 - `_aginx/*` 下划线方法名：实现是裸名（`bindDevice`/`listAgents`），无
   下划线前缀。`_aginx/discoverRemote`/`listConversations`/`getMessages`/
   `deleteConversation`/`listDirectory`/`readFile` **不存在**（permission 表

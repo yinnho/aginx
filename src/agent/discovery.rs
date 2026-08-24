@@ -20,6 +20,13 @@ pub struct AgentConfig {
     /// Version
     #[serde(default)]
     pub version: String,
+    /// stdout dialect declaration (ACP.md §2.8): "raw" | "claude-stream-json"
+    #[serde(default)]
+    pub output: Option<String>,
+    /// 注册项绑定的项目文件夹（注册单元=项目/分身；~ 展开）。
+    /// 无 [command] 时按 agent_type 从同名 agent 继承 CLI 细节（type=模板）。
+    #[serde(default)]
+    pub folder: Option<String>,
     /// Access mode: public | private (inherits global default if not set)
     #[serde(default)]
     pub access: Option<AccessMode>,
@@ -243,8 +250,25 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path, 
         env,
         timeout: config.timeout,
         resume_args,
-        working_dir: Some(project_dir.to_string_lossy().to_string()),
+        output: config.output,
+        // 注册项绑定的 folder 优先（~ 展开）；无 folder 回落 agent 目录
+        working_dir: config
+            .folder
+            .as_deref()
+            .and_then(expand_tilde)
+            .or_else(|| Some(project_dir.to_string_lossy().to_string())),
         access,
+    }
+}
+
+/// `~/x` → home 展开；其余原样
+pub fn expand_tilde(p: &str) -> Option<String> {
+    if p == "~" {
+        dirs::home_dir().map(|h| h.to_string_lossy().to_string())
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        dirs::home_dir().map(|h| h.join(rest).to_string_lossy().to_string())
+    } else {
+        Some(p.to_string())
     }
 }
 

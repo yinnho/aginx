@@ -79,6 +79,7 @@ acp-native = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+tempfile = "3"
 anyhow = "1"
 serde_json = "1"
 tokio-native-tls = "0.3"

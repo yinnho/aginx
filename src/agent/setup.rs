@@ -27,17 +27,15 @@ name = "Claude"
 agent_type = "claude"
 version = "1.0.0"
 description = "Claude Code - Anthropic's coding assistant"
+output = "claude-stream-json"
 
 [command]
 path = "claude"
-args = ["--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--input-format", "stream-json", "--include-partial-messages", "--verbose"]
+args = ["--dangerously-skip-permissions", "--print", "--output-format", "stream-json", "--verbose"]
 
 [session]
 require_workdir = true
 storage_path = "~/.claude/projects"
-
-[session.resume]
-session_id_path = "session_id"
 resume_args = ["--resume", "${SESSION_ID}"]
 
 [capabilities]

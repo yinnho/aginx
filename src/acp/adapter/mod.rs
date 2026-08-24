@@ -7,6 +7,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::AgentInfo;
 
+pub mod translate;
+use translate::OutputFormat;
+
 /// Prompt adapter — spawns a CLI process, streams stdout back
 pub struct PromptAdapter {
     command: String,
@@ -14,16 +17,28 @@ pub struct PromptAdapter {
     env: std::collections::HashMap<String, String>,
     timeout_secs: u64,
     resume_args: Option<Vec<String>>,
+    /// stdout dialect（接入包 output 声明驱动，网关核心零 CLI 知识）
+    output: OutputFormat,
+    /// 注册项绑定的默认文件夹：客户端不带 cwd 时 spawn 在这（会话锚定点）
+    working_dir: Option<String>,
+    /// 注册名（记账归属）
+    agent_id: String,
+    /// 会话台账：成功轮结束后以收割的真 sessionId 记账（§2.4.1 事实源）
+    ledger: crate::agent::ledger::SessionLedger,
 }
 
 impl PromptAdapter {
-    pub fn new(agent_info: &AgentInfo) -> Self {
+    pub fn new(agent_info: &AgentInfo, ledger: crate::agent::ledger::SessionLedger) -> Self {
         Self {
             command: agent_info.command.clone(),
             args_template: agent_info.args.clone(),
             env: agent_info.env.clone(),
             timeout_secs: agent_info.timeout.unwrap_or(120),
             resume_args: agent_info.resume_args.clone(),
+            output: OutputFormat::parse(agent_info.output.as_deref()),
+            working_dir: agent_info.working_dir.clone(),
+            agent_id: agent_info.id.clone(),
+            ledger,
         }
     }
 
@@ -41,7 +56,14 @@ impl PromptAdapter {
         let message = message.to_string();
         let timeout_secs = self.timeout_secs;
         let env = self.env.clone();
+        let output = self.output;
+        let agent_id = self.agent_id.clone();
+        let ledger = self.ledger.clone();
+        // cwd 解析优先级：客户端传入 > 注册项默认文件夹（working_dir）。
+        // 两者都过同一道门：必须存在、是目录、在 home 内。
         let cwd = cwd
+            .filter(|dir| !dir.is_empty())
+            .or(self.working_dir.as_deref())
             .filter(|dir| !dir.is_empty())
             .and_then(|dir| {
                 // Validate: must exist, be a directory, and be within home directory
@@ -136,7 +158,11 @@ impl PromptAdapter {
                     // Track if client disconnected (tx.send failed)
                     let mut client_disconnected = false;
 
-                    // Read stdout line by line, send as chunk notifications
+                    // 方言翻译收割状态（§2.5/§2.6）：chunk 只发翻译后的纯文本，
+                    // 真 sessionId/成本字段从 result 行收割
+                    let mut harvested: translate::TranslatedLine = Default::default();
+
+                    // Read stdout line by line, translate dialect → chunk notifications
                     let read_stdout = async {
                         if let Some(stdout) = child.stdout.take() {
                             use tokio::io::AsyncBufReadExt;
@@ -144,17 +170,39 @@ impl PromptAdapter {
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
-                                let mut params = serde_json::json!({"text": line});
-                                if let Some(ref sid) = session_id_owned {
-                                    params["sessionId"] = serde_json::json!(sid);
+                                let t = translate::translate_line(output, &line);
+                                if t.session_id.is_some() {
+                                    harvested.session_id = t.session_id.clone();
                                 }
-                                let notification = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "chunk",
-                                    "params": params
-                                });
-                                if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
-                                    client_disconnected = true;
+                                if t.cost_usd.is_some() {
+                                    harvested.cost_usd = t.cost_usd;
+                                }
+                                if t.duration_ms.is_some() {
+                                    harvested.duration_ms = t.duration_ms;
+                                }
+                                if t.num_turns.is_some() {
+                                    harvested.num_turns = t.num_turns;
+                                }
+                                harvested.is_error |= t.is_error;
+                                if harvested.error_text.is_none() {
+                                    harvested.error_text = t.error_text.clone();
+                                }
+                                for text in &t.chunks {
+                                    let mut params = serde_json::json!({"text": text});
+                                    if let Some(ref sid) = session_id_owned {
+                                        params["sessionId"] = serde_json::json!(sid);
+                                    }
+                                    let notification = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "chunk",
+                                        "params": params
+                                    });
+                                    if tx.send(serde_json::to_string(&notification).unwrap_or_default()).await.is_err() {
+                                        client_disconnected = true;
+                                        break;
+                                    }
+                                }
+                                if client_disconnected {
                                     break;
                                 }
                             }
@@ -199,6 +247,15 @@ impl PromptAdapter {
                             "error": {"code": -32603, "message": format!("Agent timed out after {}s", timeout_secs)}
                         });
                         let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
+                    } else if harvested.is_error {
+                        // agent 自报失败（如 claude result.is_error）→ error 帧（§2.8）
+                        let detail = harvested.error_text.clone()
+                            .unwrap_or_else(|| format!("Agent exited with code {}", code));
+                        let err = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "error": {"code": -32603, "message": detail}
+                        });
+                        let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
                     } else if code != 0 {
                         let detail = if stderr_output.is_empty() {
                             format!("Agent exited with code {}", code)
@@ -211,16 +268,31 @@ impl PromptAdapter {
                         });
                         let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
                     } else {
-                        // Success: send done signal with sessionId for client resume
+                        // Success: sessionId = 翻译器收割的 agent 真会话 id，
+                        // 无翻译器方言回显客户端传入值（§2.5 立法语义）
                         let mut result = serde_json::json!({"stopReason": "endTurn"});
-                        if let Some(ref sid) = session_id_owned {
+                        let final_sid = harvested.session_id.clone().or_else(|| session_id_owned.clone());
+                        if let Some(ref sid) = final_sid {
                             result["sessionId"] = serde_json::json!(sid);
+                        }
+                        if let Some(cost) = harvested.cost_usd {
+                            result["costUsd"] = serde_json::json!(cost);
+                        }
+                        if let Some(ms) = harvested.duration_ms {
+                            result["durationMs"] = serde_json::json!(ms);
+                        }
+                        if let Some(n) = harvested.num_turns {
+                            result["numTurns"] = serde_json::json!(n);
                         }
                         let done = serde_json::json!({
                             "jsonrpc": "2.0",
                             "result": result
                         });
                         let _ = tx.send(serde_json::to_string(&done).unwrap()).await;
+                        // 成功轮记账：只记翻译器收割到的真会话 id（raw 方言不记）
+                        if let Some(ref sid) = final_sid {
+                            ledger.record_turn(&agent_id, sid, &message);
+                        }
                     }
                 }
                 Err(e) => {

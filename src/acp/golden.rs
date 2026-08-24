@@ -159,6 +159,58 @@ fn chunk_notification_shape() {
 }
 
 #[test]
+fn external_final_result_translated_fields() {
+    // §2.5 翻译轮最终结果：收割的真 sessionId + 可选成本三件套（camelCase），
+    // 不带 id（ack 吞铁则同 plain/borrowed）。
+    let v = golden("external_final_result_translated");
+    let result = v.pointer("/result").expect("result 必填");
+    assert_eq!(
+        result.get("stopReason").and_then(|s| s.as_str()),
+        Some("endTurn")
+    );
+    assert_eq!(
+        result.get("sessionId").and_then(|s| s.as_str()),
+        Some("b8f713a4-ea3b-4d6c-920b-87dc2a0403f0")
+    );
+    assert!(result.get("sessionId").unwrap().as_str().unwrap().chars().all(
+        |c| c.is_ascii_alphanumeric() || c == '-' || c == '_'
+    ));
+    assert_eq!(result.get("costUsd").and_then(|c| c.as_f64()), Some(0.015));
+    assert_eq!(result.get("durationMs").and_then(|d| d.as_u64()), Some(8400));
+    assert_eq!(result.get("numTurns").and_then(|n| n.as_u64()), Some(1));
+    assert!(v.get("id").is_none(), "最终响应不带 id（ack 吞铁则）");
+}
+
+#[test]
+fn external_sessions_list_request_params() {
+    // §2.4.1 sessions/list 请求参数形状：{agent}（台账按注册名查，无 cwd）。
+    let v = golden("external_sessions_list_request");
+    assert_eq!(
+        v.get("method").and_then(|m| m.as_str()),
+        Some("sessions/list")
+    );
+    let params = v.get("params").expect("params 必填");
+    assert_eq!(params.get("agent").and_then(|a| a.as_str()), Some("claude"));
+    assert!(params.get("cwd").is_none(), "台账语义下无 cwd 参数");
+}
+
+#[test]
+fn external_sessions_list_result_deserializes() {
+    // §2.4.1 结果形状：{sessions:[{sessionId,title,lastTs,turns}]}，
+    // 用台账 SessionSummary 反序列化锁死字段名（事实源=网关台账，非 agent 私有存储）。
+    let v = golden("external_sessions_list_result");
+    let sessions = v
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .expect("sessions 数组必填");
+    assert_eq!(sessions.len(), 1);
+    let summary: crate::agent::ledger::SessionSummary =
+        serde_json::from_value(sessions[0].clone()).expect("SessionSummary 字段名应与文档一致");
+    assert_eq!(summary.turns, 2);
+    assert!(summary.lastTs.ends_with('Z'));
+}
+
+#[test]
 fn internal_initialize_uses_integer_version() {
     // 网关→桥 initialize 用整数 protocolVersion（adapter rpc! 的写法）。
     let v = golden("internal_initialize_request");

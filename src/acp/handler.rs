@@ -86,7 +86,7 @@ impl Handler {
         // Safe methods are always allowed
         if matches!(
             method,
-            "listAgents" | "agents/list" | "ping" | "initialize"
+            "listAgents" | "agents/list" | "sessions/list" | "ping" | "initialize"
         ) {
             return true;
         }
@@ -241,6 +241,31 @@ impl Handler {
                     auth,
                 )
             }
+            "sessions/list" => {
+                // §2.4.1：{agent} → {sessions:[…]}。事实源 = 网关台账
+                // （经手轮以收割的真 sessionId 记账；raw 方言无收割 → 空表）。
+                let params = request.params.clone().unwrap_or_default();
+                let agent_id = params.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+                if agent_id.is_empty() {
+                    (
+                        AcpResponse::error(request.id, -32602, "sessions/list requires 'agent'"),
+                        auth,
+                    )
+                } else if self.agent_manager.get_agent_info(agent_id).await.is_none() {
+                    (
+                        AcpResponse::error(request.id, -32602, &format!("Unknown agent: {}", agent_id)),
+                        auth,
+                    )
+                } else {
+                    (
+                        AcpResponse::success(
+                            request.id,
+                            serde_json::json!({ "sessions": self.agent_manager.ledger.list(agent_id) }),
+                        ),
+                        auth,
+                    )
+                }
+            }
             "ping" => (
                 AcpResponse::success(request.id, serde_json::json!({"pong": true})),
                 auth,
@@ -358,7 +383,7 @@ impl Handler {
         };
 
         // Create adapter and run prompt
-        let adapter = PromptAdapter::new(&agent_info);
+        let adapter = PromptAdapter::new(&agent_info, self.agent_manager.ledger.clone());
         // sessionId 只采信 client 显式传入——不再自动生成：
         // 生成的 uuid 会被 PromptAdapter 拼进 resume_args（如 `--resume <uuid>`），
         // headless CLI（claude/copilot）不认识该 id，首轮即 "No conversation found" 必炸。

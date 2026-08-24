@@ -1,6 +1,7 @@
 //! Agent management for aginx
 
 mod discovery;
+pub mod ledger;
 mod manager;
 mod session;
 pub mod setup;
