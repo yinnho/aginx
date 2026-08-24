@@ -167,6 +167,9 @@ assistant 文本块）；未声明/`raw` 保持原行直通。
 | `raw`（缺省） | 裸文本行 | 行直通 chunk；result.sessionId 回显客户端传入 |
 | `claude-stream-json` | claude `--output-format stream-json --verbose` | assistant 行 text 块 → chunk 纯文本；`type=result` 行收割真 session_id + costUsd/durationMs/numTurns（记入台账 §2.4.1）；`is_error:true` → error 帧 |
 
+方言是**形状契约不是身份契约**：任何 CLI 只要按此形状发声即可声明（aginx-carrier
+ask 模式自 2026-08-24 起发 claude-stream-json 形状的事件行，见 §3.1）。
+
 ### 2.7 借用者身份透传优先级（网关→桥）
 
 `Authorized → client.id`（不可冒充）＞ `public 伪 Bound → 客户端显式
@@ -183,8 +186,13 @@ borrower`（friends 名单门交给���侧 `[borrow]` 配置裁决）＞ `�
 ### 3.1 双模嗅探（aginx-carrier 桥特有）
 
 桥读 stdin 首行判模式：以 `{` 开头、可解析 JSON 且带 `"jsonrpc"` 键 → ACP
-模式；否则整段 stdin 为消息走 **ask 裸文本模式**（stdout 裸文本流式输出、
-exit 0=成功/非 0=失败）。两种模式共用同一条 `aginx.toml` command。
+模式；否则整段 stdin 为消息走 **ask 裸文本模式**（网关 PromptAdapter 契约）。
+两种模式共用同一条 `aginx.toml` command。
+
+ask 模式自 v1 起说 claude-stream-json 方言（接入包声明 `output`，§2.8）：
+每个文本增量一行 `assistant` 事件、轮末一行 `result` 事件（`session_id` /
+`num_turns` / `duration_ms` / `is_error`；错误轮也发——会话链不断）；`--session
+<id>` 续接（缺省铸造新 uuid），kernel 会话 label = `aginx:<id>` 跨进程连续。
 
 ### 3.2 ACP 方法集（桥实现）
 
