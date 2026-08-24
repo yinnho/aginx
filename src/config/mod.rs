@@ -9,6 +9,11 @@ use std::path::PathBuf;
 
 /// Get the aginx data directory (~/.aginx)
 pub fn data_dir() -> PathBuf {
+    // Test/multi-instance override: consent-flow E2E spins an isolated
+    // gateway alongside the real one via AGINX_DATA_DIR
+    if let Ok(d) = std::env::var("AGINX_DATA_DIR") {
+        return PathBuf::from(d);
+    }
     dirs::home_dir()
         .map(|h| h.join(".aginx"))
         .unwrap_or_else(|| PathBuf::from(".aginx"))
@@ -98,6 +103,10 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default)]
     pub access: AccessMode,
+    /// Consent flow: auto-approve visitor requestAccess (客服码即扫即用).
+    /// Issues a scoped Authorized token instead of queueing for the owner.
+    #[serde(default)]
+    pub auto_approve: bool,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
     #[serde(default = "default_max_concurrent_sessions")]
@@ -123,6 +132,7 @@ impl Default for ServerConfig {
             port: default_port(),
             host: default_host(),
             access: AccessMode::default(),
+            auto_approve: false,
             max_connections: default_max_connections(),
             max_concurrent_sessions: default_max_concurrent_sessions(),
             session_timeout_seconds: default_session_timeout_seconds(),

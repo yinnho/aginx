@@ -211,6 +211,66 @@ fn external_sessions_list_result_deserializes() {
 }
 
 #[test]
+fn consent_request_access_params_camel() {
+    // §2.9 requestAccess 参数 camelCase（clientName/agent）。
+    let v = golden("consent_request_access_request");
+    assert_eq!(
+        v.get("method").and_then(|m| m.as_str()),
+        Some("requestAccess")
+    );
+    let params = v.get("params").expect("params 必填");
+    let mut keys: Vec<&str> = params.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["agent", "clientName"]);
+}
+
+#[test]
+fn consent_result_shapes() {
+    // 三态响应键集：pending{status,requestId} / auto-approved{status,clientId,
+    // token,allowedAgents} / checkAccess approved{status,token}。
+    let pending = golden("consent_request_access_pending_result");
+    assert_eq!(pending.get("status").and_then(|s| s.as_str()), Some("pending"));
+    assert!(pending.get("requestId").and_then(|r| r.as_str()).unwrap_or("").starts_with("req-"));
+
+    let auto = golden("consent_request_access_auto_result");
+    assert_eq!(auto.get("status").and_then(|s| s.as_str()), Some("approved"));
+    assert!(auto.get("token").and_then(|t| t.as_str()).unwrap_or("").starts_with("ac-"));
+    assert_eq!(
+        auto.get("allowedAgents").and_then(|a| a.as_array()).map(|a| a.len()),
+        Some(1)
+    );
+
+    let fetched = golden("consent_check_access_approved_result");
+    assert_eq!(fetched.get("status").and_then(|s| s.as_str()), Some("approved"));
+    assert!(fetched.get("token").and_then(|t| t.as_str()).unwrap_or("").starts_with("ac-"));
+}
+
+#[test]
+fn consent_list_requests_result_deserializes() {
+    // §2.9 listRequests 结果用 AccessRequest 反序列化锁死字段名
+    // （token 剥离是网关侧行为，样本本就不含）。
+    let v = golden("consent_list_requests_result");
+    let reqs = v.get("requests").and_then(|r| r.as_array()).expect("requests 数组必填");
+    assert_eq!(reqs.len(), 1);
+    let req: crate::auth::AccessRequest =
+        serde_json::from_value(reqs[0].clone()).expect("AccessRequest 字段名应与文档一致");
+    assert_eq!(req.request_id, "req-1a2b3c4d");
+    assert_eq!(req.agent.as_deref(), Some("travel-planner"));
+    assert!(req.token.is_none(), "listRequests 响应永不带 token");
+}
+
+#[test]
+fn consent_list_clients_result_has_no_token() {
+    // §2.9 铁则：listClients 不含 token 字段（访客取票只走 checkAccess）。
+    let v = golden("consent_list_clients_result");
+    let clients = v.get("clients").and_then(|c| c.as_array()).expect("clients 数组必填");
+    assert_eq!(clients.len(), 1);
+    let keys: Vec<&str> = clients[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    assert!(!keys.contains(&"token"), "listClients 响应不得含 token");
+    assert!(keys.contains(&"allowSystem"));
+}
+
+#[test]
 fn internal_initialize_uses_integer_version() {
     // 网关→桥 initialize 用整数 protocolVersion（adapter rpc! 的写法）。
     let v = golden("internal_initialize_request");

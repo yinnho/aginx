@@ -16,22 +16,39 @@ use crate::auth::{AuthLevel, AuthorizedClient};
 pub struct Handler {
     agent_manager: Arc<AgentManager>,
     access: crate::config::AccessMode,
+    auto_approve: bool,
     jwt_secret: Option<String>,
 }
+
+/// Admin methods: Bound (owner device) only. Visitors holding Authorized
+/// tokens can never call these — a client must not be able to approve itself.
+const ADMIN_METHODS: &[&str] = &[
+    "listRequests",
+    "approveRequest",
+    "rejectRequest",
+    "listClients",
+    "revokeClient",
+];
 
 impl Handler {
     pub fn new(agent_manager: AgentManager) -> Self {
         Self {
             agent_manager: Arc::new(agent_manager),
             access: crate::config::AccessMode::default(),
+            auto_approve: false,
             jwt_secret: None,
         }
     }
 
-    pub fn with_access(access: crate::config::AccessMode, agent_manager: AgentManager) -> Self {
+    pub fn with_access(
+        access: crate::config::AccessMode,
+        auto_approve: bool,
+        agent_manager: AgentManager,
+    ) -> Self {
         Self {
             agent_manager: Arc::new(agent_manager),
             access,
+            auto_approve,
             jwt_secret: None,
         }
     }
@@ -57,13 +74,14 @@ impl Handler {
             return true;
         }
 
-        // No auth: only initialize and bindDevice
+        // No auth: only initialize, bindDevice and the consent-flow pair
+        // (requestAccess/checkAccess — the visitor's entry door)
         let level = match auth {
             Some(l) => l,
             None => {
                 return matches!(
                     method,
-                    "initialize" | "bindDevice"
+                    "initialize" | "bindDevice" | "requestAccess" | "checkAccess"
                 );
             }
         };
@@ -83,6 +101,11 @@ impl Handler {
         agent_id: Option<&str>,
         client: &AuthorizedClient,
     ) -> bool {
+        // Admin methods are owner-only, regardless of claims (§2.9)
+        if ADMIN_METHODS.contains(&method) {
+            return false;
+        }
+
         // Safe methods are always allowed
         if matches!(
             method,
@@ -222,6 +245,67 @@ impl Handler {
                 let (response, new_auth) = self.handle_bind_device(request, auth).await;
                 (response, new_auth)
             }
+            "requestAccess" => {
+                let response = self.handle_request_access(request).await;
+                (response, auth)
+            }
+            "checkAccess" => {
+                let response = self.handle_check_access(request).await;
+                (response, auth)
+            }
+            "listRequests" => self.owner_gate(request, &auth, |req| {
+                let mgr = crate::auth::get_auth_manager();
+                let m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                AcpResponse::success(
+                    req.id,
+                    serde_json::json!({ "requests": m.list_requests() }),
+                )
+            }),
+            "approveRequest" => {
+                let response = self.handle_approve_request(request, &auth).await;
+                (response, auth)
+            }
+            "rejectRequest" => self.owner_gate(request, &auth, |req| {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P { request_id: String }
+                let p: P = match serde_json::from_value(req.params.clone().unwrap_or_default()) {
+                    Ok(p) => p,
+                    Err(_) => return AcpResponse::error(req.id, -32602, "Invalid params: requestId required"),
+                };
+                let mgr = crate::auth::get_auth_manager();
+                let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                AcpResponse::success(req.id, serde_json::json!({ "removed": m.remove_request(&p.request_id) }))
+            }),
+            "listClients" => self.owner_gate(request, &auth, |req| {
+                let mgr = crate::auth::get_auth_manager();
+                let m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                // Tokens never leave the gateway — the visitor fetch is
+                // checkAccess-only, the owner never needs them
+                let clients: Vec<serde_json::Value> = m.list_clients().into_iter().map(|c| {
+                    serde_json::json!({
+                        "id": c.id,
+                        "name": c.name,
+                        "createdAt": c.created_at,
+                        "expiresAt": c.expires_at,
+                        "allowedAgents": c.allowed_agents,
+                        "allowSystem": c.allow_system,
+                    })
+                }).collect();
+                AcpResponse::success(req.id, serde_json::json!({ "clients": clients }))
+            }),
+            "revokeClient" => self.owner_gate(request, &auth, |req| {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P { client_id: String }
+                let p: P = match serde_json::from_value(req.params.clone().unwrap_or_default()) {
+                    Ok(p) => p,
+                    Err(_) => return AcpResponse::error(req.id, -32602, "Invalid params: clientId required"),
+                };
+                let mgr = crate::auth::get_auth_manager();
+                let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+                AcpResponse::success(req.id, serde_json::json!({ "removed": m.remove_client(&p.client_id) }))
+            }),
             "listAgents" | "agents/list" => {
                 let agents = self.agent_manager.list_agents().await;
                 // Filter agents based on authorization
@@ -344,6 +428,151 @@ impl Handler {
                 (response, auth)
             }
         }
+    }
+
+    /// Owner-only gate for admin methods. is_allowed already rejects
+    /// visitors; this is the in-arm enforcement (public mode's 伪 Bound
+    /// passes — public means everything is open, consistent with §2.2).
+    fn owner_gate(
+        &self,
+        request: AcpRequest,
+        auth: &Option<AuthLevel>,
+        f: impl FnOnce(AcpRequest) -> AcpResponse,
+    ) -> (AcpResponse, Option<AuthLevel>) {
+        if !matches!(auth, Some(AuthLevel::Bound)) {
+            return (
+                AcpResponse::error(request.id, -32600, "Owner device required"),
+                auth.clone(),
+            );
+        }
+        (f(request), auth.clone())
+    }
+
+    /// requestAccess（同意流访客入口，§2.9）：挂 pending 队列等主人点同意；
+    /// 网关配 `auto_approve = true` 时立即发放 scoped token（客服码即扫即用）。
+    async fn handle_request_access(&self, request: AcpRequest) -> AcpResponse {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            client_name: String,
+            #[serde(default)]
+            agent: Option<String>,
+        }
+        let p: P = match request.params {
+            Some(ref v) => match serde_json::from_value(v.clone()) {
+                Ok(p) => p,
+                Err(e) => return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e)),
+            },
+            None => return AcpResponse::error(request.id, -32602, "Missing params"),
+        };
+        let name = p.client_name.trim().chars().take(64).collect::<String>();
+        if name.is_empty() {
+            return AcpResponse::error(request.id, -32602, "clientName required");
+        }
+        let agent = p.agent.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+
+        let mgr = crate::auth::get_auth_manager();
+        let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+
+        if self.auto_approve {
+            // Scoped to the 客服码 suffix when present; no suffix = all agents
+            // (same surface public mode would expose, but revocable per client)
+            let allowed = agent.clone().map(|a| vec![a]).unwrap_or_default();
+            let client = m.issue_client(&name, allowed, Some(30));
+            m.add_client(client.clone()).ok();
+            tracing::info!(client = %client.id, agent = ?agent, "auto-approve: visitor token issued");
+            return AcpResponse::success(request.id, serde_json::json!({
+                "status": "approved",
+                "clientId": client.id,
+                "token": client.token,
+                "allowedAgents": client.allowed_agents,
+            }));
+        }
+
+        let req = m.add_request(&name, agent.as_deref());
+        tracing::info!(request = %req.request_id, client = %name, "access request queued");
+        AcpResponse::success(request.id, serde_json::json!({
+            "status": "pending",
+            "requestId": req.request_id,
+        }))
+    }
+
+    /// checkAccess（访客轮询取票）：approved = 一次性发 token 并销单；
+    /// pending = 主人还没处理；notFound = 被拒/已取过/过期（同一状态，不泄露原因）。
+    async fn handle_check_access(&self, request: AcpRequest) -> AcpResponse {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P { request_id: String }
+        let p: P = match request.params {
+            Some(ref v) => match serde_json::from_value(v.clone()) {
+                Ok(p) => p,
+                Err(_) => return AcpResponse::error(request.id, -32602, "Invalid params: requestId required"),
+            },
+            None => return AcpResponse::error(request.id, -32602, "Missing params"),
+        };
+
+        let mgr = crate::auth::get_auth_manager();
+        let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+        // take_request_token: approved→一次性取票销单；其余状态不销
+        if let Some(token) = m.take_request_token(&p.request_id) {
+            tracing::info!(request = %p.request_id, "access token handed to visitor");
+            return AcpResponse::success(request.id, serde_json::json!({
+                "status": "approved",
+                "token": token,
+            }));
+        }
+        let still_pending = m.list_requests().iter().any(|r| r.request_id == p.request_id);
+        AcpResponse::success(request.id, serde_json::json!({
+            "status": if still_pending { "pending" } else { "notFound" },
+        }))
+    }
+
+    /// approveRequest（主人同意）：发 per-访客 AuthorizedClient（agent 范围
+    /// 默认 = 申请时的客服码后缀），token 记在 pending 单上等访客来取。
+    async fn handle_approve_request(&self, request: AcpRequest, auth: &Option<AuthLevel>) -> AcpResponse {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            request_id: String,
+            #[serde(default)]
+            allowed_agents: Option<Vec<String>>,
+            #[serde(default)]
+            expire_days: Option<i64>,
+        }
+        if !matches!(auth, Some(AuthLevel::Bound)) {
+            return AcpResponse::error(request.id, -32600, "Owner device required");
+        }
+        let p: P = match request.params {
+            Some(ref v) => match serde_json::from_value(v.clone()) {
+                Ok(p) => p,
+                Err(e) => return AcpResponse::error(request.id, -32602, &format!("Invalid params: {}", e)),
+            },
+            None => return AcpResponse::error(request.id, -32602, "Missing params"),
+        };
+
+        let mgr = crate::auth::get_auth_manager();
+        let mut m = mgr.lock().unwrap_or_else(|e| e.into_inner());
+
+        let Some(req) = m.list_requests().into_iter().find(|r| r.request_id == p.request_id) else {
+            return AcpResponse::error(request.id, -32602, &format!("Request not found: {}", p.request_id));
+        };
+        // Scope: explicit param > the 客服码 suffix the visitor asked for > all agents
+        let allowed = p.allowed_agents
+            .filter(|v| !v.is_empty())
+            .or_else(|| req.agent.clone().map(|a| vec![a]))
+            .unwrap_or_default();
+        let client = m.issue_client(&req.client_name, allowed.clone(), p.expire_days);
+        m.add_client(client.clone()).ok();
+        m.set_request_token(&p.request_id, &client.token);
+        tracing::info!(request = %p.request_id, client = %client.id, agents = ?allowed, "access request approved");
+        AcpResponse::success(request.id, serde_json::json!({
+            "client": {
+                "id": client.id,
+                "name": client.name,
+                "allowedAgents": client.allowed_agents,
+                "expiresAt": client.expires_at,
+            }
+        }))
     }
 
     /// Handle a streaming prompt request

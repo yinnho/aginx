@@ -63,7 +63,7 @@ impl RelayClient {
         let aginx_id = config.relay.id.clone().unwrap_or_else(|| "unknown".to_string());
         let agent_manager = Arc::new(agent_manager);
         let handler = Arc::new(
-            AcpHandler::with_access(config.server.access, (*agent_manager).clone())
+            AcpHandler::with_access(config.server.access, config.server.auto_approve, (*agent_manager).clone())
                 .with_jwt_secret(config.auth.jwt_secret.clone())
         );
 

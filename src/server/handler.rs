@@ -39,7 +39,7 @@ pub struct Handler {
 impl Handler {
     pub fn new(config: Arc<Config>, agent_manager: AgentManager) -> Self {
         let handler = Arc::new(
-            AcpHandler::with_access(config.server.access, agent_manager)
+            AcpHandler::with_access(config.server.access, config.server.auto_approve, agent_manager)
                 .with_jwt_secret(config.auth.jwt_secret.clone())
         );
         Self { handler, config }

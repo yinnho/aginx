@@ -90,7 +90,8 @@ JSON-RPC 2.0 over ndjson（经第 0 层管道或 Direct TCP）。单行上限 **
 | Bound | `bindDevice` 配对得到的设备 token | 全放行（主人本人设备） |
 | Authorized | `aginx auth` 签发的 client token / JWT | 按 claims 白名单（方法/agent/system） |
 
-未鉴权（private/protected 且无 token）只放行 `initialize` 和 `bindDevice`。
+未鉴权（private/protected 且无 token）只放行 `initialize`、`bindDevice`、
+`requestAccess` 和 `checkAccess`（同意流访客门，§2.9）。
 
 ### 2.3 bindDevice
 
@@ -175,6 +176,34 @@ ask 模式自 2026-08-24 起发 claude-stream-json 形状的事件行，见 §3.
 `Authorized → client.id`（不可冒充）＞ `public 伪 Bound → 客户端显式
 borrower`（friends 名单门交给���侧 `[borrow]` 配置裁决）＞ `真 Bound →
 不透传`（桥按 local 处理，不受名单门限制）。
+
+### 2.9 同意流（requestAccess / checkAccess + 管理五法）
+
+访客拿 scoped token 的正路（取代独占配对码撑 N 客户；`bindDevice` 仍留
+给主人本人设备）：
+
+| 方法 | 鉴权 | 请求要点 | 响应 |
+|---|---|---|---|
+| `requestAccess` | 未鉴权放行 | `{clientName, agent?}`（agent = 客服码后缀分身名） | `auto_approve` 开：`{status:"approved", clientId, token, allowedAgents}`；否则 `{status:"pending", requestId}` |
+| `checkAccess` | 未鉴权放行 | `{requestId}` | 已批：`{status:"approved", token}`（**一次性取票销单**）；未处理：`{status:"pending"}`；单不在（被拒/已取/过期）：`{status:"notFound"}` |
+| `listRequests` | 仅 Bound | `{}` | `{requests:[{requestId, clientName, agent?, createdAt}]}`（token 永不出网关） |
+| `approveRequest` | 仅 Bound | `{requestId, allowedAgents?, expireDays?}` | `{client:{id, name, allowedAgents, expiresAt}}`；scope 默认 = 申请时的 agent 后缀，缺省全 agent；expireDays 缺省永久 |
+| `rejectRequest` | 仅 Bound | `{requestId}` | `{removed: bool}` |
+| `listClients` | 仅 Bound | `{}` | `{clients:[{id, name, createdAt, expiresAt?, allowedAgents, allowSystem}]}`（不含 token） |
+| `revokeClient` | 仅 Bound | `{clientId}` | `{removed: bool}`（auth.json 删行，token 即死） |
+
+铁则：
+- **admin 五法（list/approve/reject/revoke）Bound-only**：Authorized 客户
+  调用一律 `-32600`——访客永远不能给自己发 token。
+- 发放的 token = auth.json 里一条 `AuthorizedClient`（`ac-` 前缀明文 token，
+  非 JWT；`allow_system:false`、`allowed_methods` 空=非 system 方法全放行）。
+  prompt 仍受 `allowedAgents` 白名单 + listAgents 过滤（§2.2/§2.4）。
+- `auto_approve`（网关 `[server]` 配置）= 客服码即扫即用：token 自动发放、
+  scope 锁客服码后缀、30 天过期（可被 revokeClient 吊销）——比 public 强：
+  每 client 可吊销、可审计。
+- 取票后**同连接再发 `initialize` 携带 token 即升权**（连接 auth 状态随
+  initialize 更新，§2.1），无需重连。
+- pending 队列上限 50、单 24h 过期；`requestId` 即取票凭证（只到访客手上）。
 
 ---
 
@@ -396,6 +425,51 @@ materials 体量超限统一报内层 -32002。台账 JSONL 只记
 <!-- golden: external_final_result_borrowed -->
 ```json
 {"jsonrpc": "2.0", "result": {"stopReason": "endTurn", "streaming": true, "sessionId": "sess_1a2b3c", "sessionTicket": {"version": 1, "label": "borrow:travel-planner", "messages": [{"role": "user", "content": "我叫小明"}, {"role": "assistant", "content": "你好小明"}, {"role": "user", "content": "读素材里的暗号并写进产物"}, {"role": "assistant", "content": "暗号 9527 已写进 advice.md"}], "turnSummaries": [], "contextWindowTokens": 32000}, "files": [{"name": "advice.md", "contentBase64": "IyDpobbkvowKClvpq5jotLkK"}]}}
+```
+
+<!-- golden: consent_request_access_request -->
+```json
+{"jsonrpc": "2.0", "id": 8, "method": "requestAccess", "params": {"clientName": "小明", "agent": "travel-planner"}}
+```
+
+<!-- golden: consent_request_access_pending_result -->
+```json
+{"status": "pending", "requestId": "req-1a2b3c4d"}
+```
+
+<!-- golden: consent_request_access_auto_result -->
+```json
+{"status": "approved", "clientId": "client-1a2b3c4d", "token": "ac-e3b0c44298fc1c149afbf4c8996fb924", "allowedAgents": ["travel-planner"]}
+```
+
+<!-- golden: consent_check_access_request -->
+```json
+{"jsonrpc": "2.0", "id": 9, "method": "checkAccess", "params": {"requestId": "req-1a2b3c4d"}}
+```
+
+<!-- golden: consent_check_access_approved_result -->
+```json
+{"status": "approved", "token": "ac-e3b0c44298fc1c149afbf4c8996fb924"}
+```
+
+<!-- golden: consent_approve_request_request -->
+```json
+{"jsonrpc": "2.0", "id": 10, "method": "approveRequest", "params": {"requestId": "req-1a2b3c4d"}}
+```
+
+<!-- golden: consent_approve_request_result -->
+```json
+{"client": {"id": "client-1a2b3c4d", "name": "小明", "allowedAgents": ["travel-planner"], "expiresAt": null}}
+```
+
+<!-- golden: consent_list_requests_result -->
+```json
+{"requests": [{"requestId": "req-1a2b3c4d", "clientName": "小明", "agent": "travel-planner", "createdAt": 1755955200}]}
+```
+
+<!-- golden: consent_list_clients_result -->
+```json
+{"clients": [{"id": "client-1a2b3c4d", "name": "小明", "createdAt": 1755955200, "expiresAt": null, "allowedAgents": ["travel-planner"], "allowSystem": false}]}
 ```
 
 <!-- golden: internal_initialize_request -->
