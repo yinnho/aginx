@@ -65,10 +65,14 @@ async fn main() -> anyhow::Result<()> {
     if no_tls {
         run_test(tcp_stream, target).await
     } else {
-        let tls_connector = native_tls::TlsConnector::new()?;
-        let tls_stream = tokio_native_tls::TlsConnector::from(tls_connector)
-            .connect(&tls_domain, tcp_stream)
-            .await?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+        let server_name = rustls_pki_types::ServerName::try_from(tls_domain.clone())?;
+        let tls_stream = connector.connect(server_name, tcp_stream).await?;
         tracing::info!("TLS 握手成功");
         run_test(tls_stream, target).await
     }

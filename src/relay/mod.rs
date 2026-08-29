@@ -106,10 +106,14 @@ impl RelayClient {
 
     async fn connect_with_tls(&self, tcp_stream: TcpStream) -> anyhow::Result<()> {
         let domain = self.tls_domain.clone();
-        let tls_connector = native_tls::TlsConnector::new()?;
-        let tls_stream = tokio_native_tls::TlsConnector::from(tls_connector)
-            .connect(&domain, tcp_stream)
-            .await?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls_pki_types::ServerName::try_from(domain)?;
+        let tls_stream = connector.connect(server_name, tcp_stream).await?;
         tracing::info!("TLS handshake successful");
 
         let (reader, writer) = tokio::io::split(tls_stream);
