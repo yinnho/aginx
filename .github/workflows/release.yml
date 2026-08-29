@@ -28,6 +28,8 @@ jobs:
 
       - uses: mlugg/setup-zig@v1
         if: matrix.use_zig
+        with:
+          version: 0.16.0
 
       - uses: taiki-e/install-action@v2
         if: matrix.use_zig
