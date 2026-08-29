@@ -26,10 +26,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: mlugg/setup-zig@v1
+      - name: Install zig
         if: matrix.use_zig
-        with:
-          version: 0.16.0
+        run: |
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          sudo tar -xJf /tmp/zig.tar.xz -C /usr/local
+          sudo ln -sf /usr/local/zig-*/zig /usr/local/bin/zig
+          zig version
 
       - uses: taiki-e/install-action@v2
         if: matrix.use_zig
