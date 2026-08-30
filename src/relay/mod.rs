@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::agent::AgentManager;
 use crate::config::Config;
@@ -39,6 +39,25 @@ pub enum RelayMessage {
     Connected { client_id: String },
 }
 
+/// 每客户端在飞轮的取消信号名册：relay 下发 `disconnected {client_id}` 时
+/// 全部触发——notify_task 退出 → 其 rx 被 drop → adapter 现有的
+/// kill-on-tx-drop 杀掉子进程（借用方跑路，网关不留幽灵轮烧电）。
+type TurnCancels = Arc<Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>>;
+
+/// 触发某客户端全部在飞轮的取消信号（断连通知处理用）。返回触发数。
+async fn fire_client_turns(turns: &TurnCancels, client_id: &str) -> usize {
+    match turns.lock().await.remove(client_id) {
+        Some(fires) => {
+            let n = fires.len();
+            for fire in fires {
+                let _ = fire.send(());
+            }
+            n
+        }
+        None => 0,
+    }
+}
+
 /// Registration result from API
 /// Relay client
 pub struct RelayClient {
@@ -50,6 +69,7 @@ pub struct RelayClient {
     reconnect_interval: u64,
     handler: Arc<AcpHandler>,
     client_auth: Arc<Mutex<HashMap<String, Option<AuthLevel>>>>,
+    pending_turns: TurnCancels,
     access: crate::config::AccessMode,
     relay_secret: Option<String>,
 }
@@ -74,6 +94,7 @@ impl RelayClient {
             reconnect_interval: config.relay.reconnect_interval,
             handler,
             client_auth: Arc::new(Mutex::new(HashMap::new())),
+            pending_turns: Arc::new(Mutex::new(HashMap::new())),
             access: config.server.access,
             relay_secret: config.relay.relay_secret.clone(),
         }
@@ -215,7 +236,7 @@ impl RelayClient {
                             RelayMessage::Data { client_id, data } => {
                                 tracing::debug!("Data from client [{}]", client_id);
                                 if let Err(e) = handle_data_message(
-                                    writer, &client_id, data, &self.handler, &self.client_auth, &self.access,
+                                    writer, &client_id, data, &self.handler, &self.client_auth, &self.pending_turns, &self.access,
                                 ).await {
                                     tracing::error!("Error handling message: {}", e);
                                 }
@@ -223,6 +244,11 @@ impl RelayClient {
                             RelayMessage::Disconnected { client_id } => {
                                 tracing::info!("Client [{}] disconnected", client_id);
                                 self.client_auth.lock().await.remove(&client_id);
+                                // 取消该客户端全部在飞轮（杀子进程），轮数记日志。
+                                let fired = fire_client_turns(&self.pending_turns, &client_id).await;
+                                if fired > 0 {
+                                    tracing::info!("Client [{}] 断连，已取消 {} 个在飞轮", client_id, fired);
+                                }
                             }
                             RelayMessage::Error { message } => {
                                 tracing::error!("Relay error: {}", message);
@@ -255,6 +281,7 @@ async fn handle_data_message(
     data: serde_json::Value,
     handler: &Arc<AcpHandler>,
     client_auth: &Arc<Mutex<HashMap<String, Option<AuthLevel>>>>,
+    pending_turns: &TurnCancels,
     access: &crate::config::AccessMode,
 ) -> anyhow::Result<()> {
     let request: AcpRequest = match serde_json::from_value(data) {
@@ -286,11 +313,26 @@ async fn handle_data_message(
         let client_id = client_id.to_string();
         let (tx, rx) = mpsc::channel::<String>(32);
 
+        // 在飞轮入名册：断连通知触发 oneshot → notify_task 退出 → rx drop
+        // → adapter kill-on-tx-drop 杀子进程。
+        let (fire, gone) = oneshot::channel::<()>();
+        let pending_turns = Arc::clone(pending_turns);
+        pending_turns.lock().await.entry(client_id.clone()).or_default().push(fire);
+
         tokio::spawn(async move {
             let writer_clone = writer.clone();
             let notify_task = tokio::spawn(async move {
                 let mut rx = rx;
-                while let Some(notification) = rx.recv().await {
+                let mut gone = gone;
+                loop {
+                    let notification = tokio::select! {
+                        // 客户端已断：立即退出（drop rx，让 adapter 杀子进程）
+                        _ = &mut gone => break,
+                        notification = rx.recv() => match notification {
+                            Some(n) => n,
+                            None => break,
+                        },
+                    };
                     let mut w = writer_clone.lock().await;
                     let msg = format!("{}\n", notification);
                     if w.write_all(msg.as_bytes()).await.is_err() || w.flush().await.is_err() {
@@ -308,6 +350,10 @@ async fn handle_data_message(
             }
 
             let _ = notify_task.await;
+            // 轮已收尾：名册清掉本条（sender 已关或已被断连通知消费）。
+            if let Some(v) = pending_turns.lock().await.get_mut(&client_id) {
+                v.retain(|s| !s.is_closed());
+            }
         });
     } else {
         let (response, new_auth) = handler.handle_request(request, auth).await;
@@ -343,4 +389,50 @@ async fn send_relay_response(
     w.write_all(format!("{}\n", resp_text).as_bytes()).await?;
     w.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fire_client_turns_fires_only_that_client() {
+        let turns: TurnCancels = Arc::new(Mutex::new(HashMap::new()));
+
+        // c1 两轮、c2 一轮入名册
+        let (f1a, mut g1a) = oneshot::channel::<()>();
+        let (f1b, mut g1b) = oneshot::channel::<()>();
+        let (f2, mut g2) = oneshot::channel::<()>();
+        turns.lock().await.entry("c1".into()).or_default().push(f1a);
+        turns.lock().await.entry("c1".into()).or_default().push(f1b);
+        turns.lock().await.entry("c2".into()).or_default().push(f2);
+
+        assert_eq!(fire_client_turns(&turns, "c1").await, 2);
+        // c1 的接收端全部被触发；c2 不受影响
+        assert!(g1a.try_recv().is_ok());
+        assert!(g1b.try_recv().is_ok());
+        assert!(g2.try_recv().is_err());
+        // 名册里 c1 已摘除（断连是终态，client_id 不复用）；重复触发=0
+        assert!(!turns.lock().await.contains_key("c1"));
+        assert_eq!(fire_client_turns(&turns, "c1").await, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_removes_closed_senders() {
+        let turns: TurnCancels = Arc::new(Mutex::new(HashMap::new()));
+        let (done_fire, done_gone) = oneshot::channel::<()>();
+        let (open_fire, _open_gone) = oneshot::channel::<()>();
+        {
+            let mut m = turns.lock().await;
+            m.entry("c9".into()).or_default().push(done_fire);
+            m.entry("c9".into()).or_default().push(open_fire);
+        }
+        // 已收尾的轮：receiver drop → sender is_closed → 收尾清理后应被剪掉
+        drop(done_gone);
+        if let Some(v) = turns.lock().await.get_mut("c9") {
+            v.retain(|s| !s.is_closed());
+        }
+        let m = turns.lock().await;
+        assert_eq!(m["c9"].len(), 1, "只剩在飞的那条");
+    }
 }

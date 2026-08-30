@@ -91,9 +91,10 @@ enum RelayMessage {
 
 /// 转发给 aginx 的消息
 #[derive(Debug, Clone)]
-struct ToAginx {
-    client_id: String,
-    data: serde_json::Value,
+enum ToAginx {
+    Data { client_id: String, data: serde_json::Value },
+    /// 客户端断开通知（ACP.md §1.4）：网关据此取消该客户端在飞轮
+    Disconnected { client_id: String },
 }
 
 /// Relay 服务器状态
@@ -303,11 +304,11 @@ async fn handle_aginx(
     // 发送任务: 从通道接收消息并发送给 aginx
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let data_msg = RelayMessage::Data {
-                client_id: msg.client_id,
-                data: msg.data,
+            let out = match msg {
+                ToAginx::Data { client_id, data } => RelayMessage::Data { client_id, data },
+                ToAginx::Disconnected { client_id } => RelayMessage::Disconnected { client_id },
             };
-            if send_msg(&writer_for_send, data_msg).await.is_err() {
+            if send_msg(&writer_for_send, out).await.is_err() {
                 break;
             }
         }
@@ -413,6 +414,8 @@ async fn handle_client(
     }
 
     let client_id_for_recv = client_id.clone();
+    // recv_task 持一份克隆转发数据；原 sender 留给收尾的断连通知。
+    let aginx_tx_for_recv = aginx_tx.clone();
     let writer_for_send = writer.clone();
 
     // 发送任务
@@ -427,6 +430,7 @@ async fn handle_client(
 
     // 接收任务
     let recv_task = tokio::spawn(async move {
+        let aginx_tx = aginx_tx_for_recv;
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
@@ -438,7 +442,7 @@ async fn handle_client(
                     }
                     // 转发给 aginx
                     let json = serde_json::from_str(line).unwrap_or_else(|_| serde_json::json!(&line));
-                    let _ = aginx_tx.send(ToAginx {
+                    let _ = aginx_tx.send(ToAginx::Data {
                         client_id: client_id_for_recv.clone(),
                         data: json,
                     }).await;
@@ -456,6 +460,11 @@ async fn handle_client(
 
     // 清理
     cleanup_client(&state, &client_id, &target_aginx).await;
+    // 断连通知（ACP.md §1.4）：网关据此取消该客户端在飞轮并杀子进程。
+    // aginx 已不在线时 send 失败，忽略即可。
+    let _ = aginx_tx
+        .send(ToAginx::Disconnected { client_id: client_id.clone() })
+        .await;
     tracing::info!("Client [{}] disconnected from Aginx [{}]", client_id, target_aginx);
 
     Ok(())
@@ -466,6 +475,11 @@ async fn cleanup_aginx(state: &Arc<RwLock<RelayState>>, aginx_id: &str) {
     state.aginx_senders.remove(aginx_id);
 
     // 获取并清理关联的客户端
+    // 不变量：client_senders 的 map 条目是该客户端 mpsc::Sender 的唯一持有者
+    // （handle_client 不克隆）。摘掉条目 = drop sender = 客户端 send_task 的
+    // rx.recv() 返回 None = 连接关闭——aginx（手机网关）掉线时其全部客户端
+    // 立即断开、在飞轮立即报「连接已关闭」，不悬死到客户端 idle 超时。
+    // 若未来在 handle_client 克隆 tx，此保证静默失效。
     if let Some(clients) = state.aginx_clients.remove(aginx_id) {
         for client_id in clients {
             state.client_senders.remove(&client_id);

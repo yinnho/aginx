@@ -67,7 +67,12 @@ Direct 模式地���为 `agent://<host>:<port>/<agent>`。
 
 ### 1.4 断连通知
 
-relay→网关：`disconnected {client_id}`；网关随之清掉该客户端的鉴权态。
+relay→网关：`disconnected {client_id}`。客户端 TCP 断开时 relay 必须下发（经
+register 通道，紧跟连接清理之后）。网关收到后做两件事：清掉该客户端的鉴权态；
+**取消该客户端全部在飞轮**（notify 通道退出 → adapter kill-on-tx-drop 杀子进程）
+——借用方跑路不能在网关侧留幽灵轮烧电。反向（网关掉线）relay 不发通知，直接
+关闭该网关名下全部客户端连接（client sender 由 relay 状态表独占持有，摘表即断）
+——在飞轮的借用方立即收到「连接已关闭」错误，不悬死到自身 idle 超时。
 
 ---
 

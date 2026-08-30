@@ -169,7 +169,29 @@ impl PromptAdapter {
                             let reader = tokio::io::BufReader::new(stdout);
                             let mut lines = reader.lines();
 
-                            while let Ok(Some(line)) = lines.next_line().await {
+                            // 通道探���：子进程静默期（brain 思考）没有输出可
+                            // 触发 send，靠周期 tick 检查接收端是否已断——
+                            // 客户端跑路（relay disconnected → notify_task 退出
+                            // → rx drop）时 ≤1s 内发现并杀进程，不留幽灵轮。
+                            let mut chan_poll =
+                                tokio::time::interval(std::time::Duration::from_secs(1));
+                            chan_poll
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            loop {
+                                let line = tokio::select! {
+                                    l = lines.next_line() => match l {
+                                        Ok(Some(l)) => l,
+                                        Ok(None) => break, // 子进程输出结束
+                                        Err(_) => break,
+                                    },
+                                    _ = chan_poll.tick() => {
+                                        if tx.is_closed() {
+                                            client_disconnected = true;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                };
                                 let t = translate::translate_line(output, &line);
                                 if t.session_id.is_some() {
                                     harvested.session_id = t.session_id.clone();
@@ -344,6 +366,9 @@ impl PromptAdapter {
         tokio::spawn(async move {
             let run = async {
                 let mut cmd = tokio::process::Command::new(&command);
+                // 任何退出路径（超时取消、Err 提前返回、借用方断连）都杀进程，
+                // 不留幽灵——成功路径的显式 kill 变成幂等收尾。
+                cmd.kill_on_drop(true);
                 cmd.args(&args)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
@@ -452,12 +477,26 @@ impl PromptAdapter {
                 // final response (or on timeout).
 
                 let mut final_resp: Option<serde_json::Value> = None;
+                // 通道探活：agent 静默期（brain 思考）无输出可触发 send，靠
+                // 周期 tick 查接收端——借用方断连 ≤1s 内退出（kill_on_drop
+                // 收尸），不留幽灵轮。
+                let mut chan_poll =
+                    tokio::time::interval(std::time::Duration::from_secs(1));
+                chan_poll
+                    .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     let mut line = String::new();
-                    let n = reader
-                        .read_line(&mut line)
-                        .await
-                        .map_err(|e| format!("agent stdout read failed: {e}"))?;
+                    let n = tokio::select! {
+                        n = reader.read_line(&mut line) => {
+                            n.map_err(|e| format!("agent stdout read failed: {e}"))?
+                        }
+                        _ = chan_poll.tick() => {
+                            if tx.is_closed() {
+                                return Err("client disconnected".to_string());
+                            }
+                            continue;
+                        }
+                    };
                     if n == 0 {
                         break;
                     }
