@@ -237,4 +237,7 @@ pub struct AgentEntry {
     /// stdout dialect declaration (ACP.md §2.8): "raw" | "claude-stream-json"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// 产物回流目录（ACP.md §4.2 files 回）：轮成功后收集本轮新写/改的文件附终帧
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dir: Option<String>,
 }

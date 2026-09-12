@@ -22,6 +22,10 @@ pub struct AgentConfig {
     /// stdout dialect declaration (ACP.md §2.8): "raw" | "claude-stream-json"
     #[serde(default)]
     pub output: Option<String>,
+    /// 产物回流目录（ACP.md §4.2 files 回；~ 展开）：轮成功后收集该目录下
+    /// 本轮新写/改的文件（mtime ≥ 轮起点）base64 附终帧。缺省=不回流。
+    #[serde(default)]
+    pub output_dir: Option<String>,
     /// 注册项绑定的项目文件夹（注册单元=项目/分身；~ 展开）。
     /// 无 [command] 时按 agent_type 从同名 agent 继承 CLI 细节（type=模板）。
     #[serde(default)]
@@ -243,6 +247,7 @@ pub fn agent_config_to_info(config: AgentConfig, project_dir: &std::path::Path) 
         timeout: config.timeout,
         resume_args,
         output: config.output,
+        output_dir: config.output_dir.as_deref().and_then(expand_tilde),
         // 注册项绑定的 folder 优先（~ 展开）；无 folder 回落 agent 目录
         working_dir: config
             .folder

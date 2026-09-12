@@ -32,6 +32,8 @@ pub struct AgentInfo {
     pub resume_args: Option<Vec<String>>,
     /// stdout dialect declaration (ACP.md §2.8), e.g. "claude-stream-json"
     pub output: Option<String>,
+    /// 产物回流目录（ACP.md §4.2 files 回）：轮成功后收集本轮新写/改的文件附终帧
+    pub output_dir: Option<String>,
     pub working_dir: Option<String>,
 }
 
@@ -53,6 +55,7 @@ impl AgentManager {
                 timeout: ac.timeout,
                 resume_args: None,
                 output: ac.output.clone(),
+                output_dir: ac.output_dir.clone(),
                 working_dir: ac.working_dir.as_ref().map(|p| p.to_string_lossy().to_string()),
             };
             agents.insert(ac.id.clone(), info);

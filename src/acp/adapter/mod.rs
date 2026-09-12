@@ -19,6 +19,8 @@ pub struct PromptAdapter {
     resume_args: Option<Vec<String>>,
     /// stdout dialect（接入包 output 声明驱动，网关核心零 CLI 知识）
     output: OutputFormat,
+    /// 产物回流目录（接入包 output_dir 声明；ACP.md §4.2 files 回）
+    output_dir: Option<String>,
     /// 注册项绑定的默认文件夹：客户端不带 cwd 时 spawn 在这（会话锚定点）
     working_dir: Option<String>,
     /// 注册名（记账归属）
@@ -36,6 +38,7 @@ impl PromptAdapter {
             timeout_secs: agent_info.timeout.unwrap_or(120),
             resume_args: agent_info.resume_args.clone(),
             output: OutputFormat::parse(agent_info.output.as_deref()),
+            output_dir: agent_info.output_dir.clone(),
             working_dir: agent_info.working_dir.clone(),
             agent_id: agent_info.id.clone(),
             ledger,
@@ -57,6 +60,7 @@ impl PromptAdapter {
         let timeout_secs = self.timeout_secs;
         let env = self.env.clone();
         let output = self.output;
+        let output_dir = self.output_dir.clone();
         let agent_id = self.agent_id.clone();
         let ledger = self.ledger.clone();
         // cwd 解析优先级：客户端传入 > 注册项默认文件夹（working_dir）。
@@ -97,6 +101,8 @@ impl PromptAdapter {
         }
 
         tokio::spawn(async move {
+            // 产物回流的新鲜度线：本轮 spawn 之前写/改的文件不回传
+            let turn_started = std::time::SystemTime::now();
             let mut cmd = tokio::process::Command::new(&command);
             cmd.args(&args)
                 .stdin(std::process::Stdio::piped())
@@ -305,6 +311,14 @@ impl PromptAdapter {
                         }
                         if let Some(n) = harvested.num_turns {
                             result["numTurns"] = serde_json::json!(n);
+                        }
+                        // 产物回流（ACP.md §4.2 files 回）：接入包声明 output_dir
+                        // 时收集本轮新写/改的文件附终帧；无产物不附键。
+                        if let Some(ref dir) = output_dir {
+                            let collected = collect_output_files(dir, turn_started);
+                            if !collected.is_empty() {
+                                result["files"] = serde_json::json!(collected);
+                            }
                         }
                         let done = serde_json::json!({
                             "jsonrpc": "2.0",
@@ -583,5 +597,118 @@ impl PromptAdapter {
             }
         });
         Ok(())
+    }
+}
+
+/// 产物回流收集（ACP.md §4.2 files 回）：`output_dir` 声明驱动，网关核心
+/// 零 CLI 知识——轮成功后从注册目录收集**本轮**新写/改的文件（mtime ≥ 轮
+/// 起点），base64 成终帧 `files`。路径由管理员在接入包声明（信任根=写配置
+/// 的人，与 cwd 的 home 门不同），只校验存在且是目录；预算同借用轮：单文件
+/// 16MiB / 总 64MiB，超限跳过计数告警不失败。
+fn collect_output_files(dir: &str, since: std::time::SystemTime) -> Vec<serde_json::Value> {
+    use base64::Engine as _;
+
+    const MAX_FILE: u64 = 16 * 1024 * 1024;
+    const MAX_TOTAL: u64 = 64 * 1024 * 1024;
+
+    let Ok(path) = std::path::Path::new(dir).canonicalize() else {
+        tracing::warn!("output_dir not found, skipping file collection: {dir}");
+        return Vec::new();
+    };
+    if !path.is_dir() {
+        tracing::warn!("output_dir is not a directory, skipping: {dir}");
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    let mut skipped = 0u32;
+    let mut stack = vec![path.clone()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            // symlink_metadata：不追链（防环、防借道读 home 外）
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(mtime) = meta.modified() else { continue };
+            // 新鲜度线：本轮之前就存在的旧文件不回传
+            if mtime < since {
+                continue;
+            }
+            if meta.len() > MAX_FILE || total + meta.len() > MAX_TOTAL {
+                skipped += 1;
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let name = p
+                .strip_prefix(&path)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            total += bytes.len() as u64;
+            files.push(serde_json::json!({
+                "name": name,
+                "contentBase64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }));
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!("output_dir: skipped {skipped} file(s) over budget (16MiB/file, 64MiB total)");
+    }
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_output_files;
+    use base64::Engine as _;
+
+    #[test]
+    fn collects_only_files_written_since_turn_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // 旧文件：轮起点之前就存在 → 不回传
+        std::fs::write(root.join("stale.txt"), b"old").unwrap();
+        // 子目录里的新文件 → 回传，name 带相对路径
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/new.txt"), b"fresh").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let since = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("fresh.txt"), b"result").unwrap();
+        std::fs::write(root.join("sub/new.txt"), b"fresh2").unwrap();
+
+        let files = collect_output_files(&root.to_string_lossy(), since);
+        let names: Vec<&str> = files
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"fresh.txt"));
+        assert!(names.contains(&"sub/new.txt")); // 改写过的文件也算本轮产物
+        assert!(!names.contains(&"stale.txt"));
+
+        for f in files {
+            let b64 = f["contentBase64"].as_str().unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+            match f["name"].as_str().unwrap() {
+                "fresh.txt" => assert_eq!(bytes, b"result"),
+                "sub/new.txt" => assert_eq!(bytes, b"fresh2"),
+                other => panic!("unexpected file: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_dir_returns_empty() {
+        let files = collect_output_files("/nonexistent/aginx-test-output", std::time::UNIX_EPOCH);
+        assert!(files.is_empty());
     }
 }

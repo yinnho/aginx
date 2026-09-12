@@ -140,7 +140,8 @@ listAgents）。
    `streaming` 键即吞掉不发。客户端不该期待任何带 id 的中间响应。
 2. **最终响应无 id**，经通知通道下发：`{jsonrpc, result: {stopReason, …}}`。
 
-普通轮最终结果：`{stopReason: "endTurn", sessionId?, costUsd?, durationMs?, numTurns?}`。
+普通轮最终结果：`{stopReason: "endTurn", sessionId?, costUsd?, durationMs?, numTurns?, files?}`
+（`files` 仅在接入包声明 `output_dir`（§2.10）且本轮有产物时在，形状同 §4.2）。
 
 **`sessionId` 语义（2026-08-24 起）：网关收割的 agent 真会话 id**——CLI
 路径经 output 翻译器（§2.8）从 agent 输出收割；无翻译器方言时回显客户端
@@ -175,6 +176,15 @@ assistant 文本块）；未声明/`raw` 保持原行直通。
 
 方言是**形状契约不是身份契约**：任何 CLI 只要按此形状发声即可声明（aginx-carrier
 ask 模式自 2026-08-24 起发 claude-stream-json 形状的事件行，见 §3.1）。
+
+### 2.10 接入包产物声明（output_dir）
+
+`aginx.toml` 顶层 `output_dir` 字段声明该 CLI 的产物目录——轮成功后网关
+从该目录收集**本轮**新写/改的文件（mtime ≥ 本轮 spawn 时刻；改写旧文件也
+算），base64 附在普通轮最终结果 `files`（形状同 §4.2 借用轮，预算同：单
+文件 16MiB / 总 64MiB，超限跳过计数告警不失败；symlink 不追链）。无产物
+不附键；未声明 `output_dir` 的接入包行为不变。**产物语义属于接入包声明，
+不属于网关核心**——网关只知道目录与新鲜度线，不知道 CLI 是谁。
 
 ### 2.7 借用者身份透传优先级（网关→桥）
 
@@ -290,6 +300,9 @@ DB，向后兼容路径）。
   恶意名（`../`、绝对路径、反斜杠）拒绝。预算单文件 8MiB / 总 32MiB。
 - 产物从 `borrow/<uuid>/output/` 收集回流，预算单文件 16MiB / 总 64MiB
   （超限跳过计数告警，不失败）。
+- 普通轮（raw CLI 接入包）同形回流：接入包声明 `output_dir`（§2.10），
+  网关按新鲜度线（mtime ≥ 本轮 spawn）收集，终帧 `files` 与借用轮同形
+  同预算。
 
 ### 4.3 桥侧准入与配额（carrier `[borrow]` 配置）
 
