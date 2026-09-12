@@ -173,6 +173,7 @@ assistant 文本块）；未声明/`raw` 保持原行直通。
 |---|---|---|
 | `raw`（缺省） | 裸文本行 | 行直通 chunk；result.sessionId 回显客户端传入 |
 | `claude-stream-json` | claude `--output-format stream-json --verbose` | assistant 行 text 块 → chunk 纯文本；`type=result` 行收割真 session_id + costUsd/durationMs/numTurns（记入台账 §2.4.1）；`is_error:true` → error 帧 |
+| `codex-exec-json` | codex `exec --json`（JSONL 事件） | `item.completed` 的 agent_message → chunk 纯文本；`thread.started` 行收割 thread_id 作真 session_id（记入台账 §2.4.1；续话=接入包 `[session] resume_args` 声明如 `["resume", "${SESSION_ID}"]`，网关在客户端带 sessionId 时追加）；`turn.failed` → error 帧 |
 
 方言是**形状契约不是身份契约**：任何 CLI 只要按此形状发声即可声明（aginx-carrier
 ask 模式自 2026-08-24 起发 claude-stream-json 形状的事件行，见 §3.1）。

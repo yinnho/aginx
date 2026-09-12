@@ -11,6 +11,8 @@ pub enum OutputFormat {
     Raw,
     /// claude `--output-format stream-json --verbose`
     ClaudeStreamJson,
+    /// codex `exec --json`（JSONL 事件）
+    CodexExecJson,
 }
 
 impl OutputFormat {
@@ -19,6 +21,7 @@ impl OutputFormat {
         match decl {
             None | Some("raw") => Self::Raw,
             Some("claude-stream-json") => Self::ClaudeStreamJson,
+            Some("codex-exec-json") => Self::CodexExecJson,
             Some(other) => {
                 tracing::warn!(output = %other, "未知 output 方言，回落 raw 直通");
                 Self::Raw
@@ -54,6 +57,7 @@ pub fn translate_line(format: OutputFormat, line: &str) -> TranslatedLine {
             t
         }
         OutputFormat::ClaudeStreamJson => translate_claude_line(line),
+        OutputFormat::CodexExecJson => translate_codex_line(line),
     }
 }
 
@@ -118,6 +122,54 @@ fn translate_claude_line(line: &str) -> TranslatedLine {
     t
 }
 
+/// codex `exec --json` JSONL 事件（0.151 实测形状）：
+/// `thread.started` 带 thread_id（收割作真 session_id）、`item.completed`
+/// 的 agent_message 产文本、`turn.failed` 自报失败；其余事件静默。
+fn translate_codex_line(line: &str) -> TranslatedLine {
+    let mut t = TranslatedLine::default();
+    let v: serde_json::Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => {
+            // 非法 JSON：按裸文本直通（杂音不炸流）
+            if !line.is_empty() {
+                t.chunks.push(line.to_string());
+            }
+            return t;
+        }
+    };
+    match v.get("type").and_then(|s| s.as_str()) {
+        // thread.started：收割会话 id（§2.5 立法语义；resume 按它续话）
+        Some("thread.started") => {
+            if let Some(tid) = v.get("thread_id").and_then(|s| s.as_str()) {
+                t.session_id = sanitize_session_id(tid);
+            }
+        }
+        // item.completed：agent_message 文本块 → chunk（§2.6 纯文本）；
+        // 命令执行/推理等其他 item 类型不产文本
+        Some("item.completed") => {
+            if v.pointer("/item/type").and_then(|s| s.as_str()) == Some("agent_message") {
+                if let Some(text) = v.pointer("/item/text").and_then(|s| s.as_str()) {
+                    if !text.is_empty() {
+                        t.chunks.push(text.to_string());
+                    }
+                }
+            }
+        }
+        // turn.failed：agent 自报失败 → error 帧
+        Some("turn.failed") => {
+            t.is_error = true;
+            t.error_text = v
+                .pointer("/error/message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| Some("codex reported turn.failed".into()));
+        }
+        // turn.started / turn.completed(usage) 等其余事件：静默忽略
+        _ => {}
+    }
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +218,46 @@ mod tests {
         let line = r#"{"type":"result","session_id":"a;rm -rf /"}"#;
         let t = translate_line(OutputFormat::ClaudeStreamJson, line);
         assert!(t.session_id.is_none());
+    }
+
+    #[test]
+    fn codex_thread_started_harvests_session_id() {
+        let line = r#"{"type":"thread.started","thread_id":"01a0950d-7c8a-7163-93a6-932e72a6534c"}"#;
+        let t = translate_line(OutputFormat::CodexExecJson, line);
+        assert_eq!(
+            t.session_id.as_deref(),
+            Some("01a0950d-7c8a-7163-93a6-932e72a6534c")
+        );
+        assert!(t.chunks.is_empty());
+    }
+
+    #[test]
+    fn codex_agent_message_becomes_chunk() {
+        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"好的"}}"#;
+        let t = translate_line(OutputFormat::CodexExecJson, line);
+        assert_eq!(t.chunks, vec!["好的".to_string()]);
+        // 其他 item 类型（命令执行等）不产文本
+        let line = r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"ls"}}"#;
+        let t = translate_line(OutputFormat::CodexExecJson, line);
+        assert!(t.chunks.is_empty());
+    }
+
+    #[test]
+    fn codex_turn_failed_flags_error() {
+        let line = r#"{"type":"turn.failed","error":{"message":"stream error"}}"#;
+        let t = translate_line(OutputFormat::CodexExecJson, line);
+        assert!(t.is_error);
+        assert_eq!(t.error_text.as_deref(), Some("stream error"));
+    }
+
+    #[test]
+    fn codex_garbage_passthrough_and_parse() {
+        assert_eq!(
+            OutputFormat::parse(Some("codex-exec-json")),
+            OutputFormat::CodexExecJson
+        );
+        let t = translate_line(OutputFormat::CodexExecJson, "not json");
+        assert_eq!(t.chunks, vec!["not json".to_string()]);
     }
 
     #[test]
