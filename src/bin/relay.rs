@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -396,7 +397,9 @@ async fn handle_client(
     // 生成客户端 ID
     let client_id = format!("c_{}", generate_id());
 
-    tracing::info!("Client [{}] connected to Aginx [{}] from {}", client_id, target_aginx, peer_addr);
+    // 纯探活连接（连上即断、零数据）只记 debug，避免 watchdog 周期探测刷屏；
+    // 真会话在断开时统一记一条带转发数的 INFO。
+    tracing::debug!("Client [{}] connecting to Aginx [{}] from {}", client_id, target_aginx, peer_addr);
 
     // 发送连接成功
     send_msg(&writer, RelayMessage::Connected { target: target_aginx.clone() }).await?;
@@ -429,6 +432,8 @@ async fn handle_client(
     });
 
     // 接收任务
+    let msgs_forwarded = Arc::new(AtomicU64::new(0));
+    let msgs_counter = msgs_forwarded.clone();
     let recv_task = tokio::spawn(async move {
         let aginx_tx = aginx_tx_for_recv;
         loop {
@@ -440,6 +445,7 @@ async fn handle_client(
                     if line.is_empty() {
                         continue;
                     }
+                    msgs_counter.fetch_add(1, Ordering::Relaxed);
                     // 转发给 aginx
                     let json = serde_json::from_str(line).unwrap_or_else(|_| serde_json::json!(&line));
                     let _ = aginx_tx.send(ToAginx::Data {
@@ -465,7 +471,12 @@ async fn handle_client(
     let _ = aginx_tx
         .send(ToAginx::Disconnected { client_id: client_id.clone() })
         .await;
-    tracing::info!("Client [{}] disconnected from Aginx [{}]", client_id, target_aginx);
+    let forwarded = msgs_forwarded.load(Ordering::Relaxed);
+    if forwarded > 0 {
+        tracing::info!("Client [{}] disconnected from Aginx [{}] ({} msgs)", client_id, target_aginx, forwarded);
+    } else {
+        tracing::debug!("Client [{}] disconnected from Aginx [{}] (probe, no data)", client_id, target_aginx);
+    }
 
     Ok(())
 }
