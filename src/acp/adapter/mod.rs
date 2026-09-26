@@ -27,10 +27,16 @@ pub struct PromptAdapter {
     agent_id: String,
     /// 会话台账：成功轮结束后以收割的真 sessionId 记账（§2.4.1 事实源）
     ledger: crate::agent::ledger::SessionLedger,
+    /// prompt 存根：收件先落盘，轮夭折留底（超时丢件柜台）
+    spool: crate::agent::spool::PromptSpool,
 }
 
 impl PromptAdapter {
-    pub fn new(agent_info: &AgentInfo, ledger: crate::agent::ledger::SessionLedger) -> Self {
+    pub fn new(
+        agent_info: &AgentInfo,
+        ledger: crate::agent::ledger::SessionLedger,
+        spool: crate::agent::spool::PromptSpool,
+    ) -> Self {
         Self {
             command: agent_info.command.clone(),
             args_template: agent_info.args.clone(),
@@ -42,6 +48,7 @@ impl PromptAdapter {
             working_dir: agent_info.working_dir.clone(),
             agent_id: agent_info.id.clone(),
             ledger,
+            spool,
         }
     }
 
@@ -82,6 +89,10 @@ impl PromptAdapter {
                 }
             });
         let session_id_owned = session_id.map(|s| s.to_string());
+
+        // 收件先落盘：轮夭折（超时/断连/spawn 失败）时 prompt 有底可查可重发
+        let ticket = self.spool.write(&self.agent_id, session_id, cwd.as_deref(), &message);
+        let spool = self.spool.clone();
 
         // Build args: sanitize sessionId to prevent command injection
         let mut args: Vec<String> = self.args_template.iter()
@@ -125,6 +136,7 @@ impl PromptAdapter {
                         if let Err(e) = stdin.write_all(message.as_bytes()).await {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
+                            spool.lost(ticket.as_ref(), "stdin_failed", &format!("stdin write: {e}"));
                             let err = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "error": {"code": -32603, "message": format!("Failed to write to agent stdin: {}", e)}
@@ -135,6 +147,7 @@ impl PromptAdapter {
                         if let Err(e) = stdin.write_all(b"\n").await {
                             let _ = child.kill().await;
                             let _ = child.wait().await;
+                            spool.lost(ticket.as_ref(), "stdin_failed", &format!("stdin write: {e}"));
                             let err = serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "error": {"code": -32603, "message": format!("Failed to write to agent stdin: {}", e)}
@@ -245,6 +258,11 @@ impl PromptAdapter {
                         Err(_) => {
                             tracing::warn!("Agent process timed out after {}s", timeout_secs);
                             let _ = child.kill().await;
+                            spool.lost(
+                                ticket.as_ref(),
+                                "timeout",
+                                &format!("Agent process timed out after {timeout_secs}s"),
+                            );
                             true
                         }
                     };
@@ -253,6 +271,11 @@ impl PromptAdapter {
                     if client_disconnected {
                         tracing::info!("Client disconnected, killing agent process");
                         let _ = child.kill().await;
+                        spool.lost(
+                            ticket.as_ref(),
+                            "client_disconnected",
+                            "接收端在轮进行中断开，进程被杀",
+                        );
                     }
 
                     let exit_status = child.wait().await.ok();
@@ -277,6 +300,8 @@ impl PromptAdapter {
                         let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
                     } else if harvested.is_error {
                         // agent 自报失败（如 claude result.is_error）→ error 帧（§2.8）
+                        // 进程善终：内容已完整交给 agent，销账
+                        spool.delivered(ticket.as_ref());
                         let detail = harvested.error_text.clone()
                             .unwrap_or_else(|| format!("Agent exited with code {}", code));
                         let err = serde_json::json!({
@@ -285,6 +310,8 @@ impl PromptAdapter {
                         });
                         let _ = tx.send(serde_json::to_string(&err).unwrap()).await;
                     } else if code != 0 {
+                        // 同上：跑完了才退的非零码，内容已达对端
+                        spool.delivered(ticket.as_ref());
                         let detail = if stderr_output.is_empty() {
                             format!("Agent exited with code {}", code)
                         } else {
@@ -298,6 +325,7 @@ impl PromptAdapter {
                     } else {
                         // Success: sessionId = 翻译器收割的 agent 真会话 id，
                         // 无翻译器方言回显客户端传入值（§2.5 立法语义）
+                        spool.delivered(ticket.as_ref());
                         let mut result = serde_json::json!({"stopReason": "endTurn"});
                         let final_sid = harvested.session_id.clone().or_else(|| session_id_owned.clone());
                         if let Some(ref sid) = final_sid {
@@ -332,6 +360,7 @@ impl PromptAdapter {
                     }
                 }
                 Err(e) => {
+                    spool.lost(ticket.as_ref(), "spawn_failed", &format!("Failed to start agent: {e}"));
                     let err = serde_json::json!({
                         "jsonrpc": "2.0",
                         "error": {"code": -32603, "message": format!("Failed to start agent: {}", e)}
@@ -376,6 +405,10 @@ impl PromptAdapter {
         let message = message.to_string();
         let active_flow = active_flow.unwrap_or_default();
         let borrower = borrower.unwrap_or_default();
+
+        // 收件先落盘（同 prompt()：借用轮夭折同样有底）
+        let ticket = self.spool.write(&self.agent_id, None, cwd.as_deref(), &message);
+        let spool = self.spool.clone();
 
         tokio::spawn(async move {
             let run = async {
@@ -577,10 +610,12 @@ impl PromptAdapter {
 
             match tokio::time::timeout(Duration::from_secs(timeout_secs), run).await {
                 Ok(Ok(result)) => {
+                    spool.delivered(ticket.as_ref());
                     let done = serde_json::json!({"jsonrpc": "2.0", "result": result});
                     let _ = tx.send(serde_json::to_string(&done).unwrap_or_default()).await;
                 }
                 Ok(Err(e)) => {
+                    spool.lost(ticket.as_ref(), "agent_failed", &e);
                     let err = serde_json::json!({
                         "jsonrpc": "2.0",
                         "error": {"code": -32603, "message": e},
@@ -588,6 +623,11 @@ impl PromptAdapter {
                     let _ = tx.send(serde_json::to_string(&err).unwrap_or_default()).await;
                 }
                 Err(_) => {
+                    spool.lost(
+                        ticket.as_ref(),
+                        "timeout",
+                        &format!("borrowed turn timed out after {timeout_secs}s"),
+                    );
                     let err = serde_json::json!({
                         "jsonrpc": "2.0",
                         "error": {"code": -32603, "message": format!("borrowed turn timed out after {}s", timeout_secs)},

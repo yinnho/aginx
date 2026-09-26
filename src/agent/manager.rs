@@ -15,6 +15,8 @@ pub struct AgentManager {
     agents: Arc<RwLock<HashMap<String, AgentInfo>>>,
     /// 会话台账（sessions/list 事实源，§2.4.1）
     pub ledger: super::ledger::SessionLedger,
+    /// prompt 存根（超时丢件柜台，收件先落盘）
+    pub spool: super::spool::PromptSpool,
 }
 
 /// Agent runtime info
@@ -107,6 +109,7 @@ impl AgentManager {
         Self {
             agents: Arc::new(RwLock::new(agents)),
             ledger: super::ledger::SessionLedger::load(),
+            spool: super::spool::PromptSpool::open(),
         }
     }
 
